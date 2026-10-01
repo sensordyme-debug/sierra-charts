@@ -41,6 +41,8 @@
 
 #include <vector>
 #include <map>
+#include <set>
+#include <climits>
 #include <mutex>
 #include <string>
 #include <cmath>
@@ -229,7 +231,22 @@ namespace nqe
 		int computedThrough = -1;   // last closed bar with final values
 		int generation = 0;         // bumped on every reset (studies use it to rewrite subgraphs)
 		int lastArraySize = 0;
-		void Reset() { computedThrough = -1; ++generation; lastArraySize = 0; }
+		int dirtyFrom = INT_MAX;    // lowest historical index rewritten since the owning study last mirrored
+		// fingerprint of the forming bar when this engine last ran: lets repeated Ensure* calls in one
+		// update cycle (several studies share the engine) skip re-evaluating an unchanged last bar
+		int fpN = 0; double fpTime = 0; float fpVol = -1, fpClose = 0, fpHigh = 0, fpLow = 0;
+		void Reset() { computedThrough = -1; ++generation; lastArraySize = 0; dirtyFrom = INT_MAX; fpN = 0; fpVol = -1; }
+		bool UpToDate(SCStudyInterfaceRef sc) const
+		{
+			const int n = sc.ArraySize; if (n <= 0 || computedThrough < n - 2 || lastArraySize != n || fpN != n) return false;
+			const int i = n - 1;
+			return fpTime == sc.BaseDateTimeIn[i].GetAsDouble() && fpVol == sc.Volume[i] && fpClose == sc.Close[i] && fpHigh == sc.High[i] && fpLow == sc.Low[i];
+		}
+		void Stamp(SCStudyInterfaceRef sc)
+		{
+			const int n = sc.ArraySize; computedThrough = n - 2; lastArraySize = n; fpN = n;
+			if (n > 0) { const int i = n - 1; fpTime = sc.BaseDateTimeIn[i].GetAsDouble(); fpVol = sc.Volume[i]; fpClose = sc.Close[i]; fpHigh = sc.High[i]; fpLow = sc.Low[i]; }
+		}
 	};
 
 	struct BaseState : EngineCommon
@@ -278,20 +295,24 @@ namespace nqe
 		std::vector<Swing> swings;
 		int lastSwingHigh = -1, lastSwingLow = -1;           // indices into swings
 		int prevSwingHigh = -1, prevSwingLow = -1;
-		// profile (committed through computedThrough)
-		int profSession = -1;
-		int profBaseTick = 0;                                // price tick of profile[0]
-		std::vector<double> profVol;                         // volume per level
-		std::vector<int> profTpo;                            // TPO count per level
+		bool lastHighBroken = false, lastLowBroken = false;
+		// RTH profile (committed through computedThrough)
+		std::map<int, double> profVol;                       // level -> volume
+		double profTotal = 0;
+		std::map<int, int> tpoMap;                           // level -> TPO count (completed periods)
+		std::set<int> periodLevels;                          // levels touched in the current TPO period
 		int lastTpoPeriod = -1;
-		std::vector<unsigned char> tpoTouched;               // scratch: level touched in current TPO period
-		// day bookkeeping
-		int curDay = 0; float dayHigh = -FLT_MAX, dayLow = FLT_MAX;
+		float devPoc = 0, devVah = 0, devVal = 0;
+		// day / session bookkeeping
+		int curDay = 0;
+		int finalizedSession = -1, rthOpenSession = -1;
 		float onH = -FLT_MAX, onL = FLT_MAX;
-		float ibH = -FLT_MAX, ibL = FLT_MAX; bool ibClosed = false;
+		float rthHigh = -FLT_MAX, rthLow = FLT_MAX;
+		float ibH = -FLT_MAX, ibL = FLT_MAX; bool ibClosed = false; int ibCloseIdx = -1;
 		float prevDayHigh = 0, prevDayLow = 0, prevPoc = 0, prevVah = 0, prevVal = 0;
-		float rthOpen = 0; int rthOpenIdx = -1; float firstHalfHourHigh = -FLT_MAX, firstHalfHourLow = FLT_MAX;
-		signed char todayOpenType = OT_NONE;
+		float rthOpen = 0; int rthOpenIdx = -1;
+		float o30High = -FLT_MAX, o30Low = FLT_MAX; int o30HighIdx = -1, o30LowIdx = -1;
+		signed char todayOpenType = OT_NONE; bool openTypeDone = false; float openTypeDirValue = 0;
 		std::vector<float> ibRangeHistory;                   // one per completed IB (for regime)
 		std::vector<float> nakedPocs;                        // untested prior-session POCs
 		std::vector<int> nakedPocBorn;
@@ -299,6 +320,7 @@ namespace nqe
 		std::vector<Zone> singlePrints;
 		std::vector<Zone> liquidity;                         // equal highs/lows
 		std::vector<Level> levels;                           // snapshot of all active levels (rebuilt each update)
+		std::vector<int> deadLines;                          // drawings to delete (flushed by the Auction study)
 		int lastBosDir = 0, lastBosIdx = -1000;
 		int lastChochDir = 0, lastChochIdx = -1000;
 	};
@@ -561,16 +583,22 @@ namespace nqe
 		if (engine <= E_AUCTION)
 		{
 			S.auction.swings.clear(); S.auction.lastSwingHigh = S.auction.lastSwingLow = -1;
-			S.auction.prevSwingHigh = S.auction.prevSwingLow = -1;
-			S.auction.profSession = -1; S.auction.profVol.clear(); S.auction.profTpo.clear(); S.auction.tpoTouched.clear();
-			S.auction.curDay = 0; S.auction.dayHigh = -FLT_MAX; S.auction.dayLow = FLT_MAX;
-			S.auction.onH = -FLT_MAX; S.auction.onL = FLT_MAX; S.auction.ibH = -FLT_MAX; S.auction.ibL = FLT_MAX; S.auction.ibClosed = false;
+			S.auction.prevSwingHigh = S.auction.prevSwingLow = -1; S.auction.lastHighBroken = S.auction.lastLowBroken = false;
+			S.auction.profVol.clear(); S.auction.profTotal = 0; S.auction.tpoMap.clear(); S.auction.periodLevels.clear(); S.auction.lastTpoPeriod = -1;
+			S.auction.devPoc = S.auction.devVah = S.auction.devVal = 0;
+			S.auction.curDay = 0; S.auction.finalizedSession = -1; S.auction.rthOpenSession = -1;
+			S.auction.onH = -FLT_MAX; S.auction.onL = FLT_MAX; S.auction.rthHigh = -FLT_MAX; S.auction.rthLow = FLT_MAX;
+			S.auction.ibH = -FLT_MAX; S.auction.ibL = FLT_MAX; S.auction.ibClosed = false; S.auction.ibCloseIdx = -1;
 			S.auction.prevDayHigh = S.auction.prevDayLow = S.auction.prevPoc = S.auction.prevVah = S.auction.prevVal = 0;
-			S.auction.rthOpen = 0; S.auction.rthOpenIdx = -1; S.auction.todayOpenType = OT_NONE;
-			S.auction.ibRangeHistory.clear(); S.auction.nakedPocs.clear(); S.auction.nakedPocBorn.clear();
+			S.auction.rthOpen = 0; S.auction.rthOpenIdx = -1; S.auction.o30High = -FLT_MAX; S.auction.o30Low = FLT_MAX; S.auction.o30HighIdx = S.auction.o30LowIdx = -1;
+			S.auction.todayOpenType = OT_NONE; S.auction.openTypeDone = false; S.auction.openTypeDirValue = 0;
+			S.auction.ibRangeHistory.clear();
+			for (size_t k = 0; k < S.auction.nakedPocLine.size(); ++k) if (S.auction.nakedPocLine[k]) S.auction.deadLines.push_back(S.auction.nakedPocLine[k]);
+			for (size_t k = 0; k < S.auction.singlePrints.size(); ++k) if (S.auction.singlePrints[k].lineNumber) S.auction.deadLines.push_back(S.auction.singlePrints[k].lineNumber);
+			for (size_t k = 0; k < S.auction.liquidity.size(); ++k) if (S.auction.liquidity[k].lineNumber) S.auction.deadLines.push_back(S.auction.liquidity[k].lineNumber);
+			S.auction.nakedPocs.clear(); S.auction.nakedPocBorn.clear(); S.auction.nakedPocLine.clear();
 			S.auction.singlePrints.clear(); S.auction.liquidity.clear(); S.auction.levels.clear();
 			S.auction.lastBosDir = 0; S.auction.lastBosIdx = -1000; S.auction.lastChochDir = 0; S.auction.lastChochIdx = -1000;
-			S.auction.lastTpoPeriod = -1;
 		}
 		if (engine <= E_VWAP)
 		{
@@ -663,6 +691,7 @@ namespace nqe
 		BaseState& B = S.base;
 		Fit(B.atr, n); Fit(B.tr, n); Fit(B.tradingDay, n); Fit(B.isRth, n); Fit(B.rthSession, n);
 		Fit(B.secIntoRth, n); Fit(B.dayStartIdx, n); Fit(B.rthStartIdx, n); Fit(B.lastRthId, n);
+		if (B.UpToDate(sc)) return;
 		int from = B.computedThrough + 1;
 		if (from < 0) from = 0;
 		if (from > n - 1) from = n - 1;
@@ -706,8 +735,7 @@ namespace nqe
 				B.lastRthId[i] = prevLastId;
 			}
 		}
-		B.computedThrough = n - 2;
-		B.lastArraySize = n;
+		B.Stamp(sc);
 		UpdateDataStamp(sc, S);
 	}
 
@@ -786,9 +814,7 @@ namespace nqe
 		if (sc.UseTool(T) > 0) lineNumber = T.LineNumber;
 	}
 
-	// ==== 6  Auction / Structure engine (phase 2) ===============================
 	void EnsureAuction(SCStudyInterfaceRef sc, ChartState& S);
-	// ==== 7  VWAP engine (phase 2) ==============================================
 	void EnsureVwap(SCStudyInterfaceRef sc, ChartState& S);
 	// ==== 8  Order Flow engine (phase 3) ========================================
 	void EnsureFlow(SCStudyInterfaceRef sc, ChartState& S);
@@ -803,23 +829,591 @@ namespace nqe
 	// ==== 13 Logger (phase 7) ===================================================
 	void EnsureLog(SCStudyInterfaceRef sc, ChartState& S);
 
-	// Phase-1 stubs: size arrays and mark computed so downstream code is safe.
+	// ==== 6  Auction / Structure engine ========================================
+	namespace auction_detail
+	{
+		typedef std::map<int, double> LevelMap;
+
+		inline int PriceToTick(float price, float tick) { return static_cast<int>(floor(price / tick + 0.5)); }
+		inline int TickToLevel(int t, int tpl) { return (t >= 0 ? t : t - tpl + 1) / tpl; }
+		inline float LevelBottom(int level, float tick, int tpl) { return (static_cast<float>(level) * tpl - 0.5f) * tick; }
+		inline float LevelTop(int level, float tick, int tpl) { return (static_cast<float>(level) * tpl + tpl - 0.5f) * tick; }
+		inline float LevelMid(int level, float tick, int tpl) { return (static_cast<float>(level) * tpl + (tpl - 1) * 0.5f) * tick; }
+
+		// Adds bar i's volume-at-price to the map: real VAP when available, else bar volume spread over H..L.
+		// Returns the set of levels touched (for TPO counting) through r_lo/r_hi.
+		void AddBarToProfile(SCStudyInterfaceRef sc, ChartState& S, int i, LevelMap& vol, double& total, int& r_lo, int& r_hi)
+		{
+			const int tpl = Max(1, S.params.auction.profileTicksPerLevel);
+			const float tick = S.tickSize;
+			r_lo = TickToLevel(PriceToTick(sc.Low[i], tick), tpl);
+			r_hi = TickToLevel(PriceToTick(sc.High[i], tick), tpl);
+			bool used = false;
+			if (sc.VolumeAtPriceForBars != nullptr && static_cast<int>(sc.VolumeAtPriceForBars->GetNumberOfBars()) > i)
+			{
+				const int cnt = sc.VolumeAtPriceForBars->GetSizeAtBarIndex(i);
+				if (cnt > 0)
+				{
+					used = true;
+					const s_VolumeAtPriceV2* p = nullptr;
+					for (int k = 0; k < cnt; ++k)
+					{
+						if (!sc.VolumeAtPriceForBars->GetVAPElementAtIndex(i, k, &p) || p == nullptr) break;
+						const int level = TickToLevel(p->PriceInTicks, tpl);
+						vol[level] += p->Volume; total += p->Volume;
+					}
+				}
+			}
+			if (!used)
+			{
+				const double v = sc.Volume[i];
+				const int levels = Max(1, r_hi - r_lo + 1);
+				for (int lv = r_lo; lv <= r_hi; ++lv) vol[lv] += v / levels;
+				total += v;
+			}
+		}
+
+		// POC and value area (two-levels-at-a-time expansion from the POC).
+		bool ComputePocVa(const LevelMap& vol, double total, float vaPct, int& poc, int& vah, int& val)
+		{
+			if (vol.empty() || total <= 0) return false;
+			std::vector<std::pair<int, double> > v(vol.begin(), vol.end());
+			size_t pocIdx = 0; double best = -1;
+			for (size_t k = 0; k < v.size(); ++k) if (v[k].second > best) { best = v[k].second; pocIdx = k; }
+			// tie: prefer the level nearest the middle of the range
+			{
+				const size_t mid = v.size() / 2;
+				for (size_t k = 0; k < v.size(); ++k)
+					if (v[k].second == best && (k > mid ? k - mid : mid - k) < (pocIdx > mid ? pocIdx - mid : mid - pocIdx)) pocIdx = k;
+			}
+			poc = v[pocIdx].first;
+			const double target = total * vaPct / 100.0;
+			double acc = v[pocIdx].second;
+			size_t up = pocIdx, dn = pocIdx;
+			while (acc < target && (up + 1 < v.size() || dn > 0))
+			{
+				double upSum = 0, dnSum = 0;
+				if (up + 1 < v.size()) { upSum = v[up + 1].second; if (up + 2 < v.size()) upSum += v[up + 2].second; }
+				if (dn > 0) { dnSum = v[dn - 1].second; if (dn > 1) dnSum += v[dn - 2].second; }
+				if ((upSum >= dnSum && up + 1 < v.size()) || dn == 0)
+				{
+					acc += v[up + 1].second; ++up;
+					if (up + 1 < v.size() && acc < target) { acc += v[up + 1].second; ++up; }
+				}
+				else
+				{
+					acc += v[dn - 1].second; --dn;
+					if (dn > 0 && acc < target) { acc += v[dn - 1].second; --dn; }
+				}
+			}
+			vah = v[up].first; val = v[dn].first;
+			return true;
+		}
+
+		inline bool IsPivotHigh(SCStudyInterfaceRef sc, int p, int N)
+		{
+			const float h = sc.High[p];
+			for (int k = 1; k <= N; ++k) if (h <= sc.High[p - k] || h <= sc.High[p + k]) return false;
+			return true;
+		}
+		inline bool IsPivotLow(SCStudyInterfaceRef sc, int p, int N)
+		{
+			const float l = sc.Low[p];
+			for (int k = 1; k <= N; ++k) if (l >= sc.Low[p - k] || l >= sc.Low[p + k]) return false;
+			return true;
+		}
+
+		void RefreshSwingIndices(AuctionState& A)
+		{
+			A.lastSwingHigh = A.prevSwingHigh = A.lastSwingLow = A.prevSwingLow = -1;
+			for (int k = static_cast<int>(A.swings.size()) - 1; k >= 0; --k)
+			{
+				const Swing& s = A.swings[k];
+				if (s.high) { if (A.lastSwingHigh < 0) A.lastSwingHigh = k; else if (A.prevSwingHigh < 0) A.prevSwingHigh = k; }
+				else { if (A.lastSwingLow < 0) A.lastSwingLow = k; else if (A.prevSwingLow < 0) A.prevSwingLow = k; }
+				if (A.prevSwingHigh >= 0 && A.prevSwingLow >= 0) break;
+			}
+		}
+
+		// Returns true when the swing list changed (new or replaced extreme).
+		bool AddSwing(AuctionState& A, const Swing& s, float minDist, bool& r_replaced)
+		{
+			r_replaced = false;
+			if (!A.swings.empty())
+			{
+				Swing& last = A.swings.back();
+				if (last.high == s.high)
+				{
+					if ((s.high && s.price > last.price) || (!s.high && s.price < last.price)) { last = s; r_replaced = true; RefreshSwingIndices(A); return true; }
+					return false;
+				}
+				if (fabs(s.price - last.price) < minDist) return false;
+			}
+			A.swings.push_back(s);
+			if (A.swings.size() > 400) A.swings.erase(A.swings.begin(), A.swings.begin() + 100);
+			RefreshSwingIndices(A);
+			return true;
+		}
+
+		// Rebuilds single-print zones from the committed TPO map (count == 1, excluding the tails).
+		void RebuildSinglePrints(ChartState& S, int bornIdx)
+		{
+			AuctionState& A = S.auction;
+			const int tpl = Max(1, S.params.auction.profileTicksPerLevel);
+			std::vector<Zone> fresh;
+			if (A.tpoMap.size() >= 3)
+			{
+				std::vector<std::pair<int, int> > v(A.tpoMap.begin(), A.tpoMap.end());
+				size_t lo = 0, hi = v.size() - 1;
+				while (lo < v.size() && v[lo].second <= 1) ++lo;           // lower tail
+				while (hi > lo && v[hi].second <= 1) --hi;                 // upper tail
+				size_t k = lo;
+				while (k <= hi && k < v.size())
+				{
+					if (v[k].second == 1)
+					{
+						size_t e = k; while (e + 1 <= hi && v[e + 1].second == 1 && v[e + 1].first == v[e].first + 1) ++e;
+						Zone z; z.bornIdx = bornIdx; z.bottom = LevelBottom(v[k].first, S.tickSize, tpl); z.top = LevelTop(v[e].first, S.tickSize, tpl);
+						z.kind = LVL_SINGLE_PRINT; z.dir = 0; z.active = true;
+						fresh.push_back(z);
+						k = e + 1;
+					}
+					else ++k;
+				}
+			}
+			// keep line numbers of zones that still exist (same top/bottom)
+			for (size_t a = 0; a < fresh.size(); ++a)
+				for (size_t b = 0; b < A.singlePrints.size(); ++b)
+					if (A.singlePrints[b].lineNumber != 0 && fabs(A.singlePrints[b].top - fresh[a].top) < 1e-6 && fabs(A.singlePrints[b].bottom - fresh[a].bottom) < 1e-6)
+					{ fresh[a].lineNumber = A.singlePrints[b].lineNumber; fresh[a].bornIdx = A.singlePrints[b].bornIdx; A.singlePrints[b].lineNumber = 0; break; }
+			for (size_t b = 0; b < A.singlePrints.size(); ++b) if (A.singlePrints[b].lineNumber != 0) A.deadLines.push_back(A.singlePrints[b].lineNumber);
+			A.singlePrints.swap(fresh);
+		}
+
+		void FinalizeRthSession(ChartState& S, int atIdx)
+		{
+			AuctionState& A = S.auction;
+			if (A.profTotal > 0)
+			{
+				int poc, vah, val;
+				if (ComputePocVa(A.profVol, A.profTotal, S.params.auction.valueAreaPct, poc, vah, val))
+				{
+					const int tpl = Max(1, S.params.auction.profileTicksPerLevel);
+					A.prevPoc = LevelMid(poc, S.tickSize, tpl); A.prevVah = LevelTop(vah, S.tickSize, tpl); A.prevVal = LevelBottom(val, S.tickSize, tpl);
+					A.nakedPocs.push_back(A.prevPoc); A.nakedPocBorn.push_back(atIdx); A.nakedPocLine.push_back(0);
+					const int keep = Max(0, S.params.auction.nakedPocsTracked);
+					while (static_cast<int>(A.nakedPocs.size()) > keep)
+					{
+						if (A.nakedPocLine[0] != 0) A.deadLines.push_back(A.nakedPocLine[0]);
+						A.nakedPocs.erase(A.nakedPocs.begin()); A.nakedPocBorn.erase(A.nakedPocBorn.begin()); A.nakedPocLine.erase(A.nakedPocLine.begin());
+					}
+				}
+			}
+			if (A.rthHigh > -FLT_MAX) { A.prevDayHigh = A.rthHigh; A.prevDayLow = A.rthLow; }
+			if (A.ibClosed && A.ibH > -FLT_MAX) A.ibRangeHistory.push_back(A.ibH - A.ibL);
+			if (A.ibRangeHistory.size() > 200) A.ibRangeHistory.erase(A.ibRangeHistory.begin());
+			// close the TPO period and clear the session profile
+			A.profVol.clear(); A.profTotal = 0; A.tpoMap.clear(); A.periodLevels.clear(); A.lastTpoPeriod = -1;
+			for (size_t b = 0; b < A.singlePrints.size(); ++b) if (A.singlePrints[b].lineNumber != 0) A.deadLines.push_back(A.singlePrints[b].lineNumber);
+			A.singlePrints.clear();
+			A.rthHigh = -FLT_MAX; A.rthLow = FLT_MAX; A.ibH = -FLT_MAX; A.ibL = FLT_MAX; A.ibClosed = false; A.ibCloseIdx = -1;
+			A.rthOpen = 0; A.rthOpenIdx = -1; A.todayOpenType = OT_NONE; A.openTypeDone = false;
+			A.o30High = -FLT_MAX; A.o30Low = FLT_MAX; A.o30HighIdx = -1; A.o30LowIdx = -1;
+		}
+
+		int ClassifyOpen(const AuctionState& A, float atr, float close30, float& r_dir)
+		{
+			r_dir = 0;
+			const float O = A.rthOpen, H = A.o30High, L = A.o30Low;
+			const float range = H - L;
+			if (range <= 0 || atr <= 0) return OT_NONE;
+			const float openPos = (O - L) / range;            // 0 = open at low, 1 = open at high
+			const float closePos = (close30 - L) / range;
+			const bool lowFirst = A.o30LowIdx < A.o30HighIdx;
+			// Open-Drive: open at one extreme, close at the other end
+			if (openPos <= 0.15f && closePos >= 0.7f) { r_dir = 1.0f; return OT_DRIVE_UP; }
+			if (openPos >= 0.85f && closePos <= 0.3f) { r_dir = -1.0f; return OT_DRIVE_DOWN; }
+			// Open-Test-Drive: shallow test against, then drive and close at the extreme
+			if (openPos > 0.15f && openPos <= 0.35f && lowFirst && closePos >= 0.7f) { r_dir = 0.7f; return OT_TEST_DRIVE_UP; }
+			if (openPos < 0.85f && openPos >= 0.65f && !lowFirst && closePos <= 0.3f) { r_dir = -0.7f; return OT_TEST_DRIVE_DOWN; }
+			// Open-Rejection-Reverse: deep move first, then back through the open
+			if (openPos >= 0.35f && lowFirst && closePos > openPos + 0.15f) { r_dir = 0.5f; return OT_REJECT_REVERSE_UP; }
+			if (openPos <= 0.65f && !lowFirst && closePos < openPos - 0.15f) { r_dir = -0.5f; return OT_REJECT_REVERSE_DOWN; }
+			r_dir = 0; return OT_AUCTION;
+		}
+	}
+
 	void EnsureAuction(SCStudyInterfaceRef sc, ChartState& S)
 	{
-		EnsureBase(sc, S); const int n = sc.ArraySize; AuctionState& A = S.auction;
+		using namespace auction_detail;
+		EnsureBase(sc, S);
+		const int n = sc.ArraySize; if (n <= 0) return;
+		AuctionState& A = S.auction; const AuctionParams& P = S.params.auction; const BaseState& B = S.base;
 		Fit(A.poc, n); Fit(A.vah, n); Fit(A.val, n); Fit(A.pdPoc, n); Fit(A.pdVah, n); Fit(A.pdVal, n); Fit(A.pdh, n); Fit(A.pdl, n);
 		Fit(A.onHigh, n); Fit(A.onLow, n); Fit(A.ibHigh, n); Fit(A.ibLow, n); Fit(A.ibDone, n);
 		Fit(A.structTrend, n); Fit(A.bos, n); Fit(A.vaPos, n); Fit(A.pocPos, n); Fit(A.ibPos, n); Fit(A.valueMig, n); Fit(A.openTypeDir, n);
 		Fit(A.openType, n); Fit(A.swingHighMark, n); Fit(A.swingLowMark, n); Fit(A.bosMark, n); Fit(A.chochMark, n);
-		A.computedThrough = n - 2; A.lastArraySize = n;
+		if (A.UpToDate(sc)) return;   // nothing new since the last Ensure in this update cycle
+		int from = A.computedThrough + 1; if (from < 0) from = 0; if (from > n - 1) from = n - 1;
+		const int tpl = Max(1, P.profileTicksPerLevel);
+		const float tick = S.tickSize;
+		const int N = Max(2, P.swingStrength);
+
+		for (int i = from; i < n; ++i)
+		{
+			const bool closed = (i <= n - 2);
+			const float atr = AtrAt(S, i);
+			const float c = sc.Close[i], h = sc.High[i], l = sc.Low[i];
+			const bool rth = B.isRth[i] != 0;
+			const bool newDay = (i == 0) || (B.tradingDay[i] != B.tradingDay[i - 1]);
+			const bool prevRth = (i > 0) && B.isRth[i - 1] != 0;
+
+			// ---- session transitions (idempotent thanks to the guards) ----
+			if (prevRth && (!rth || newDay) && A.finalizedSession != B.rthSession[i - 1]) { A.finalizedSession = B.rthSession[i - 1]; FinalizeRthSession(S, i); }
+			if (newDay && A.curDay != B.tradingDay[i])
+			{
+				A.curDay = B.tradingDay[i];
+				A.onH = -FLT_MAX; A.onL = FLT_MAX;
+			}
+			if (rth && !prevRth && A.rthOpenIdx != i && A.rthOpenSession != B.rthSession[i])
+			{
+				A.rthOpenSession = B.rthSession[i]; A.rthOpen = sc.Open[i]; A.rthOpenIdx = i; A.todayOpenType = OT_NONE; A.openTypeDone = false;
+				A.o30High = -FLT_MAX; A.o30Low = FLT_MAX; A.o30HighIdx = A.o30LowIdx = -1;
+				A.profVol.clear(); A.profTotal = 0; A.tpoMap.clear(); A.periodLevels.clear(); A.lastTpoPeriod = -1;
+				A.rthHigh = -FLT_MAX; A.rthLow = FLT_MAX; A.ibH = -FLT_MAX; A.ibL = FLT_MAX; A.ibClosed = false; A.ibCloseIdx = -1;
+			}
+
+			// ---- provisional copies of the committed accumulators for this bar ----
+			float onH = A.onH, onL = A.onL, ibH = A.ibH, ibL = A.ibL, rthHigh = A.rthHigh, rthLow = A.rthLow;
+			bool ibClosed = A.ibClosed;
+			if (!rth && B.rthStartIdx[i] < 0)
+			{
+				// overnight: this trading day has not opened its RTH session yet
+				onH = Max(onH, h); onL = Min(onL, l);
+				if (closed) { A.onH = onH; A.onL = onL; }
+			}
+			if (rth)
+			{
+				rthHigh = Max(rthHigh, h); rthLow = Min(rthLow, l);
+				const bool inIb = B.secIntoRth[i] < P.ibMinutes * 60;
+				if (inIb) { ibH = Max(ibH, h); ibL = Min(ibL, l); }
+				else if (!ibClosed && ibH > -FLT_MAX) { ibClosed = true; }
+				if (closed) { A.rthHigh = rthHigh; A.rthLow = rthLow; A.ibH = ibH; A.ibL = ibL; if (ibClosed && !A.ibClosed) { A.ibClosed = true; A.ibCloseIdx = i; } }
+			}
+
+			// ---- profile (committed on closed bars; forming bar evaluated on a copy) ----
+			float poc = 0, vah = 0, val = 0;
+			if (rth)
+			{
+				int lo = 0, hi = 0;
+				if (closed)
+				{
+					AddBarToProfile(sc, S, i, A.profVol, A.profTotal, lo, hi);
+					const int period = B.secIntoRth[i] / Max(60, P.tpoMinutes * 60);
+					if (A.lastTpoPeriod >= 0 && period != A.lastTpoPeriod)
+					{
+						// commit the period that just finished (levels touched by its closed bars)
+						for (std::set<int>::const_iterator it = A.periodLevels.begin(); it != A.periodLevels.end(); ++it) A.tpoMap[*it] += 1;
+						A.periodLevels.clear();
+						RebuildSinglePrints(S, i);
+					}
+					for (int lv = lo; lv <= hi; ++lv) A.periodLevels.insert(lv);
+					A.lastTpoPeriod = period;
+					int p, vh, vl;
+					if (ComputePocVa(A.profVol, A.profTotal, P.valueAreaPct, p, vh, vl)) { poc = LevelMid(p, tick, tpl); vah = LevelTop(vh, tick, tpl); val = LevelBottom(vl, tick, tpl); }
+				}
+				else
+				{
+					LevelMap tmp(A.profVol); double tot = A.profTotal;
+					AddBarToProfile(sc, S, i, tmp, tot, lo, hi);
+					int p, vh, vl;
+					if (ComputePocVa(tmp, tot, P.valueAreaPct, p, vh, vl)) { poc = LevelMid(p, tick, tpl); vah = LevelTop(vh, tick, tpl); val = LevelBottom(vl, tick, tpl); }
+				}
+				A.devPoc = poc; A.devVah = vah; A.devVal = val;
+			}
+
+			// ---- open type after the first N minutes ----
+			if (rth && A.rthOpenIdx >= 0)
+			{
+				const int evalSec = P.openTypeMinutes * 60;
+				if (B.secIntoRth[i] < evalSec)
+				{
+					if (closed)
+					{
+						if (h > A.o30High) { A.o30High = h; A.o30HighIdx = i; }
+						if (l < A.o30Low) { A.o30Low = l; A.o30LowIdx = i; }
+					}
+				}
+				else if (!A.openTypeDone && closed && A.o30HighIdx >= 0)
+				{
+					float dir = 0; A.todayOpenType = static_cast<signed char>(ClassifyOpen(A, atr, sc.Close[i - 1], dir)); A.openTypeDirValue = dir; A.openTypeDone = true;
+				}
+			}
+
+			// ---- swings (confirmed N bars late, closed bars only) ----
+			bool swingsChanged = false;
+			if (closed && i - 2 * N >= 0)
+			{
+				const int p = i - N;
+				const float minDist = P.swingMinAtr * AtrAt(S, p);
+				bool replaced = false;
+				if (IsPivotHigh(sc, p, N)) { Swing s; s.idx = p; s.price = sc.High[p]; s.confirmIdx = i; s.high = true; if (AddSwing(A, s, minDist, replaced)) { swingsChanged = true; A.lastHighBroken = false; A.swingHighMark[p] = 1; A.dirtyFrom = Min(A.dirtyFrom, p); } }
+				if (IsPivotLow(sc, p, N)) { Swing s; s.idx = p; s.price = sc.Low[p]; s.confirmIdx = i; s.high = false; if (AddSwing(A, s, minDist, replaced)) { swingsChanged = true; A.lastLowBroken = false; A.swingLowMark[p] = 1; A.dirtyFrom = Min(A.dirtyFrom, p); } }
+				if (swingsChanged)
+				{
+					// liquidity pools: equal highs / lows within tolerance
+					const float tol = P.equalTolTicks * tick;
+					const Swing& ns = A.swings.back();
+					for (int k = static_cast<int>(A.swings.size()) - 2; k >= 0 && k >= static_cast<int>(A.swings.size()) - 8; --k)
+					{
+						const Swing& q = A.swings[k];
+						if (q.high != ns.high || fabs(q.price - ns.price) > tol) continue;
+						bool merged = false;
+						for (size_t z = 0; z < A.liquidity.size(); ++z)
+						{
+							Zone& Z = A.liquidity[z];
+							if (!Z.active || (Z.kind == LVL_LIQ_EQH) != ns.high) continue;
+							if (ns.price >= Z.bottom - tol && ns.price <= Z.top + tol) { Z.top = Max(Z.top, ns.price); Z.bottom = Min(Z.bottom, ns.price); merged = true; break; }
+						}
+						if (!merged)
+						{
+							Zone Z; Z.bornIdx = q.idx; Z.top = Max(q.price, ns.price); Z.bottom = Min(q.price, ns.price); Z.kind = ns.high ? LVL_LIQ_EQH : LVL_LIQ_EQL; Z.dir = ns.high ? -1 : 1; Z.active = true;
+							A.liquidity.push_back(Z);
+						}
+						break;
+					}
+					while (static_cast<int>(A.liquidity.size()) > 60) { if (A.liquidity[0].lineNumber) A.deadLines.push_back(A.liquidity[0].lineNumber); A.liquidity.erase(A.liquidity.begin()); }
+				}
+			}
+
+			// structure trend
+			float st = 0;
+			if (A.lastSwingHigh >= 0 && A.prevSwingHigh >= 0 && A.lastSwingLow >= 0 && A.prevSwingLow >= 0)
+			{
+				const bool hh = A.swings[A.lastSwingHigh].price > A.swings[A.prevSwingHigh].price;
+				const bool hl = A.swings[A.lastSwingLow].price > A.swings[A.prevSwingLow].price;
+				if (hh && hl) st = 1; else if (!hh && !hl) st = -1; else st = 0;
+			}
+
+			// BOS / CHoCH on closed bars
+			if (closed)
+			{
+				const float prevTrend = (i > 0) ? A.structTrend[i - 1] : 0;
+				if (A.lastSwingHigh >= 0 && !A.lastHighBroken && A.swings[A.lastSwingHigh].idx < i && c > A.swings[A.lastSwingHigh].price)
+				{
+					A.lastHighBroken = true;
+					if (prevTrend < 0) { A.chochMark[i] = 1; A.lastChochDir = 1; A.lastChochIdx = i; } else { A.bosMark[i] = 1; }
+					A.lastBosDir = 1; A.lastBosIdx = i;
+				}
+				if (A.lastSwingLow >= 0 && !A.lastLowBroken && A.swings[A.lastSwingLow].idx < i && c < A.swings[A.lastSwingLow].price)
+				{
+					A.lastLowBroken = true;
+					if (prevTrend > 0) { A.chochMark[i] = -1; A.lastChochDir = -1; A.lastChochIdx = i; } else { A.bosMark[i] = -1; }
+					A.lastBosDir = -1; A.lastBosIdx = i;
+				}
+				// liquidity pools die when a close goes through them
+				for (size_t z = 0; z < A.liquidity.size(); ++z)
+				{
+					Zone& Z = A.liquidity[z]; if (!Z.active) continue;
+					if ((Z.kind == LVL_LIQ_EQH && c > Z.top) || (Z.kind == LVL_LIQ_EQL && c < Z.bottom)) { Z.active = false; Z.deadIdx = i; }
+				}
+				// naked POCs tested?
+				for (size_t k = 0; k < A.nakedPocs.size(); )
+				{
+					if (l <= A.nakedPocs[k] && h >= A.nakedPocs[k] && i > A.nakedPocBorn[k])
+					{
+						if (A.nakedPocLine[k] != 0) A.deadLines.push_back(A.nakedPocLine[k]);
+						A.nakedPocs.erase(A.nakedPocs.begin() + k); A.nakedPocBorn.erase(A.nakedPocBorn.begin() + k); A.nakedPocLine.erase(A.nakedPocLine.begin() + k);
+					}
+					else ++k;
+				}
+			}
+
+			// ---- outputs ----
+			A.structTrend[i] = st;
+			const float decay = static_cast<float>(Max(1, P.bosDecayBars));
+			A.bos[i] = (A.lastBosIdx >= 0 && i >= A.lastBosIdx) ? static_cast<float>(A.lastBosDir) * static_cast<float>(exp(-(i - A.lastBosIdx) / decay)) : 0.0f;
+			A.poc[i] = poc; A.vah[i] = vah; A.val[i] = val;
+			A.pdPoc[i] = A.prevPoc; A.pdVah[i] = A.prevVah; A.pdVal[i] = A.prevVal; A.pdh[i] = A.prevDayHigh; A.pdl[i] = A.prevDayLow;
+			A.onHigh[i] = onH > -FLT_MAX ? onH : 0.0f; A.onLow[i] = onL < FLT_MAX ? onL : 0.0f;
+			A.ibHigh[i] = (rth && ibH > -FLT_MAX) ? ibH : 0.0f; A.ibLow[i] = (rth && ibL < FLT_MAX) ? ibL : 0.0f; A.ibDone[i] = (rth && ibClosed) ? 1 : 0;
+			// location features
+			if (vah > val && atr > 0)
+			{
+				if (c > vah) A.vaPos[i] = Clamp1(0.5 + 0.5 * (c - vah) / atr);
+				else if (c < val) A.vaPos[i] = Clamp1(-0.5 - 0.5 * (val - c) / atr);
+				else A.vaPos[i] = Clamp1(((c - val) / (vah - val) - 0.5) * 1.0);
+				A.pocPos[i] = Clamp1((c - poc) / (2.0 * atr));
+			}
+			else { A.vaPos[i] = (i > 0) ? A.vaPos[i - 1] * 0.9f : 0.0f; A.pocPos[i] = (i > 0) ? A.pocPos[i - 1] * 0.9f : 0.0f; }
+			if (rth && ibClosed && ibH > ibL && atr > 0)
+			{
+				const float mid = 0.5f * (ibH + ibL);
+				if (c > ibH) A.ibPos[i] = Clamp1(0.5 + 0.5 * (c - ibH) / atr);
+				else if (c < ibL) A.ibPos[i] = Clamp1(-0.5 - 0.5 * (ibL - c) / atr);
+				else A.ibPos[i] = Clamp1((c - mid) / (ibH - ibL));
+			}
+			else A.ibPos[i] = 0;
+			// value migration (needs a developing VA and a prior-day VA)
+			if (rth && vah > val && A.prevVah > A.prevVal && B.secIntoRth[i] >= 1800)
+			{
+				const float ov = Max(0.0f, Min(vah, A.prevVah) - Max(val, A.prevVal));
+				const float w = Min(vah - val, A.prevVah - A.prevVal);
+				if (w > 0 && ov / w >= 0.5f) A.valueMig[i] = 0; else A.valueMig[i] = Sign(poc - A.prevPoc);
+			}
+			else A.valueMig[i] = (i > 0 && rth) ? A.valueMig[i - 1] : 0.0f;
+			A.openType[i] = rth ? A.todayOpenType : static_cast<signed char>(OT_NONE);
+			A.openTypeDir[i] = (rth && A.openTypeDone && B.secIntoRth[i] <= 2 * 3600) ? A.openTypeDirValue : 0.0f;
+		}
+		A.Stamp(sc);
+
+		// ---- level snapshot for HUD / targets (auction part) ----
+		A.levels.clear();
+		const int li = n - 1;
+		const float pc = sc.Close[li];
+		if (A.poc[li] > 0) { A.levels.push_back({ A.poc[li], LVL_POC, li }); A.levels.push_back({ A.vah[li], LVL_VAH, li }); A.levels.push_back({ A.val[li], LVL_VAL, li }); }
+		if (A.pdPoc[li] > 0) { A.levels.push_back({ A.pdPoc[li], LVL_PD_POC, li }); A.levels.push_back({ A.pdVah[li], LVL_PD_VAH, li }); A.levels.push_back({ A.pdVal[li], LVL_PD_VAL, li }); }
+		if (A.pdh[li] > 0) { A.levels.push_back({ A.pdh[li], LVL_PDH, li }); A.levels.push_back({ A.pdl[li], LVL_PDL, li }); }
+		if (A.onHigh[li] > 0) { A.levels.push_back({ A.onHigh[li], LVL_ONH, li }); A.levels.push_back({ A.onLow[li], LVL_ONL, li }); }
+		if (A.ibHigh[li] > 0 && A.ibDone[li])
+		{
+			const float r = A.ibHigh[li] - A.ibLow[li];
+			A.levels.push_back({ A.ibHigh[li], LVL_IBH, li }); A.levels.push_back({ A.ibLow[li], LVL_IBL, li });
+			const float m[3] = { P.ibExtA, P.ibExtB, P.ibExtC };
+			for (int k = 0; k < 3; ++k) if (m[k] > 0) { A.levels.push_back({ A.ibHigh[li] + r * m[k], LVL_IBEXT, li }); A.levels.push_back({ A.ibLow[li] - r * m[k], LVL_IBEXT, li }); }
+		}
+		for (size_t k = 0; k < A.nakedPocs.size(); ++k) A.levels.push_back({ A.nakedPocs[k], LVL_NAKED_POC, A.nakedPocBorn[k] });
+		if (A.lastSwingHigh >= 0) A.levels.push_back({ A.swings[A.lastSwingHigh].price, LVL_SWING_H, A.swings[A.lastSwingHigh].idx });
+		if (A.lastSwingLow >= 0) A.levels.push_back({ A.swings[A.lastSwingLow].price, LVL_SWING_L, A.swings[A.lastSwingLow].idx });
+		for (size_t z = 0; z < A.liquidity.size(); ++z) if (A.liquidity[z].active) A.levels.push_back({ 0.5f * (A.liquidity[z].top + A.liquidity[z].bottom), A.liquidity[z].kind, A.liquidity[z].bornIdx });
+		(void)pc;
 	}
+
+	// ==== 7  VWAP engine ========================================================
+	namespace vwap_detail
+	{
+		inline float Tp(SCStudyInterfaceRef sc, int i) { return (sc.High[i] + sc.Low[i] + sc.Close[i]) / 3.0f; }
+
+		// Anchored VWAP sums from bar a to bar b inclusive.
+		inline void SumRange(SCStudyInterfaceRef sc, int a, int b, double& pv, double& v)
+		{
+			pv = 0; v = 0;
+			for (int k = Max(0, a); k <= b; ++k) { const double vol = sc.Volume[k]; pv += Tp(sc, k) * vol; v += vol; }
+		}
+	}
+
 	void EnsureVwap(SCStudyInterfaceRef sc, ChartState& S)
 	{
-		EnsureAuction(sc, S); const int n = sc.ArraySize; VwapState& V = S.vwap;
+		using namespace vwap_detail;
+		EnsureAuction(sc, S);
+		const int n = sc.ArraySize; if (n <= 0) return;
+		VwapState& V = S.vwap; const VwapParams& P = S.params.vwap; const BaseState& B = S.base; const AuctionState& A = S.auction;
 		Fit(V.vwap, n); Fit(V.sd, n); Fit(V.b1u, n); Fit(V.b1d, n); Fit(V.b2u, n); Fit(V.b2d, n); Fit(V.b3u, n); Fit(V.b3d, n);
 		Fit(V.avOn, n); Fit(V.avRth, n); Fit(V.avSwHi, n); Fit(V.avSwLo, n); Fit(V.slope, n); Fit(V.pos, n); Fit(V.accept, n);
-		V.computedThrough = n - 2; V.lastArraySize = n;
+		if (V.UpToDate(sc)) return;
+		int from = V.computedThrough + 1; if (from < 0) from = 0; if (from > n - 1) from = n - 1;
+		const int k = Max(1, P.slopeBars);
+
+		for (int i = from; i < n; ++i)
+		{
+			const bool closed = (i <= n - 2);
+			const float atr = AtrAt(S, i);
+			const double vol = sc.Volume[i];
+			const double tp = Tp(sc, i);
+			const double pv = tp * vol, ppv = tp * tp * vol;
+			const bool rth = B.isRth[i] != 0;
+
+			// --- session VWAP (anchor: RTH open or trading-day start) ---
+			int sessionKey = (P.anchor == 0) ? (rth ? B.rthSession[i] : -1) : B.tradingDay[i];
+			if (P.anchor == 0 && !rth) sessionKey = -1;
+			if (sessionKey != V.sSession) { V.sPV = V.sPPV = V.sV = 0; V.sSession = sessionKey; V.sStartIdx = i; V.acceptRun = 0; }
+			double sPV = V.sPV + pv, sPPV = V.sPPV + ppv, sV = V.sV + vol;
+			float vwap = 0, sd = 0;
+			if (sessionKey >= 0 && sV > 0)
+			{
+				vwap = static_cast<float>(sPV / sV);
+				const double var = sPPV / sV - static_cast<double>(vwap) * vwap;
+				sd = var > 0 ? static_cast<float>(sqrt(var)) : 0.0f;
+			}
+			if (closed) { V.sPV = sPV; V.sPPV = sPPV; V.sV = sV; }
+			V.vwap[i] = vwap; V.sd[i] = sd;
+			V.b1u[i] = vwap > 0 ? vwap + P.band1 * sd : 0; V.b1d[i] = vwap > 0 ? vwap - P.band1 * sd : 0;
+			V.b2u[i] = vwap > 0 ? vwap + P.band2 * sd : 0; V.b2d[i] = vwap > 0 ? vwap - P.band2 * sd : 0;
+			V.b3u[i] = vwap > 0 ? vwap + P.band3 * sd : 0; V.b3d[i] = vwap > 0 ? vwap - P.band3 * sd : 0;
+
+			// --- overnight-open anchored (trading day start) ---
+			if (B.tradingDay[i] != V.oDay) { V.oPV = V.oV = 0; V.oDay = B.tradingDay[i]; }
+			{ const double a = V.oPV + pv, b = V.oV + vol; V.avOn[i] = b > 0 ? static_cast<float>(a / b) : 0.0f; if (closed) { V.oPV = a; V.oV = b; } }
+
+			// --- RTH-open anchored ---
+			{
+				const int key = rth ? B.rthSession[i] : -1;
+				if (key != V.rSession) { V.rPV = V.rV = 0; V.rSession = key; }
+				const double a = V.rPV + pv, b = V.rV + vol;
+				V.avRth[i] = (key >= 0 && b > 0) ? static_cast<float>(a / b) : 0.0f;
+				if (closed) { V.rPV = a; V.rV = b; }
+			}
+
+			// --- swing-anchored (last confirmed swing high / low) ---
+			{
+				const int hIdx = A.lastSwingHigh >= 0 ? A.swings[A.lastSwingHigh].idx : -1;
+				const int lIdx = A.lastSwingLow >= 0 ? A.swings[A.lastSwingLow].idx : -1;
+				if (hIdx != V.hAnchor)
+				{
+					V.hAnchor = hIdx;
+					if (hIdx >= 0)
+					{
+						// back-fill from the pivot bar up to the last committed bar, then continue incrementally
+						double cpv = 0, cv = 0;
+						for (int j = hIdx; j < i; ++j) { const double vv = sc.Volume[j]; cpv += Tp(sc, j) * vv; cv += vv; V.avSwHi[j] = cv > 0 ? static_cast<float>(cpv / cv) : 0.0f; }
+						V.hPV = cpv; V.hV = cv; V.dirtyFrom = Min(V.dirtyFrom, hIdx);
+					}
+					else { V.hPV = V.hV = 0; }
+				}
+				if (lIdx != V.lAnchor)
+				{
+					V.lAnchor = lIdx;
+					if (lIdx >= 0)
+					{
+						double cpv = 0, cv = 0;
+						for (int j = lIdx; j < i; ++j) { const double vv = sc.Volume[j]; cpv += Tp(sc, j) * vv; cv += vv; V.avSwLo[j] = cv > 0 ? static_cast<float>(cpv / cv) : 0.0f; }
+						V.lPV = cpv; V.lV = cv; V.dirtyFrom = Min(V.dirtyFrom, lIdx);
+					}
+					else { V.lPV = V.lV = 0; }
+				}
+				if (hIdx >= 0) { const double a = V.hPV + pv, b = V.hV + vol; V.avSwHi[i] = b > 0 ? static_cast<float>(a / b) : 0.0f; if (closed) { V.hPV = a; V.hV = b; } } else V.avSwHi[i] = 0;
+				if (lIdx >= 0) { const double a = V.lPV + pv, b = V.lV + vol; V.avSwLo[i] = b > 0 ? static_cast<float>(a / b) : 0.0f; if (closed) { V.lPV = a; V.lV = b; } } else V.avSwLo[i] = 0;
+			}
+
+			// --- features ---
+			const float c = sc.Close[i];
+			if (vwap > 0 && i - k >= 0 && V.vwap[i - k] > 0 && atr > 0 && (i - k) >= V.sStartIdx)
+				V.slope[i] = Clamp1(((vwap - V.vwap[i - k]) / atr) / 0.5);
+			else V.slope[i] = 0;
+			if (vwap > 0) { const float scale = sd > 0.25f * atr ? 2.0f * sd : Max(atr, S.tickSize); V.pos[i] = Clamp1((c - vwap) / scale); }
+			else V.pos[i] = 0;
+			// acceptance / rejection (closed bars drive the run counter; forming bar reads it)
+			int run = V.acceptRun;
+			float acc = 0;
+			if (vwap > 0)
+			{
+				const int side = c > vwap ? 1 : (c < vwap ? -1 : 0);
+				if (side > 0) run = run > 0 ? run + 1 : 1; else if (side < 0) run = run < 0 ? run - 1 : -1;
+				if (run >= P.acceptCloses) acc = 1.0f; else if (run <= -P.acceptCloses) acc = -1.0f;
+				else if (sc.Low[i] < vwap && sc.High[i] > vwap)
+				{
+					// traded through and closed back on the prior side = rejection
+					const float prevC = i > 0 ? sc.Close[i - 1] : c;
+					if (c > vwap && prevC > vwap) acc = 0.5f; else if (c < vwap && prevC < vwap) acc = -0.5f;
+				}
+				if (closed) V.acceptRun = run;
+			}
+			V.accept[i] = acc;
+		}
+		V.Stamp(sc);
 	}
+
+	// Phase stubs for engines not yet implemented: size arrays and mark computed so downstream code is safe.
 	void EnsureFlow(SCStudyInterfaceRef sc, ChartState& S)
 	{
 		EnsureVwap(sc, S); const int n = sc.ArraySize; FlowState& F = S.flow;
@@ -1231,20 +1825,86 @@ SCSFExport scsf_NQEdge_Auction(SCStudyInterfaceRef sc)
 	CheckWarnings(sc, S);
 	EnsureAuction(sc, S);
 
-	// Subgraph mirror (phase 2 fills the engine; here arrays are zero)
+	// Subgraph mirror
 	int& gen = sc.GetPersistentInt(1);
-	int start = sc.UpdateStartIndex;
+	int start = Min(sc.UpdateStartIndex, S.auction.dirtyFrom); S.auction.dirtyFrom = INT_MAX;
 	if (gen != S.auction.generation) { start = 0; gen = S.auction.generation; }
-	const AuctionState& A = S.auction;
+	if (start < 0) start = 0;
+	const AuctionState& A = S.auction; const AuctionParams& P = S.params.auction;
+	const bool dDev = sc.Input[AI_D_DEVVA].GetYesNo() != 0, dPd = sc.Input[AI_D_PDVA].GetYesNo() != 0, dOn = sc.Input[AI_D_ON].GetYesNo() != 0, dIb = sc.Input[AI_D_IB].GetYesNo() != 0;
+	const bool dPdhl = sc.Input[AI_D_PDHL].GetYesNo() != 0, dSw = sc.Input[AI_D_SWING].GetYesNo() != 0, dBos = sc.Input[AI_D_BOS].GetYesNo() != 0;
+	sc.Subgraph[AS_POC].PrimaryColor = sc.Input[AI_C_POC].GetColor(); sc.Subgraph[AS_VAH].PrimaryColor = sc.Subgraph[AS_VAL].PrimaryColor = sc.Input[AI_C_VA].GetColor();
+	sc.Subgraph[AS_PDPOC].PrimaryColor = sc.Subgraph[AS_PDVAH].PrimaryColor = sc.Subgraph[AS_PDVAL].PrimaryColor = sc.Input[AI_C_PD].GetColor();
+	sc.Subgraph[AS_ONH].PrimaryColor = sc.Subgraph[AS_ONL].PrimaryColor = sc.Input[AI_C_ON].GetColor();
+	sc.Subgraph[AS_IBH].PrimaryColor = sc.Subgraph[AS_IBL].PrimaryColor = sc.Input[AI_C_IB].GetColor();
+	for (int k = AS_IBEXT_AU; k <= AS_IBEXT_CD; ++k) sc.Subgraph[k].PrimaryColor = sc.Input[AI_C_IBEXT].GetColor();
+	sc.Subgraph[AS_PDH].PrimaryColor = sc.Subgraph[AS_PDL].PrimaryColor = sc.Input[AI_C_PD].GetColor();
+	sc.Subgraph[AS_SWH].PrimaryColor = sc.Input[AI_C_SWH].GetColor(); sc.Subgraph[AS_SWL].PrimaryColor = sc.Input[AI_C_SWL].GetColor();
+	sc.Subgraph[AS_BOSU].PrimaryColor = sc.Subgraph[AS_BOSD].PrimaryColor = sc.Input[AI_C_BOS].GetColor();
+	sc.Subgraph[AS_CHU].PrimaryColor = sc.Subgraph[AS_CHD].PrimaryColor = sc.Input[AI_C_CHOCH].GetColor();
+	sc.Subgraph[AS_POC].DrawStyle = dDev ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE; sc.Subgraph[AS_VAH].DrawStyle = sc.Subgraph[AS_VAL].DrawStyle = dDev ? DRAWSTYLE_DASH : DRAWSTYLE_IGNORE;
+	sc.Subgraph[AS_PDPOC].DrawStyle = sc.Subgraph[AS_PDVAH].DrawStyle = sc.Subgraph[AS_PDVAL].DrawStyle = dPd ? DRAWSTYLE_DASH : DRAWSTYLE_IGNORE;
+	sc.Subgraph[AS_ONH].DrawStyle = sc.Subgraph[AS_ONL].DrawStyle = dOn ? DRAWSTYLE_DASH : DRAWSTYLE_IGNORE;
+	sc.Subgraph[AS_IBH].DrawStyle = sc.Subgraph[AS_IBL].DrawStyle = dIb ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE;
+	for (int k = AS_IBEXT_AU; k <= AS_IBEXT_CD; ++k) sc.Subgraph[k].DrawStyle = dIb ? DRAWSTYLE_DASH : DRAWSTYLE_IGNORE;
+	sc.Subgraph[AS_PDH].DrawStyle = sc.Subgraph[AS_PDL].DrawStyle = dPdhl ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE;
+	sc.Subgraph[AS_SWH].DrawStyle = dSw ? DRAWSTYLE_TRIANGLE_DOWN : DRAWSTYLE_IGNORE; sc.Subgraph[AS_SWL].DrawStyle = dSw ? DRAWSTYLE_TRIANGLE_UP : DRAWSTYLE_IGNORE;
+	sc.Subgraph[AS_BOSU].DrawStyle = dBos ? DRAWSTYLE_ARROW_UP : DRAWSTYLE_IGNORE; sc.Subgraph[AS_BOSD].DrawStyle = dBos ? DRAWSTYLE_ARROW_DOWN : DRAWSTYLE_IGNORE;
+	sc.Subgraph[AS_CHU].DrawStyle = dBos ? DRAWSTYLE_DIAMOND : DRAWSTYLE_IGNORE; sc.Subgraph[AS_CHD].DrawStyle = dBos ? DRAWSTYLE_DIAMOND : DRAWSTYLE_IGNORE;
+
 	for (int i = start; i < sc.ArraySize; ++i)
 	{
 		sc.Subgraph[AS_POC][i] = A.poc[i]; sc.Subgraph[AS_VAH][i] = A.vah[i]; sc.Subgraph[AS_VAL][i] = A.val[i];
 		sc.Subgraph[AS_PDPOC][i] = A.pdPoc[i]; sc.Subgraph[AS_PDVAH][i] = A.pdVah[i]; sc.Subgraph[AS_PDVAL][i] = A.pdVal[i];
-		sc.Subgraph[AS_ONH][i] = A.onHigh[i]; sc.Subgraph[AS_ONL][i] = A.onLow[i]; sc.Subgraph[AS_IBH][i] = A.ibHigh[i]; sc.Subgraph[AS_IBL][i] = A.ibLow[i];
+		sc.Subgraph[AS_ONH][i] = A.onHigh[i]; sc.Subgraph[AS_ONL][i] = A.onLow[i];
+		const float ibh = A.ibHigh[i], ibl = A.ibLow[i]; const float r = ibh - ibl;
+		sc.Subgraph[AS_IBH][i] = ibh; sc.Subgraph[AS_IBL][i] = ibl;
+		const bool ext = A.ibDone[i] != 0 && ibh > 0;
+		sc.Subgraph[AS_IBEXT_AU][i] = ext && P.ibExtA > 0 ? ibh + r * P.ibExtA : 0; sc.Subgraph[AS_IBEXT_AD][i] = ext && P.ibExtA > 0 ? ibl - r * P.ibExtA : 0;
+		sc.Subgraph[AS_IBEXT_BU][i] = ext && P.ibExtB > 0 ? ibh + r * P.ibExtB : 0; sc.Subgraph[AS_IBEXT_BD][i] = ext && P.ibExtB > 0 ? ibl - r * P.ibExtB : 0;
+		sc.Subgraph[AS_IBEXT_CU][i] = ext && P.ibExtC > 0 ? ibh + r * P.ibExtC : 0; sc.Subgraph[AS_IBEXT_CD][i] = ext && P.ibExtC > 0 ? ibl - r * P.ibExtC : 0;
 		sc.Subgraph[AS_PDH][i] = A.pdh[i]; sc.Subgraph[AS_PDL][i] = A.pdl[i];
+		sc.Subgraph[AS_SWH][i] = A.swingHighMark[i] ? sc.High[i] : 0.0f; sc.Subgraph[AS_SWL][i] = A.swingLowMark[i] ? sc.Low[i] : 0.0f;
+		sc.Subgraph[AS_BOSU][i] = A.bosMark[i] > 0 ? sc.Low[i] : 0.0f; sc.Subgraph[AS_BOSD][i] = A.bosMark[i] < 0 ? sc.High[i] : 0.0f;
+		sc.Subgraph[AS_CHU][i] = A.chochMark[i] > 0 ? sc.Low[i] : 0.0f; sc.Subgraph[AS_CHD][i] = A.chochMark[i] < 0 ? sc.High[i] : 0.0f;
 		sc.Subgraph[AS_F_STRUCT][i] = A.structTrend[i]; sc.Subgraph[AS_F_BOS][i] = A.bos[i]; sc.Subgraph[AS_F_VAPOS][i] = A.vaPos[i];
 		sc.Subgraph[AS_F_POCPOS][i] = A.pocPos[i]; sc.Subgraph[AS_F_IBPOS][i] = A.ibPos[i]; sc.Subgraph[AS_F_VALMIG][i] = A.valueMig[i]; sc.Subgraph[AS_F_OPEN][i] = A.openTypeDir[i];
 	}
+
+	// Drawings owned by this study: naked POC rays, single-print zones, liquidity pools
+	AuctionState& AW = S.auction;
+	for (size_t k = 0; k < AW.deadLines.size(); ++k) { int ln = AW.deadLines[k]; DeleteDrawing(sc, ln); }
+	AW.deadLines.clear();
+	const int last = sc.ArraySize - 1;
+	const int maxZones = Max(5, sc.Input[AI_MAX_ZONES].GetInt());
+	if (sc.Input[AI_D_NAKED].GetYesNo())
+	{
+		for (size_t k = 0; k < AW.nakedPocs.size(); ++k)
+		{
+			char txt[32]; sprintf_s(txt, sizeof(txt), "nPOC");
+			DrawRay(sc, AW.nakedPocLine[k], AW.nakedPocBorn[k], AW.nakedPocs[k], sc.Input[AI_C_NAKED].GetColor(), 1, LINESTYLE_DOT, txt);
+		}
+	}
+	else for (size_t k = 0; k < AW.nakedPocLine.size(); ++k) DeleteDrawing(sc, AW.nakedPocLine[k]);
+	if (sc.Input[AI_D_SINGLE].GetYesNo())
+	{
+		int drawn = 0;
+		for (size_t z = 0; z < AW.singlePrints.size() && drawn < maxZones; ++z, ++drawn)
+			DrawRect(sc, AW.singlePrints[z].lineNumber, AW.singlePrints[z].bornIdx, last, AW.singlePrints[z].top, AW.singlePrints[z].bottom, sc.Input[AI_C_SINGLE].GetColor(), 75, "single prints");
+	}
+	else for (size_t z = 0; z < AW.singlePrints.size(); ++z) DeleteDrawing(sc, AW.singlePrints[z].lineNumber);
+	if (sc.Input[AI_D_LIQ].GetYesNo())
+	{
+		int drawn = 0;
+		for (int z = static_cast<int>(AW.liquidity.size()) - 1; z >= 0; --z)
+		{
+			Zone& Z = AW.liquidity[z];
+			if (!Z.active) { if (Z.deadIdx >= 0 && last - Z.deadIdx > 5) DeleteDrawing(sc, Z.lineNumber); else if (Z.lineNumber) DrawRect(sc, Z.lineNumber, Z.bornIdx, Z.deadIdx, Z.top, Z.bottom, sc.Input[AI_C_LIQ].GetColor(), 85); continue; }
+			if (drawn++ >= maxZones) { DeleteDrawing(sc, Z.lineNumber); continue; }
+			DrawRect(sc, Z.lineNumber, Z.bornIdx, last, Z.top, Z.bottom, sc.Input[AI_C_LIQ].GetColor(), 70, Z.kind == LVL_LIQ_EQH ? "EQH liquidity" : "EQL liquidity");
+		}
+	}
+	else for (size_t z = 0; z < AW.liquidity.size(); ++z) DeleteDrawing(sc, AW.liquidity[z].lineNumber);
 }
 
 // --- 2. VWAP ------------------------------------------------------------------
@@ -1304,8 +1964,9 @@ SCSFExport scsf_NQEdge_VWAP(SCStudyInterfaceRef sc)
 	sc.Subgraph[VS_SWH].DrawStyle = dW ? DRAWSTYLE_DASH : DRAWSTYLE_IGNORE; sc.Subgraph[VS_SWL].DrawStyle = dW ? DRAWSTYLE_DASH : DRAWSTYLE_IGNORE;
 
 	int& gen = sc.GetPersistentInt(1);
-	int start = sc.UpdateStartIndex;
+	int start = Min(sc.UpdateStartIndex, S.vwap.dirtyFrom); S.vwap.dirtyFrom = INT_MAX;
 	if (gen != S.vwap.generation) { start = 0; gen = S.vwap.generation; }
+	if (start < 0) start = 0;
 	const VwapState& V = S.vwap;
 	for (int i = start; i < sc.ArraySize; ++i)
 	{
