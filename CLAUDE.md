@@ -44,4 +44,13 @@ See docs/ARCHITECTURE.md §4 (engines) and the section banners (`// ==== N`) in 
 Then in Sierra Chart: Analysis >> Build Custom Studies DLL >> Remote Build - Release >> NQEdgeSuite.cpp.
 
 ## Phase status
-See CHANGELOG.md.
+All nine phases are implemented (see CHANGELOG.md). The suite has been syntax-checked against the
+Sierra headers but not yet built or run inside Sierra Chart; `docs/DECISIONS.md` lists the API
+details to confirm on the first Remote Build.
+
+## Working on the source
+`src/sierra/NQEdgeSuite.cpp` is organised by `// ==== N` banners. Engines live in `namespace nqe`
+(`EnsureBase` … `EnsureLog`), study functions (`scsf_NQEdge_*`) at the end. When adding a feature:
+add the enum entry in `FeatureId`, the name in `kFeatureNames`, its group in `kFeatureGroup`, the
+default weight in `Weights::SetDefaults` and `config/NQEdge_weights.txt`, the assignment in
+`EnsureDcs`, and the column in `research/nqedge_research.py` (`FEATURES`/`GROUPS`).

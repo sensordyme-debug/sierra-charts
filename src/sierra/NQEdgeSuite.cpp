@@ -182,8 +182,8 @@ namespace nqe
 	{
 		char weightsFile[128] = "NQEdge_weights.txt";
 		int hotReloadSec = 5;
-		float signalThr = 40.0f;
-		float fadeThr = 20.0f;
+		float signalThr = 0.0f;     // 0 = from the weights file
+		float fadeThr = 0.0f;
 		int smoothLen = 5;
 		float strongThr = 60.0f;
 		float weakThr = 25.0f;
@@ -509,6 +509,7 @@ namespace nqe
 		bool headerWritten = false;
 		int generationWritten = -1;
 		int rowsWritten = 0;
+		double lastWrittenTime = 0;    // survives engine resets: append mode skips rows at or before it
 		std::string path;
 	};
 
@@ -533,6 +534,7 @@ namespace nqe
 		int curSetup = 0; SetupStats curStats; bool statsAvail = false;
 		char vwapText[64] = "";
 		int signalsTotal = 0;
+		double updateMs = 0, maxUpdateMs = 0; int fullCalcMs = 0; int bars = 0;
 	};
 
 	struct DataStamp { int arraySize = 0; double t0 = 0, tMid = 0, tLast = 0; int midIdx = -1, lastIdx = -1; bool valid = false; };
@@ -550,6 +552,7 @@ namespace nqe
 		Warnings warn; HudSnapshot hud;
 		float tickSize = 0.25f;
 		int resetCount = 0;
+		int hudUpdates = 0;
 
 		EngineCommon& Engine(int e)
 		{
@@ -565,6 +568,8 @@ namespace nqe
 	static std::recursive_mutex g_mutex;
 	static std::map<int, ChartState*> g_charts;
 	static int g_instanceId = 0;   // random per DLL load, lets study instances detect a reload
+	struct RegistryCleanup { ~RegistryCleanup() { for (std::map<int, ChartState*>::iterator it = g_charts.begin(); it != g_charts.end(); ++it) delete it->second; g_charts.clear(); } };
+	static RegistryCleanup g_registryCleanup;   // destroyed before g_charts/g_mutex (reverse construction order)
 
 	inline int InstanceId()
 	{
@@ -2523,7 +2528,7 @@ namespace nqe
 				{
 					res = 2; resIdx = last; resultR = (g.dir > 0 ? sc.Close[last] - entryFill : entryFill - sc.Close[last]) / risk;   // timeout: mark to market
 				}
-				if (res == 0) { if (k == V.nextSignal) break; else continue; }   // still pending (needs more bars)
+				if (res == 0) continue;   // still pending (needs more bars); nextSignal stays at the first pending one
 				g.resolved = res; g.resultR = resultR; g.resIdx = resIdx; g.barsToRes = resIdx - g.idx; g.mfeR = mfe; g.maeR = mae;
 			}
 			if (g.resIdx >= 0 && g.resIdx < n) { V.addR[g.resIdx] += g.resultR; earliestRes = Min(earliestRes, g.resIdx); }
@@ -2571,6 +2576,7 @@ namespace nqe
 		for (int i = Max(0, L.lastQueuedIdx + 1); i <= lastClosed; ++i)
 		{
 			if (P.rthOnly && !B.isRth[i]) { L.lastQueuedIdx = i; continue; }
+			if (!P.rewriteOnRecalc && sc.BaseDateTimeIn[i].GetAsDouble() <= L.lastWrittenTime) { L.lastQueuedIdx = i; continue; }
 			LogRow r; r.idx = i; r.t = sc.BaseDateTimeIn[i].GetAsDouble(); r.o = sc.Open[i]; r.h = sc.High[i]; r.l = sc.Low[i]; r.c = sc.Close[i]; r.v = sc.Volume[i];
 			for (int k = 0; k < F_COUNT; ++k) r.feat[k] = D.feat[static_cast<size_t>(i) * F_COUNT + k];
 			r.dcs = D.dcs[i]; r.regime = S.regime.regime[i]; r.setup = D.signalType[i]; r.dir = D.signalDir[i]; r.atr = AtrAt(S, i);
@@ -2613,7 +2619,7 @@ namespace nqe
 			FILE* f = nullptr;
 			if (!L.headerWritten)
 			{
-				const bool rewrite = P.rewriteOnRecalc != 0 || L.generationWritten != L.generation;
+				const bool rewrite = P.rewriteOnRecalc != 0;
 				f = fopen(L.path.c_str(), rewrite ? "w" : "a");
 				if (f)
 				{
@@ -2635,6 +2641,7 @@ namespace nqe
 				}
 				fclose(f);
 				L.rowsWritten += static_cast<int>(ready);
+				L.lastWrittenTime = Max(L.lastWrittenTime, L.pending[ready - 1].t);
 			}
 			L.pending.erase(L.pending.begin(), L.pending.begin() + ready);
 		}
@@ -2654,7 +2661,9 @@ namespace nqe
 			const char* s = tz.GetChars();
 			std::string t = s ? s : "";
 			for (size_t k = 0; k < t.size(); ++k) t[k] = static_cast<char>(tolower(static_cast<unsigned char>(t[k])));
-			W.tzNotNY = !(t.find("new_york") != std::string::npos || t.find("new york") != std::string::npos || t.find("eastern") != std::string::npos);
+			W.tzNotNY = !(t.find("new_york") != std::string::npos || t.find("new york") != std::string::npos || t.find("eastern") != std::string::npos
+				|| t.compare(0, 3, "est") == 0 || t.find("est-05") != std::string::npos || t.find("est-5") != std::string::npos);
+			if (t.empty()) W.tzNotNY = false;   // unknown: do not warn
 		}
 		W.vapOff = (sc.MaintainVolumeAtPriceData == 0);
 		W.noDepth = (sc.GetBidMarketDepthNumberOfLevels != nullptr) ? (sc.GetBidMarketDepthNumberOfLevels() <= 0) : true;
@@ -2663,6 +2672,9 @@ namespace nqe
 		if (W.tzNotNY) strcat_s(W.text, sizeof(W.text), "Chart time zone must be New York (Chart>>Chart Settings)\n");
 		if (W.vapOff) strcat_s(W.text, sizeof(W.text), "Volume at Price data off (reload chart after adding NQ Edge studies)\n");
 		if (W.interMissing[0]) { strcat_s(W.text, sizeof(W.text), "Missing intermarket: "); strcat_s(W.text, sizeof(W.text), W.interMissing); strcat_s(W.text, sizeof(W.text), "\n"); }
+		static const char* engineStudy[E_COUNT] = { "", "Auction/Structure Engine", "VWAP Engine", "Order Flow Engine", "Regime + MTF Bias", "Intermarket Engine", "Directional Conviction Score", "Signal Validation", "Feature Logger" };
+		for (int e = E_AUCTION; e <= E_DCS; ++e)
+			if (!S.studyPresent[e] && S.hudUpdates > 1) { strcat_s(W.text, sizeof(W.text), "Add study: NQ Edge: "); strcat_s(W.text, sizeof(W.text), engineStudy[e]); strcat_s(W.text, sizeof(W.text), "\n"); }
 		if (W.noDepth) strcat_s(W.text, sizeof(W.text), "No market depth (optional; depth features disabled)\n");
 	}
 
@@ -2817,6 +2829,7 @@ namespace nqe
 		if (sc.Input[HI_SHOW_LEVELS].GetYesNo()) lines += 1;
 		lines += 1;                         // state line
 		if (full && sc.Input[HI_SHOW_STATS].GetYesNo()) lines += 2;
+		if (full) lines += 1;
 		int warnLines = 0;
 		if (sc.Input[HI_SHOW_WARN].GetYesNo() && S.warn.text[0]) { for (const char* p = S.warn.text; *p; ++p) if (*p == '\n') ++warnLines; }
 		lines += warnLines;
@@ -2945,6 +2958,13 @@ namespace nqe
 				P.Line(buf, cText);
 			}
 			else { P.Line("Stats: no resolved signals yet", cNeu); P.Line("", cNeu); }
+		}
+
+		// 8b. performance (full preset)
+		if (full)
+		{
+			sprintf_s(buf, sizeof(buf), "calc %.1f ms (max %.1f)  full recalc %d ms  bars %d  closed #%d", H.updateMs, H.maxUpdateMs, H.fullCalcMs, H.bars, H.lastClosedIdx);
+			P.Line(buf, cNeu);
 		}
 
 		// 9. warnings
@@ -3525,8 +3545,8 @@ SCSFExport scsf_NQEdge_DCS(SCStudyInterfaceRef sc)
 		sc.Subgraph[DS_SIGNAL].DrawStyle = DRAWSTYLE_IGNORE; sc.Subgraph[DS_BIAS].DrawStyle = DRAWSTYLE_IGNORE;
 		sc.Input[DI_FILE].Name = "Weights File Name (in Data folder)"; sc.Input[DI_FILE].SetString("NQEdge_weights.txt");
 		NQE_INT_INPUT(DI_RELOAD, "Weights Hot-Reload Check Seconds", 5, 1, 600);
-		NQE_FLT_INPUT(DI_THR, "Signal Threshold (|DCS| >=)", 40.0, 0.0, 100.0);
-		NQE_FLT_INPUT(DI_FADE, "Fade Threshold In Balance (|DCS| >=)", 20.0, 0.0, 100.0);
+		NQE_FLT_INPUT(DI_THR, "Signal Threshold |DCS| (0 = from weights file, default 40)", 0.0, 0.0, 100.0);
+		NQE_FLT_INPUT(DI_FADE, "Fade Threshold In Balance |DCS| (0 = from weights file, default 20)", 0.0, 0.0, 100.0);
 		NQE_INT_INPUT(DI_SMOOTH, "Smoothing Length (EMA)", 5, 1, 50);
 		NQE_FLT_INPUT(DI_STRONG, "Bar State: Strong Threshold", 60.0, 0.0, 100.0);
 		NQE_FLT_INPUT(DI_WEAK, "Bar State: Weak Threshold", 25.0, 0.0, 100.0);
@@ -3747,9 +3767,16 @@ SCSFExport scsf_NQEdge_HUD(SCStudyInterfaceRef sc)
 	if (sc.LastCallToFunction) { Release(sc, -1); return; }
 	std::lock_guard<std::recursive_mutex> lock(g_mutex);
 	ChartState& S = Acquire(sc);
+	++S.hudUpdates;
 	CheckDataStamp(sc, S);
 	CheckWarnings(sc, S);
-	EnsureLog(sc, S);          // pulls the full chain
+	{
+		LARGE_INTEGER f0, t0, t1; QueryPerformanceFrequency(&f0); QueryPerformanceCounter(&t0);
+		EnsureLog(sc, S);          // pulls the full chain
+		QueryPerformanceCounter(&t1);
+		const double ms = f0.QuadPart > 0 ? 1000.0 * static_cast<double>(t1.QuadPart - t0.QuadPart) / static_cast<double>(f0.QuadPart) : 0.0;
+		S.hud.updateMs = ms; if (sc.UpdateStartIndex > 0) S.hud.maxUpdateMs = Max(S.hud.maxUpdateMs, ms); S.hud.fullCalcMs = sc.LastFullCalculationTimeInMicroseconds / 1000; S.hud.bars = sc.ArraySize;
+	}
 	BuildHudSnapshot(sc, S);
 
 	const bool paint = sc.Input[HI_PAINT].GetYesNo() != 0;

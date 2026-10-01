@@ -41,3 +41,8 @@
 ## Phase 8 — Python research loop
 - `research/nqedge_research.py`: loads the feature logs, labels direction beyond an ATR threshold, walk-forward (rolling train/test by trading day, no shuffling) logistic regression + LightGBM (scikit-learn HistGradientBoosting fallback), hit rate / expectancy in R / profit factor / coverage per model, setup and regime, calibration tables, feature importances, and exports `NQEdge_weights.txt` (weights, regime gates from per-regime fits, hit-rate-derived threshold) with `--deploy` into Sierra's Data folder. `--synthetic N` smoke test.
 - `research/README.md`, `research/requirements.txt`.
+
+## Phase 9 — Polish
+- HUD: "Add study: …" warnings for missing engine studies (after the first full update), time-zone check against Sierra's POSIX string, performance line (update ms, max, last full recalculation, bar count) in the Full preset.
+- Registry freed at DLL unload; validation no longer blocks on the first pending signal; logger append mode never truncates and skips rows already written; DCS threshold inputs default to 0 = taken from the weights file (an explicit value overrides).
+- Docs: `docs/SETUP.md`, `sierra/chartbooks/README.md`, `sierra/studycollections/README.md`, decisions 14–25, CLAUDE.md contributor notes.

@@ -60,3 +60,39 @@ Ambiguities resolved while building, and anything not verifiable without a Sierr
   differs — change `kStorageUnitTick` in the source.
 * `sc.VolumeAtPriceForBars->GetNumberOfBars() < sc.ArraySize` is used (as Sierra's own
   VWAP study does) to detect VAP not yet loaded.
+
+## Added during phases 2–9
+
+14. **PDH/PDL = prior RTH session high/low** (not the 24-hour range); the overnight range is
+    reported separately as ON High/Low.
+15. **VWAP uses (H+L+C)/3 × volume per bar**, not VAP-weighted prices. It keeps the engine
+    independent of VAP availability; the difference is well below one tick on 1-minute bars.
+16. **Single prints** are TPO-based (30-minute periods by default): levels with exactly one TPO
+    inside the profile body; the tails (count-1 runs touching the profile high/low) are excluded.
+17. **Open type** is classified from the first 30 minutes using the open's position in the
+    30-minute range, the order of the extremes and the 30-minute close: Open-Drive
+    (open within 15 % of one extreme, close in the far 30 %), Open-Test-Drive (shallow test
+    against, close at the far extreme), Open-Rejection-Reverse (deep move first, close back
+    through the open), otherwise Open-Auction.
+18. **Regime scoring** fuses ER (0.35), |VWAP slope| (0.25), |structure| (0.2) and
+    time-outside-value (0.2) into a trendiness score; direction = 0.4 slope + 0.3 structure +
+    0.2 VWAP side + 0.1 value migration. Chop = ATR fast/slow ≥ 1.3 with ER below the balance
+    threshold. Hysteresis is a bar count on the candidate regime.
+19. **MTF cells use completed timeframe bars only** (plus the live close for the VWAP side), so
+    a 60-minute cell changes at most once per hour and never repaints.
+20. **Historical signals rebuild their level list as of the bar** (per-bar level arrays, naked
+    POC history with tested index, swings filtered by confirmation index, zones by born/dead
+    index). Zones evicted by the drawing caps are lost for very old bars, which only affects
+    back-testing of the oldest history.
+21. **One signal per bar**: the highest-priority candidate (failed breakout 4, pullback and
+    divergence 3, value edge and break-acceptance 2) that passes the R:R gate; duplicates of the
+    same setup/direction within 3 bars are suppressed.
+22. **Validation R accounting** closes the trade at T1 (+R) or the stop (−1 R); T2 is tracked only
+    as a hit percentage; timeouts are marked to market after *Max Bars To Resolution*.
+23. **Feature logger delays rows** until the +60 min bar has closed; on a full recalculation it
+    rewrites the file (input) so there are never duplicate rows.
+24. **Chartbooks and study collections are binary Sierra files** that cannot be generated here;
+    `sierra/chartbooks/README.md` and `sierra/studycollections/README.md` give the recipe and the
+    deploy script copies whatever is saved there.
+25. **Research expectancy** is measured on forward returns with 1 R = the label threshold in ATR;
+    the on-chart validation study remains the authority for setup statistics.

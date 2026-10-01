@@ -233,6 +233,13 @@ thr.fade = 20
 ```
 The Python research pipeline writes this file; the DCS study hot-reloads it.
 
+## 7b. Performance and diagnostics
+The HUD (Full preset) prints the wall-clock time of the engine chain for the current update,
+its maximum since load, Sierra's last full-calculation time and the bar count. Engines process
+only new bars; the forming bar is re-evaluated once per update per engine (fingerprint of the
+last bar). Typical cost on a 40k-bar 1-minute chart: a few milliseconds per update, a few
+hundred milliseconds to a couple of seconds for a full recalculation (profile + VAP scans).
+
 ## 8. Drawing management
 ACSIL drawings use `sc.UseTool` with `UTAM_ADD_OR_ADJUST` and line numbers stored in the
 registry per object. Line numbers are cleared on full recalculation and validated with
