@@ -318,6 +318,8 @@ namespace nqe
 		std::vector<float> nakedPocs;                        // untested prior-session POCs
 		std::vector<int> nakedPocBorn;
 		std::vector<int> nakedPocLine;
+		struct NakedRec { float price; int born; int dead; };
+		std::vector<NakedRec> nakedHist;                     // every prior-session POC with its tested index (for as-of queries)
 		std::vector<Zone> singlePrints;
 		std::vector<Zone> liquidity;                         // equal highs/lows
 		std::vector<Level> levels;                           // snapshot of all active levels (rebuilt each update)
@@ -481,6 +483,7 @@ namespace nqe
 		std::vector<Signal> signals;
 		int lastAlertIdx = -1;
 		int lastSignalCheckedIdx = -1;
+		bool newSignals = false;
 	};
 
 	struct SetupStats { int count = 0, wins = 0, losses = 0, t2 = 0, timeouts = 0; double sumR = 0, sumWinR = 0, sumLossR = 0, sumMfe = 0, sumMae = 0, sumBars = 0; };
@@ -620,7 +623,7 @@ namespace nqe
 			for (size_t k = 0; k < S.auction.nakedPocLine.size(); ++k) if (S.auction.nakedPocLine[k]) S.auction.deadLines.push_back(S.auction.nakedPocLine[k]);
 			for (size_t k = 0; k < S.auction.singlePrints.size(); ++k) if (S.auction.singlePrints[k].lineNumber) S.auction.deadLines.push_back(S.auction.singlePrints[k].lineNumber);
 			for (size_t k = 0; k < S.auction.liquidity.size(); ++k) if (S.auction.liquidity[k].lineNumber) S.auction.deadLines.push_back(S.auction.liquidity[k].lineNumber);
-			S.auction.nakedPocs.clear(); S.auction.nakedPocBorn.clear(); S.auction.nakedPocLine.clear();
+			S.auction.nakedPocs.clear(); S.auction.nakedPocBorn.clear(); S.auction.nakedPocLine.clear(); S.auction.nakedHist.clear();
 			S.auction.singlePrints.clear(); S.auction.liquidity.clear(); S.auction.levels.clear();
 			S.auction.lastBosDir = 0; S.auction.lastBosIdx = -1000; S.auction.lastChochDir = 0; S.auction.lastChochIdx = -1000;
 		}
@@ -851,7 +854,6 @@ namespace nqe
 	void EnsureFlow(SCStudyInterfaceRef sc, ChartState& S);
 	void EnsureRegime(SCStudyInterfaceRef sc, ChartState& S);
 	void EnsureInter(SCStudyInterfaceRef sc, ChartState& S);
-	// ==== 11 DCS (phase 6) ======================================================
 	void EnsureDcs(SCStudyInterfaceRef sc, ChartState& S);
 	// ==== 12 Validation (phase 7) ===============================================
 	void EnsureVal(SCStudyInterfaceRef sc, ChartState& S);
@@ -1030,6 +1032,7 @@ namespace nqe
 					const int tpl = Max(1, S.params.auction.profileTicksPerLevel);
 					A.prevPoc = LevelMid(poc, S.tickSize, tpl); A.prevVah = LevelTop(vah, S.tickSize, tpl); A.prevVal = LevelBottom(val, S.tickSize, tpl);
 					A.nakedPocs.push_back(A.prevPoc); A.nakedPocBorn.push_back(atIdx); A.nakedPocLine.push_back(0);
+					{ AuctionState::NakedRec rec; rec.price = A.prevPoc; rec.born = atIdx; rec.dead = -1; A.nakedHist.push_back(rec); if (A.nakedHist.size() > 400) A.nakedHist.erase(A.nakedHist.begin(), A.nakedHist.begin() + 100); }
 					const int keep = Max(0, S.params.auction.nakedPocsTracked);
 					while (static_cast<int>(A.nakedPocs.size()) > keep)
 					{
@@ -1251,6 +1254,7 @@ namespace nqe
 				{
 					if (l <= A.nakedPocs[k] && h >= A.nakedPocs[k] && i > A.nakedPocBorn[k])
 					{
+						for (int q = static_cast<int>(A.nakedHist.size()) - 1; q >= 0; --q) if (A.nakedHist[q].dead < 0 && A.nakedHist[q].born == A.nakedPocBorn[k]) { A.nakedHist[q].dead = i; break; }
 						if (A.nakedPocLine[k] != 0) A.deadLines.push_back(A.nakedPocLine[k]);
 						A.nakedPocs.erase(A.nakedPocs.begin() + k); A.nakedPocBorn.erase(A.nakedPocBorn.begin() + k); A.nakedPocLine.erase(A.nakedPocLine.begin() + k);
 					}
@@ -2146,12 +2150,328 @@ namespace nqe
 		I.Stamp(sc);
 	}
 
+	// ==== 11 Weights + DCS composite + setups ===================================
+	namespace dcs_detail
+	{
+		inline std::string Trim(const std::string& x)
+		{
+			size_t a = 0, b = x.size();
+			while (a < b && (x[a] == ' ' || x[a] == '\t' || x[a] == '\r' || x[a] == '\n')) ++a;
+			while (b > a && (x[b - 1] == ' ' || x[b - 1] == '\t' || x[b - 1] == '\r' || x[b - 1] == '\n')) --b;
+			return x.substr(a, b - a);
+		}
+
+		// Parses "key = value" lines into the weights. Returns false when the file cannot be opened.
+		bool ParseWeightsFile(const char* path, Weights& w)
+		{
+			FILE* f = fopen(path, "r");
+			if (!f) return false;
+			char line[512];
+			while (fgets(line, sizeof(line), f))
+			{
+				std::string s(line);
+				const size_t hash = s.find('#'); if (hash != std::string::npos) s = s.substr(0, hash);
+				const size_t eq = s.find('='); if (eq == std::string::npos) continue;
+				const std::string key = Trim(s.substr(0, eq)); const std::string val = Trim(s.substr(eq + 1));
+				if (key.empty() || val.empty()) continue;
+				const double v = atof(val.c_str());
+				if (key == "version") w.version = static_cast<int>(v);
+				else if (key == "thr.signal") w.thrSignal = static_cast<float>(v);
+				else if (key == "thr.fade") w.thrFade = static_cast<float>(v);
+				else if (key.compare(0, 2, "w.") == 0)
+				{
+					const std::string name = key.substr(2);
+					for (int k = 0; k < F_COUNT; ++k) if (name == kFeatureNames[k]) { w.w[k] = static_cast<float>(v); break; }
+				}
+				else if (key.compare(0, 5, "gate.") == 0)
+				{
+					const size_t dot = key.find('.', 5); if (dot == std::string::npos) continue;
+					const std::string reg = key.substr(5, dot - 5), grp = key.substr(dot + 1);
+					int g = -1; for (int k = 0; k < G_COUNT; ++k) if (grp == kGroupNames[k]) g = k;
+					if (g < 0) continue;
+					if (reg == "trend") { w.gate[RG_TREND_UP][g] = static_cast<float>(v); w.gate[RG_TREND_DOWN][g] = static_cast<float>(v); }
+					else if (reg == "balance") w.gate[RG_BALANCE][g] = static_cast<float>(v);
+					else if (reg == "chop") w.gate[RG_CHOP][g] = static_cast<float>(v);
+				}
+			}
+			fclose(f);
+			return true;
+		}
+
+		// Hot reload: re-read when the file's mtime changed. Returns true when weights changed.
+		bool MaybeReloadWeights(SCStudyInterfaceRef sc, ChartState& S)
+		{
+			DcsState& D = S.dcs; const DcsParams& P = S.params.dcs;
+			const double now = static_cast<double>(GetTickCount64()) / 1000.0;
+			if (D.weights.lastCheck > 0 && now - D.weights.lastCheck < Max(1, P.hotReloadSec)) return false;
+			D.weights.lastCheck = now;
+			SCString path = sc.DataFilesFolder();
+			if (path.GetLength() > 0 && path.GetChars()[path.GetLength() - 1] != '\\' && path.GetChars()[path.GetLength() - 1] != '/') path += "\\";
+			path += P.weightsFile;
+			struct _stat st;
+			if (_stat(path.GetChars(), &st) != 0) { if (D.weights.loadedFromFile) { D.weights.SetDefaults(); D.weights.loadedFromFile = false; D.weights.fileMtime = 0; return true; } return false; }
+			if (D.weights.loadedFromFile && st.st_mtime == D.weights.fileMtime) return false;
+			Weights fresh; fresh.SetDefaults();
+			if (!ParseWeightsFile(path.GetChars(), fresh)) return false;
+			fresh.fileMtime = st.st_mtime; fresh.loadedFromFile = true; fresh.lastCheck = now;
+			const bool changed = std::memcmp(fresh.w, D.weights.w, sizeof(fresh.w)) != 0 || std::memcmp(fresh.gate, D.weights.gate, sizeof(fresh.gate)) != 0
+				|| fresh.thrSignal != D.weights.thrSignal || fresh.thrFade != D.weights.thrFade || !D.weights.loadedFromFile;
+			D.weights = fresh;
+			if (changed) { SCString m; m.Format("NQ Edge: weights loaded from %s (version %d)", path.GetChars(), fresh.version); sc.AddMessageToLog(m, 0); }
+			return changed;
+		}
+
+		// ---- level list as of bar i (for targets, location tests, HUD) ----
+		struct Lv { float price; int kind; };
+		void GatherLevels(SCStudyInterfaceRef sc, ChartState& S, int i, std::vector<Lv>& out)
+		{
+			out.clear();
+			const AuctionState& A = S.auction; const VwapState& V = S.vwap; const FlowState& F = S.flow; const AuctionParams& AP = S.params.auction;
+			if (A.poc[i] > 0) { out.push_back({ A.poc[i], LVL_POC }); out.push_back({ A.vah[i], LVL_VAH }); out.push_back({ A.val[i], LVL_VAL }); }
+			if (A.pdPoc[i] > 0) { out.push_back({ A.pdPoc[i], LVL_PD_POC }); out.push_back({ A.pdVah[i], LVL_PD_VAH }); out.push_back({ A.pdVal[i], LVL_PD_VAL }); }
+			if (A.pdh[i] > 0) { out.push_back({ A.pdh[i], LVL_PDH }); out.push_back({ A.pdl[i], LVL_PDL }); }
+			if (A.onHigh[i] > 0) { out.push_back({ A.onHigh[i], LVL_ONH }); out.push_back({ A.onLow[i], LVL_ONL }); }
+			if (A.ibHigh[i] > 0 && A.ibDone[i])
+			{
+				const float r = A.ibHigh[i] - A.ibLow[i];
+				out.push_back({ A.ibHigh[i], LVL_IBH }); out.push_back({ A.ibLow[i], LVL_IBL });
+				const float m[3] = { AP.ibExtA, AP.ibExtB, AP.ibExtC };
+				for (int k = 0; k < 3; ++k) if (m[k] > 0) { out.push_back({ A.ibHigh[i] + r * m[k], LVL_IBEXT }); out.push_back({ A.ibLow[i] - r * m[k], LVL_IBEXT }); }
+			}
+			if (V.vwap[i] > 0)
+			{
+				out.push_back({ V.vwap[i], LVL_VWAP }); out.push_back({ V.b1u[i], LVL_VWAP_B1U }); out.push_back({ V.b1d[i], LVL_VWAP_B1D });
+				out.push_back({ V.b2u[i], LVL_VWAP_B2U }); out.push_back({ V.b2d[i], LVL_VWAP_B2D }); out.push_back({ V.b3u[i], LVL_VWAP_B3U }); out.push_back({ V.b3d[i], LVL_VWAP_B3D });
+			}
+			for (size_t k = 0; k < A.nakedHist.size(); ++k) { const AuctionState::NakedRec& r = A.nakedHist[k]; if (r.born <= i && (r.dead < 0 || r.dead > i)) out.push_back({ r.price, LVL_NAKED_POC }); }
+			// last confirmed swings as of i
+			bool gotH = false, gotL = false;
+			for (int k = static_cast<int>(A.swings.size()) - 1; k >= 0 && !(gotH && gotL); --k)
+			{
+				const Swing& s = A.swings[k]; if (s.confirmIdx > i) continue;
+				if (s.high && !gotH) { out.push_back({ s.price, LVL_SWING_H }); gotH = true; }
+				if (!s.high && !gotL) { out.push_back({ s.price, LVL_SWING_L }); gotL = true; }
+			}
+			for (size_t z = 0; z < A.liquidity.size(); ++z) { const Zone& Z = A.liquidity[z]; if (Z.bornIdx <= i && (Z.active || Z.deadIdx > i)) out.push_back({ 0.5f * (Z.top + Z.bottom), Z.kind }); }
+			for (size_t z = 0; z < F.absorbZones.size(); ++z) { const Zone& Z = F.absorbZones[z]; if (Z.bornIdx < i && (Z.active || Z.deadIdx > i)) out.push_back({ Z.dir > 0 ? Z.bottom : Z.top, LVL_ABSORB }); }
+			for (size_t z = 0; z < F.imbZones.size(); ++z) { const Zone& Z = F.imbZones[z]; if (Z.bornIdx < i && (Z.active || Z.deadIdx > i)) out.push_back({ Z.dir > 0 ? Z.bottom : Z.top, LVL_IMB }); }
+		}
+
+		inline const char* LevelName(int kind)
+		{
+			switch (kind)
+			{
+			case LVL_POC: return "POC"; case LVL_VAH: return "VAH"; case LVL_VAL: return "VAL"; case LVL_PD_POC: return "pdPOC"; case LVL_PD_VAH: return "pdVAH"; case LVL_PD_VAL: return "pdVAL";
+			case LVL_PDH: return "PDH"; case LVL_PDL: return "PDL"; case LVL_ONH: return "ONH"; case LVL_ONL: return "ONL"; case LVL_IBH: return "IBH"; case LVL_IBL: return "IBL"; case LVL_IBEXT: return "IBext";
+			case LVL_NAKED_POC: return "nPOC"; case LVL_SWING_H: return "swing H"; case LVL_SWING_L: return "swing L"; case LVL_LIQ_EQH: return "EQH"; case LVL_LIQ_EQL: return "EQL";
+			case LVL_VWAP: return "VWAP"; case LVL_VWAP_B1U: return "VWAP+1"; case LVL_VWAP_B1D: return "VWAP-1"; case LVL_VWAP_B2U: return "VWAP+2"; case LVL_VWAP_B2D: return "VWAP-2";
+			case LVL_VWAP_B3U: return "VWAP+3"; case LVL_VWAP_B3D: return "VWAP-3"; case LVL_ABSORB: return "absorb"; case LVL_IMB: return "imb"; case LVL_SINGLE_PRINT: return "single";
+			default: return "level";
+			}
+		}
+
+		// nearest level of one of the given kinds within tol of price (kinds terminated by -1)
+		inline bool NearLevel(const std::vector<Lv>& lv, float price, float tol, const int* kinds, float& r_price, int& r_kind)
+		{
+			float best = FLT_MAX; bool found = false;
+			for (size_t k = 0; k < lv.size(); ++k)
+			{
+				bool ok = false; for (int q = 0; kinds[q] >= 0; ++q) if (lv[k].kind == kinds[q]) { ok = true; break; }
+				if (!ok) continue;
+				const float d = static_cast<float>(fabs(lv[k].price - price));
+				if (d <= tol && d < best) { best = d; r_price = lv[k].price; r_kind = lv[k].kind; found = true; }
+			}
+			return found;
+		}
+
+		// targets: nearest levels beyond entry in the trade direction, at least minDist away
+		inline bool PickTargets(const std::vector<Lv>& lv, int dir, float entry, float minDist, float& t1, float& t2, int& k1, int& k2)
+		{
+			float b1 = FLT_MAX, b2 = FLT_MAX; k1 = k2 = LVL_NONE; t1 = t2 = 0;
+			for (size_t k = 0; k < lv.size(); ++k)
+			{
+				const float d = dir > 0 ? lv[k].price - entry : entry - lv[k].price;
+				if (d < minDist) continue;
+				if (d < b1) { b2 = b1; t2 = t1; k2 = k1; b1 = d; t1 = lv[k].price; k1 = lv[k].kind; }
+				else if (d < b2 && d > b1) { b2 = d; t2 = lv[k].price; k2 = lv[k].kind; }
+			}
+			if (b1 == FLT_MAX) return false;
+			if (b2 == FLT_MAX) { t2 = entry + (t1 - entry) * 2.0f; k2 = LVL_NONE; }
+			return true;
+		}
+
+		struct Candidate { int type; int dir; float stop; float refLevel; int refKind; int score; };
+
+		bool BuildSignal(SCStudyInterfaceRef sc, ChartState& S, int i, const Candidate& cd, const std::vector<Lv>& lv, Signal& out)
+		{
+			const DcsParams& P = S.params.dcs; const float atr = AtrAt(S, i);
+			const float entry = sc.Close[i];
+			float stop = cd.stop;
+			if (cd.dir > 0 && stop >= entry) return false;
+			if (cd.dir < 0 && stop <= entry) return false;
+			const float risk = static_cast<float>(fabs(entry - stop));
+			if (risk < S.tickSize) return false;
+			float t1, t2; int k1, k2;
+			if (!PickTargets(lv, cd.dir, entry, Max(P.minTargetAtr * atr, risk * P.minRR), t1, t2, k1, k2)) return false;
+			const float rr = static_cast<float>(fabs(t1 - entry)) / risk;
+			if (rr < P.minRR) return false;
+			out = Signal();
+			out.idx = i; out.type = cd.type; out.dir = cd.dir; out.entry = entry; out.stop = sc.RoundToTickSize(stop); out.t1 = sc.RoundToTickSize(t1); out.t2 = sc.RoundToTickSize(t2);
+			out.dcs = S.dcs.dcs[i]; out.rr = rr;
+			sprintf_s(out.label, sizeof(out.label), "%s \xB7 %s \xB7 DCS %+.0f \xB7 R:R %.1f \xB7 T1 %s", cd.dir > 0 ? "LONG" : "SHORT", kSetupNames[cd.type], out.dcs, rr, LevelName(k1));
+			return true;
+		}
+	}
+
 	void EnsureDcs(SCStudyInterfaceRef sc, ChartState& S)
 	{
-		EnsureInter(sc, S); const int n = sc.ArraySize; DcsState& D = S.dcs;
+		using namespace dcs_detail;
+		EnsureInter(sc, S);
+		const int n = sc.ArraySize; if (n <= 0) return;
+		DcsState& D = S.dcs; const DcsParams& P = S.params.dcs;
+		if (MaybeReloadWeights(sc, S)) { ResetFrom(S, E_DCS); }
 		Fit(D.feat, n * F_COUNT); Fit(D.dcs, n); Fit(D.dcsSmooth, n); Fit(D.barState, n); Fit(D.signalType, n); Fit(D.signalDir, n);
-		D.computedThrough = n - 2; D.lastArraySize = n;
+		if (D.UpToDate(sc)) return;
+		int from = D.computedThrough + 1; if (from < 0) from = 0; if (from > n - 1) from = n - 1;
+		const AuctionState& A = S.auction; const VwapState& V = S.vwap; const FlowState& F = S.flow; const RegimeState& R = S.regime; const InterState& I = S.inter;
+		const Weights& W = D.weights;
+		const float thr = P.signalThr > 0 ? P.signalThr : W.thrSignal;
+		const float fadeThr = P.fadeThr > 0 ? P.fadeThr : W.thrFade;
+		const float alpha = 2.0f / (Max(1, P.smoothLen) + 1.0f);
+		std::vector<Lv> lv; lv.reserve(64);
+
+		for (int i = from; i < n; ++i)
+		{
+			const bool closed = (i <= n - 2);
+			float* f = &D.feat[static_cast<size_t>(i) * F_COUNT];
+			f[F_VWAP_POS] = V.pos[i]; f[F_VWAP_SLOPE] = V.slope[i]; f[F_VWAP_ACCEPT] = V.accept[i];
+			f[F_STRUCT_TREND] = A.structTrend[i]; f[F_BOS] = A.bos[i]; f[F_VA_POS] = A.vaPos[i]; f[F_POC_POS] = A.pocPos[i]; f[F_IB_POS] = A.ibPos[i];
+			f[F_VALUE_MIG] = A.valueMig[i]; f[F_OPEN_TYPE] = A.openTypeDir[i];
+			f[F_DELTA] = Clamp1(F.deltaPct[i] / 0.3); f[F_CVD_Z] = Clamp1(F.cvdZ[i] / 2.0); f[F_CVD_DIV] = F.fCvdDiv[i]; f[F_ABSORB] = F.fAbsorb[i]; f[F_EXHAUST] = F.fExhaust[i];
+			f[F_IMBALANCE] = F.fImb[i]; f[F_TRAPPED] = F.fTrapped[i]; f[F_LARGE_TRADE] = F.fLarge[i];
+			f[F_REGIME_TREND] = R.regimeTrend[i]; f[F_MTF_BIAS] = R.mtfBias[i];
+			f[F_RS_INDEX] = I.rsIndex[i]; f[F_SMT] = I.smt[i]; f[F_TICK_CUM] = I.tickCum[i]; f[F_TICK_EXT] = I.tickExt[i]; f[F_TICK_DIV] = I.tickDiv[i]; f[F_MEGA_CAP] = I.megaCap[i];
+
+			const int reg = Clamp(static_cast<int>(R.regime[i]), 0, 4);
+			double num = 0, den = 0;
+			for (int k = 0; k < F_COUNT; ++k)
+			{
+				if (IsNan(f[k])) continue;
+				const float g = (reg == RG_NONE) ? 1.0f : W.gate[reg][kFeatureGroup[k]];
+				const float wk = W.w[k] * g;
+				num += wk * f[k]; den += fabs(wk);
+			}
+			const float dcs = den > 0 ? static_cast<float>(Clamp(100.0 * num / den, -100.0, 100.0)) : 0.0f;
+			D.dcs[i] = dcs;
+			D.dcsSmooth[i] = (i == 0) ? dcs : D.dcsSmooth[i - 1] + alpha * (dcs - D.dcsSmooth[i - 1]);
+			D.barState[i] = static_cast<signed char>(dcs >= P.strongThr ? 2 : (dcs >= P.weakThr ? 1 : (dcs <= -P.strongThr ? -2 : (dcs <= -P.weakThr ? -1 : 0))));
+			D.signalType[i] = 0; D.signalDir[i] = 0;
+
+			// ---- setups: closed bars only, one signal per bar ----
+			if (!closed || i < 30 || i <= D.lastSignalCheckedIdx) continue;
+			D.lastSignalCheckedIdx = i;
+			const float atr = AtrAt(S, i); if (atr <= 0) continue;
+			const float c = sc.Close[i], h = sc.High[i], l = sc.Low[i];
+			const float tol = P.levelTolAtr * atr, buf = P.stopBufferAtr * atr;
+			const float mtf = R.mtfBias[i];
+			GatherLevels(sc, S, i, lv);
+			std::vector<Candidate> cands;
+			const float dPct = F.deltaPct[i], dPctPrev = i > 0 ? F.deltaPct[i - 1] : 0.0f;
+			const bool deltaFlipUp = dPct >= 0.15f && dPctPrev < 0, deltaFlipDn = dPct <= -0.15f && dPctPrev > 0;
+			const bool imbBuy = F.imbMark[i] == 1 || F.imbMark[i] == 2, imbSell = F.imbMark[i] == -1 || F.imbMark[i] == 2;
+
+			// 1. Trend pullback continuation
+			if (P.setupOn[SETUP_TREND_PULLBACK])
+			{
+				static const int kinds[] = { LVL_VWAP, LVL_VWAP_B1D, LVL_VWAP_B1U, LVL_POC, LVL_ABSORB, -1 };
+				float lp; int lk;
+				if (reg == RG_TREND_UP && dcs >= thr && (!P.requireMtf || mtf > 0.1f) && NearLevel(lv, l, tol, kinds, lp, lk) && c > lp && (F.absorbMark[i] == 1 || deltaFlipUp || imbBuy))
+					cands.push_back({ SETUP_TREND_PULLBACK, 1, Min(l, lp) - buf, lp, lk, 3 });
+				if (reg == RG_TREND_DOWN && dcs <= -thr && (!P.requireMtf || mtf < -0.1f) && NearLevel(lv, h, tol, kinds, lp, lk) && c < lp && (F.absorbMark[i] == -1 || deltaFlipDn || imbSell))
+					cands.push_back({ SETUP_TREND_PULLBACK, -1, Max(h, lp) + buf, lp, lk, 3 });
+			}
+			// 2. Value-edge rejection in balance
+			if (P.setupOn[SETUP_VALUE_EDGE] && reg == RG_BALANCE)
+			{
+				static const int hiKinds[] = { LVL_VAH, LVL_PD_VAH, LVL_IBH, LVL_VWAP_B2U, -1 };
+				static const int loKinds[] = { LVL_VAL, LVL_PD_VAL, LVL_IBL, LVL_VWAP_B2D, -1 };
+				float lp; int lk;
+				if (dcs <= -fadeThr * 0.5f && NearLevel(lv, h, tol, hiKinds, lp, lk) && c < lp && (F.absorbMark[i] == -1 || F.exhaustMark[i] == -1 || F.trapMark[i] == -1 || (dPct <= -0.15f && h >= lp)))
+					cands.push_back({ SETUP_VALUE_EDGE, -1, Max(h, lp) + buf, lp, lk, 2 });
+				if (dcs >= fadeThr * 0.5f && NearLevel(lv, l, tol, loKinds, lp, lk) && c > lp && (F.absorbMark[i] == 1 || F.exhaustMark[i] == 1 || F.trapMark[i] == 1 || (dPct >= 0.15f && l <= lp)))
+					cands.push_back({ SETUP_VALUE_EDGE, 1, Min(l, lp) - buf, lp, lk, 2 });
+			}
+			// 3. Failed breakout / trapped traders
+			if (P.setupOn[SETUP_FAILED_BREAKOUT] && F.trapMark[i] != 0)
+			{
+				static const int hiKinds[] = { LVL_IBH, LVL_PDH, LVL_VAH, LVL_ONH, LVL_SWING_H, LVL_LIQ_EQH, LVL_PD_VAH, -1 };
+				static const int loKinds[] = { LVL_IBL, LVL_PDL, LVL_VAL, LVL_ONL, LVL_SWING_L, LVL_LIQ_EQL, LVL_PD_VAL, -1 };
+				const int K = Max(1, S.params.flow.trapReversalBars) + 1;
+				float ext = F.trapMark[i] < 0 ? -FLT_MAX : FLT_MAX;
+				for (int q = Max(0, i - K); q <= i; ++q) ext = F.trapMark[i] < 0 ? Max(ext, sc.High[q]) : Min(ext, sc.Low[q]);
+				float lp; int lk;
+				if (F.trapMark[i] < 0 && dcs < thr && NearLevel(lv, ext, tol * 1.5f, hiKinds, lp, lk)) cands.push_back({ SETUP_FAILED_BREAKOUT, -1, ext + buf, lp, lk, 4 });
+				if (F.trapMark[i] > 0 && dcs > -thr && NearLevel(lv, ext, tol * 1.5f, loKinds, lp, lk)) cands.push_back({ SETUP_FAILED_BREAKOUT, 1, ext - buf, lp, lk, 4 });
+			}
+			// 4. Break-and-acceptance
+			if (P.setupOn[SETUP_BREAK_ACCEPT] && i >= 2 && (reg == RG_TREND_UP || reg == RG_TREND_DOWN || reg == RG_BALANCE))
+			{
+				static const int hiKinds[] = { LVL_IBH, LVL_VAH, LVL_PDH, LVL_ONH, LVL_PD_VAH, LVL_LIQ_EQH, -1 };
+				static const int loKinds[] = { LVL_IBL, LVL_VAL, LVL_PDL, LVL_ONL, LVL_PD_VAL, LVL_LIQ_EQL, -1 };
+				const bool flowUp = imbBuy || (i >= 3 && (F.imbMark[i - 1] >= 1 || F.imbMark[i - 2] >= 1)) || F.cvdZ[i] > 0.5f;
+				const bool flowDn = imbSell || (i >= 3 && (F.imbMark[i - 1] == -1 || F.imbMark[i - 2] == -1 || F.imbMark[i - 1] == 2)) || F.cvdZ[i] < -0.5f;
+				for (size_t k = 0; k < lv.size(); ++k)
+				{
+					const float L = lv[k].price; bool hi = false, lo = false;
+					for (int q = 0; hiKinds[q] >= 0; ++q) if (lv[k].kind == hiKinds[q]) hi = true;
+					for (int q = 0; loKinds[q] >= 0; ++q) if (lv[k].kind == loKinds[q]) lo = true;
+					if (hi && dcs >= thr && dPct > 0 && flowUp && c > L && sc.Close[i - 1] > L && sc.Close[i - 2] <= L && c - L <= 2.0f * atr)
+					{ cands.push_back({ SETUP_BREAK_ACCEPT, 1, L - buf, L, lv[k].kind, 2 }); break; }
+					if (lo && dcs <= -thr && dPct < 0 && flowDn && c < L && sc.Close[i - 1] < L && sc.Close[i - 2] >= L && L - c <= 2.0f * atr)
+					{ cands.push_back({ SETUP_BREAK_ACCEPT, -1, L + buf, L, lv[k].kind, 2 }); break; }
+				}
+			}
+			// 5. SMT / CVD divergence reversal at liquidity
+			if (P.setupOn[SETUP_DIVERGENCE] && (F.divMark[i] != 0 || I.smtMark[i] != 0))
+			{
+				static const int hiKinds[] = { LVL_LIQ_EQH, LVL_PDH, LVL_ONH, LVL_VAH, LVL_NAKED_POC, LVL_IBH, LVL_PD_VAH, LVL_VWAP_B2U, LVL_VWAP_B3U, -1 };
+				static const int loKinds[] = { LVL_LIQ_EQL, LVL_PDL, LVL_ONL, LVL_VAL, LVL_NAKED_POC, LVL_IBL, LVL_PD_VAL, LVL_VWAP_B2D, LVL_VWAP_B3D, -1 };
+				const int dir = (F.divMark[i] != 0) ? F.divMark[i] : I.smtMark[i];
+				// the pivot that just got confirmed
+				float pivot = dir > 0 ? FLT_MAX : -FLT_MAX;
+				for (int k = static_cast<int>(A.swings.size()) - 1; k >= 0; --k) { if (A.swings[k].confirmIdx == i) { pivot = A.swings[k].price; break; } if (A.swings[k].confirmIdx < i) break; }
+				float lp; int lk;
+				if (dir > 0 && pivot < FLT_MAX && dcs > -thr && NearLevel(lv, pivot, tol * 1.5f, loKinds, lp, lk)) cands.push_back({ SETUP_DIVERGENCE, 1, pivot - buf, lp, lk, 3 });
+				if (dir < 0 && pivot > -FLT_MAX && dcs < thr && NearLevel(lv, pivot, tol * 1.5f, hiKinds, lp, lk)) cands.push_back({ SETUP_DIVERGENCE, -1, pivot + buf, lp, lk, 3 });
+			}
+
+			// choose the strongest candidate that yields a valid trade plan
+			int best = -1; int bestScore = -1;
+			Signal sig;
+			for (size_t k = 0; k < cands.size(); ++k)
+			{
+				Signal tmp;
+				if (!BuildSignal(sc, S, i, cands[k], lv, tmp)) continue;
+				const int score = cands[k].score * 100 + static_cast<int>(tmp.rr * 10);
+				if (score > bestScore) { bestScore = score; best = static_cast<int>(k); sig = tmp; }
+			}
+			if (best >= 0)
+			{
+				// no duplicate of the same setup/direction within 3 bars
+				bool dup = false;
+				for (int k = static_cast<int>(D.signals.size()) - 1; k >= 0 && D.signals[k].idx >= i - 3; --k) if (D.signals[k].type == sig.type && D.signals[k].dir == sig.dir) { dup = true; break; }
+				if (!dup)
+				{
+					D.signals.push_back(sig);
+					if (D.signals.size() > 5000) D.signals.erase(D.signals.begin(), D.signals.begin() + 1000);
+					D.signalType[i] = static_cast<signed char>(sig.type); D.signalDir[i] = static_cast<signed char>(sig.dir);
+					D.newSignals = true;
+				}
+			}
+		}
+		D.Stamp(sc);
 	}
+
 	void EnsureVal(SCStudyInterfaceRef sc, ChartState& S)
 	{
 		EnsureDcs(sc, S); const int n = sc.ArraySize; Fit(S.val.cumR, n);
@@ -2189,6 +2509,7 @@ namespace nqe
 
 	void BuildHudSnapshot(SCStudyInterfaceRef sc, ChartState& S)
 	{
+		using namespace dcs_detail;
 		HudSnapshot& H = S.hud;
 		const int n = sc.ArraySize;
 		const int i = n - 2;   // last closed bar
@@ -2196,17 +2517,19 @@ namespace nqe
 		if (i < 0) return;
 		H.close = sc.Close[n - 1];
 		H.atr = AtrAt(S, i);
+		const float thr = S.params.dcs.signalThr > 0 ? S.params.dcs.signalThr : S.dcs.weights.thrSignal;
 		if (i < static_cast<int>(S.dcs.dcs.size()))
 		{
 			H.dcs = S.dcs.dcs[i]; H.dcsSmooth = S.dcs.dcsSmooth[i];
 			H.dcsTrend = (i >= 5) ? S.dcs.dcs[i] - S.dcs.dcs[i - 5] : 0;
 			H.barState = S.dcs.barState[i];
-			H.bias = (H.dcs >= S.dcs.weights.thrSignal) ? 1 : (H.dcs <= -S.dcs.weights.thrSignal ? -1 : 0);
+			H.bias = (H.dcs >= thr) ? 1 : (H.dcs <= -thr ? -1 : 0);
 		}
 		if (i < static_cast<int>(S.regime.regime.size()))
 		{
 			H.regime = S.regime.regime[i];
 			H.mtf[0] = S.regime.mtf1[i]; H.mtf[1] = S.regime.mtf5[i]; H.mtf[2] = S.regime.mtf15[i]; H.mtf[3] = S.regime.mtf60[i];
+			for (int t = 0; t < 4; ++t) H.mtfAvail[t] = S.regime.tf[t].available;
 		}
 		if (i < static_cast<int>(S.auction.openType.size())) { H.openType = S.auction.openType[i]; H.valueMig = S.auction.valueMig[i]; }
 		if (i < static_cast<int>(S.flow.cvdZ.size()))
@@ -2214,10 +2537,64 @@ namespace nqe
 			H.cvdZ = S.flow.cvdZ[i]; H.cvdTrend = H.cvdZ > 0.5f ? 1 : (H.cvdZ < -0.5f ? -1 : 0);
 			strcpy_s(H.lastEvent, sizeof(H.lastEvent), S.flow.lastEventText); H.lastEventPrice = S.flow.lastEventPrice;
 		}
+		// intermarket
+		{
+			const InterState& I = S.inter;
+			H.ymAvail = I.ym.ok; H.tickAvail = I.tick.ok;
+			H.ym = (I.ym.ok && i < static_cast<int>(I.rsYM.size())) ? (I.rsYM[i] > 0.2f ? 1 : (I.rsYM[i] < -0.2f ? -1 : 0)) : 0;
+			H.tick = (I.tick.ok && i < static_cast<int>(I.tickCum.size()) && !IsNan(I.tickCum[i])) ? (I.tickCum[i] > 0.15f ? 1 : (I.tickCum[i] < -0.15f ? -1 : 0)) : 0;
+			H.megaCount = 0;
+			for (int k = 0; k < 6; ++k)
+			{
+				if (!I.mega[k].ok) continue;
+				H.mega[H.megaCount] = I.megaState[k];
+				const char* sym = I.mega[k].symbol.GetChars();
+				char nm[12] = ""; int q = 0;
+				for (const char* p = sym ? sym : ""; *p && q < 6 && *p != '-' && *p != '.'; ++p) nm[q++] = *p;
+				nm[q] = 0; if (q == 0) sprintf_s(nm, sizeof(nm), "M%d", k + 1);
+				strcpy_s(H.megaNames[H.megaCount], sizeof(H.megaNames[H.megaCount]), nm);
+				++H.megaCount;
+			}
+			H.smt = (I.lastSmtIdx >= 0 && i - I.lastSmtIdx <= 12) ? (I.lastSmtVal > 0 ? 1 : -1) : 0;
+		}
 		H.signalsTotal = static_cast<int>(S.dcs.signals.size());
 		if (i < static_cast<int>(S.vwap.vwap.size()) && S.vwap.vwap[i] > 0)
 			sprintf_s(H.vwapText, sizeof(H.vwapText), "VWAP %s", sc.FormatGraphValue(S.vwap.vwap[i], sc.BaseGraphValueFormat).GetChars());
 		else H.vwapText[0] = 0;
+
+		// nearest support / resistance from the level list as of the last closed bar
+		std::vector<Lv> lv; GatherLevels(sc, S, i, lv);
+		H.supPrice = 0; H.resPrice = 0; H.supKind = H.resKind = LVL_NONE;
+		float bs = FLT_MAX, br = FLT_MAX;
+		for (size_t k = 0; k < lv.size(); ++k)
+		{
+			const float d = lv[k].price - H.close;
+			if (d > 0 && d < br) { br = d; H.resPrice = lv[k].price; H.resKind = lv[k].kind; }
+			if (d < 0 && -d < bs) { bs = -d; H.supPrice = lv[k].price; H.supKind = lv[k].kind; }
+		}
+
+		// current setup type = the most recent signal's type (for the stats row) or the one the state line suggests
+		H.curSetup = SETUP_NONE; H.statsAvail = false;
+		if (!S.dcs.signals.empty()) { H.curSetup = S.dcs.signals.back().type; }
+		else H.curSetup = (H.regime == RG_TREND_UP || H.regime == RG_TREND_DOWN) ? SETUP_TREND_PULLBACK : SETUP_VALUE_EDGE;
+		if (H.curSetup > 0 && H.curSetup < SETUP_COUNT) { H.curStats = S.val.stats[H.curSetup]; H.statsAvail = true; }
+
+		// plain-English state line
+		const char* vwapS = S.vwap.vwap.size() > static_cast<size_t>(i) && S.vwap.vwap[i] > 0 ? sc.FormatGraphValue(S.vwap.vwap[i], sc.BaseGraphValueFormat).GetChars() : "VWAP";
+		const Signal* live = (!S.dcs.signals.empty() && i - S.dcs.signals.back().idx <= 5) ? &S.dcs.signals.back() : nullptr;
+		if (live)
+			sprintf_s(H.stateLine, sizeof(H.stateLine), "%s %s: entry %s stop %s T1 %s", live->dir > 0 ? "LONG" : "SHORT", kSetupNames[live->type],
+				sc.FormatGraphValue(live->entry, sc.BaseGraphValueFormat).GetChars(), sc.FormatGraphValue(live->stop, sc.BaseGraphValueFormat).GetChars(), sc.FormatGraphValue(live->t1, sc.BaseGraphValueFormat).GetChars());
+		else if (H.regime == RG_TREND_UP)
+			sprintf_s(H.stateLine, sizeof(H.stateLine), "Trend up%s, wait for pullback to %s %s with absorption", H.bias > 0 ? " (bias long)" : "", H.supKind != LVL_NONE ? LevelName(H.supKind) : "VWAP", H.supPrice > 0 ? sc.FormatGraphValue(H.supPrice, sc.BaseGraphValueFormat).GetChars() : vwapS);
+		else if (H.regime == RG_TREND_DOWN)
+			sprintf_s(H.stateLine, sizeof(H.stateLine), "Trend down%s, wait for pullback to %s %s with absorption", H.bias < 0 ? " (bias short)" : "", H.resKind != LVL_NONE ? LevelName(H.resKind) : "VWAP", H.resPrice > 0 ? sc.FormatGraphValue(H.resPrice, sc.BaseGraphValueFormat).GetChars() : vwapS);
+		else if (H.regime == RG_BALANCE)
+			sprintf_s(H.stateLine, sizeof(H.stateLine), "Balance: fade %s %s / %s %s on absorption, target POC", H.resKind != LVL_NONE ? LevelName(H.resKind) : "VAH", H.resPrice > 0 ? sc.FormatGraphValue(H.resPrice, sc.BaseGraphValueFormat).GetChars() : "", H.supKind != LVL_NONE ? LevelName(H.supKind) : "VAL", H.supPrice > 0 ? sc.FormatGraphValue(H.supPrice, sc.BaseGraphValueFormat).GetChars() : "");
+		else if (H.regime == RG_CHOP)
+			sprintf_s(H.stateLine, sizeof(H.stateLine), "Volatile chop: stand aside until DCS beyond %+.0f with regime change", thr);
+		else
+			sprintf_s(H.stateLine, sizeof(H.stateLine), "Warming up (need swings, value area and session data)");
 	}
 
 	inline n_ACSIL::s_GraphicsColor GColor(uint32_t c) { n_ACSIL::s_GraphicsColor g; g.SetColorValue(c); return g; }
@@ -3040,20 +3417,64 @@ SCSFExport scsf_NQEdge_DCS(SCStudyInterfaceRef sc)
 	sc.Subgraph[DS_SMOOTH].PrimaryColor = sc.Input[DI_C_SMOOTH].GetColor(); sc.Subgraph[DS_THR_UP].PrimaryColor = sc.Subgraph[DS_THR_DN].PrimaryColor = sc.Input[DI_C_THR].GetColor();
 	const uint32_t cG = sc.Input[DI_C_GREEN].GetColor(), cR = sc.Input[DI_C_RED].GetColor(), cN = sc.Input[DI_C_GRAY].GetColor();
 	int& gen = sc.GetPersistentInt(1);
-	int start = sc.UpdateStartIndex;
+	int start = Min(sc.UpdateStartIndex, S.dcs.dirtyFrom); S.dcs.dirtyFrom = INT_MAX;
 	if (gen != S.dcs.generation) { start = 0; gen = S.dcs.generation; }
+	if (start < 0) start = 0;
 	const DcsState& D = S.dcs;
+	const float thrLine = S.params.dcs.signalThr > 0 ? S.params.dcs.signalThr : D.weights.thrSignal;
 	for (int i = start; i < sc.ArraySize; ++i)
 	{
 		const float v = D.dcs[i];
 		sc.Subgraph[DS_DCS][i] = v; sc.Subgraph[DS_SMOOTH][i] = D.dcsSmooth[i];
-		sc.Subgraph[DS_THR_UP][i] = D.weights.thrSignal; sc.Subgraph[DS_THR_DN][i] = -D.weights.thrSignal;
+		sc.Subgraph[DS_THR_UP][i] = thrLine; sc.Subgraph[DS_THR_DN][i] = -thrLine;
 		const float t = Clamp(static_cast<float>(fabs(v)) / 100.0f, 0.0f, 1.0f);
 		uint32_t c = v >= 0 ? sc.RGBInterpolate(cN, cG, t) : sc.RGBInterpolate(cN, cR, t);
 		if (i == sc.ArraySize - 1) c = sc.RGBInterpolate(c, RGB(0, 0, 0), 0.5f);   // provisional (forming bar) drawn dim
 		sc.Subgraph[DS_DCS].DataColor[i] = c;
 		sc.Subgraph[DS_SIGNAL][i] = static_cast<float>(D.signalType[i]) * static_cast<float>(D.signalDir[i]);
 		sc.Subgraph[DS_BIAS][i] = static_cast<float>(D.barState[i]);
+	}
+
+	// ---- signal drawings (region 0) and alerts ----
+	DcsState& DW = S.dcs;
+	const int maxDrawn = Max(1, sc.Input[DI_MAXSIG].GetInt());
+	const int lineBars = Max(2, sc.Input[DI_TGTBARS].GetInt());
+	const uint32_t cLong = sc.Input[DI_C_LONG].GetColor(), cShort = sc.Input[DI_C_SHORT].GetColor(), cEntry = sc.Input[DI_C_ENTRY].GetColor();
+	const uint32_t cStop = sc.Input[DI_C_STOP].GetColor(), cTgt = sc.Input[DI_C_TARGET].GetColor(), cLabel = sc.Input[DI_C_LABEL].GetColor();
+	const int total = static_cast<int>(DW.signals.size());
+	for (int k = total - 1; k >= 0; --k)
+	{
+		Signal& g = DW.signals[k];
+		const bool keep = (total - 1 - k) < maxDrawn;
+		if (!keep)
+		{
+			if (g.lineArrow == 0 && g.lineEntry == 0 && g.lineStop == 0 && g.lineT1 == 0 && g.lineT2 == 0 && g.lineText == 0) break;   // older ones are already clean
+			DeleteDrawing(sc, g.lineArrow); DeleteDrawing(sc, g.lineEntry); DeleteDrawing(sc, g.lineStop); DeleteDrawing(sc, g.lineT1); DeleteDrawing(sc, g.lineT2); DeleteDrawing(sc, g.lineText);
+			continue;
+		}
+		if (g.lineArrow != 0 && DrawingAlive(sc, g.lineArrow)) continue;    // drawn once; closed-bar signals never change
+		const float atr = AtrAt(S, g.idx);
+		const float ay = g.dir > 0 ? sc.Low[g.idx] - 0.3f * atr : sc.High[g.idx] + 0.3f * atr;
+		DrawMarker(sc, g.lineArrow, g.idx, ay, g.dir > 0 ? MARKER_ARROWUP : MARKER_ARROWDOWN, 10, g.dir > 0 ? cLong : cShort, 3);
+		const int e = Min(sc.ArraySize - 1 + 0, g.idx + lineBars);
+		DrawSegment(sc, g.lineEntry, g.idx, e, g.entry, cEntry, 1, LINESTYLE_SOLID);
+		DrawSegment(sc, g.lineStop, g.idx, e, g.stop, cStop, 1, LINESTYLE_DASH);
+		DrawSegment(sc, g.lineT1, g.idx, e, g.t1, cTgt, 1, LINESTYLE_DOT);
+		DrawSegment(sc, g.lineT2, g.idx, e, g.t2, cTgt, 1, LINESTYLE_DOT);
+		DrawLabel(sc, g.lineText, g.idx, g.dir > 0 ? g.stop : g.t1, g.label, cLabel, 8, true);
+	}
+	// alert only for a signal on the newest closed bar, only in real time
+	if (sc.Input[DI_ALERTS].GetYesNo() && total > 0 && !sc.IsFullRecalculation && sc.DownloadingHistoricalData == 0 && !sc.IsReplayRunning())
+	{
+		const Signal& g = DW.signals[total - 1];
+		if (g.idx == sc.ArraySize - 2 && DW.lastAlertIdx != g.idx)
+		{
+			DW.lastAlertIdx = g.idx;
+			SCString msg; msg.Format("NQ Edge %s @ %s stop %s T1 %s T2 %s", g.label, sc.FormatGraphValue(g.entry, sc.BaseGraphValueFormat).GetChars(),
+				sc.FormatGraphValue(g.stop, sc.BaseGraphValueFormat).GetChars(), sc.FormatGraphValue(g.t1, sc.BaseGraphValueFormat).GetChars(), sc.FormatGraphValue(g.t2, sc.BaseGraphValueFormat).GetChars());
+			const int snd = sc.Input[DI_SOUND].GetAlertSoundNumber();
+			if (snd > 0) sc.SetAlert(snd - 1, g.idx, msg); else sc.AddAlertLine(msg, 1);
+		}
 	}
 }
 

@@ -26,3 +26,10 @@
 ## Phase 5 — Intermarket Engine
 - Reference charts by number (YM/ES/RTY/TICK/6 mega caps), refreshed each call, time-aligned with `GetContainingIndexForSCDateTime` and shifted back when the reference bar was still forming at the primary bar's close.
 - Relative strength z-scores vs each index (`rsIndex`), SMT divergence at freshly confirmed swings (any index failing to confirm), NYSE TICK session average, extremes count and TICK-vs-price trend divergence, mega-cap leadership (own RTH VWAP + EMA) breadth. Missing charts are reported in the HUD warnings and their features are NaN (dropped by the composite).
+
+## Phase 6 — Composite DCS, bar painting, setups, alerts
+- Weights file loader (`NQEdge_weights.txt`, hot reload by mtime, `w.*`, `gate.<regime>.<group>`, `thr.*`), compiled-in defaults.
+- DCS = 100 · Σ w·gate·f / Σ|w·gate| over available (non-NaN) features; regime gates (trend damps reversal/location, balance inverts location, chop halves everything); EMA-smoothed line; bar states (strong/weak bull/bear, neutral); gradient-coloured histogram with dim forming bar; bar painting via the HUD study.
+- Five setups on closed bars with bias + location + trigger: trend pullback (VWAP/±1σ/POC + absorption/delta flip/stacked imbalance), value-edge rejection in balance, failed breakout/trapped traders, break-and-acceptance (two closes beyond IB/VA/PD/ON level with flow support), SMT/CVD divergence at liquidity. Structural stop + ATR buffer, T1/T2 at the next liquidity levels, R:R gate, label `LONG · Trend Pullback · DCS +72 · R:R 2.4 · T1 VAH`.
+- Signal drawings (arrow, entry/stop/T1/T2 segments, label), bounded; `sc.SetAlert` only for a signal on the newest closed bar in real time.
+- HUD snapshot: nearest support/resistance from the as-of level list, plain-English state line, MTF availability, intermarket dots with mega-cap names, current-setup stats hook.
