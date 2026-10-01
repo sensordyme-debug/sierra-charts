@@ -33,3 +33,7 @@
 - Five setups on closed bars with bias + location + trigger: trend pullback (VWAP/±1σ/POC + absorption/delta flip/stacked imbalance), value-edge rejection in balance, failed breakout/trapped traders, break-and-acceptance (two closes beyond IB/VA/PD/ON level with flow support), SMT/CVD divergence at liquidity. Structural stop + ATR buffer, T1/T2 at the next liquidity levels, R:R gate, label `LONG · Trend Pullback · DCS +72 · R:R 2.4 · T1 VAH`.
 - Signal drawings (arrow, entry/stop/T1/T2 segments, label), bounded; `sc.SetAlert` only for a signal on the newest closed bar in real time.
 - HUD snapshot: nearest support/resistance from the as-of level list, plain-English state line, MTF availability, intermarket dots with mega-cap names, current-setup stats hook.
+
+## Phase 7 — Validation + Feature Logger
+- Validation: every signal replayed forward on closed bars with configurable slippage (entry and stop), stop-first on ambiguous bars, T1 win / stop loss / timeout (mark-to-market) resolution, T2 tracking, MFE/MAE in R, bars to resolution; per-setup count/win %/avg R/PF/T2 %; cumulative-R curve subgraph; results feed the HUD with a small-sample warning.
+- Feature logger: one CSV row per closed bar written only once the +60 min window has closed (forward returns at +5/+15/+30/+60 in ATR, MFE/MAE), file per symbol in the Data folder, rewrite on full recalculation (input), RTH-only filter.

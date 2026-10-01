@@ -491,14 +491,14 @@ namespace nqe
 	struct ValState : EngineCommon
 	{
 		SetupStats stats[SETUP_COUNT];
-		std::vector<float> cumR;
+		std::vector<float> cumR, addR;
 		int nextSignal = 0;      // first signal index not yet fully resolved
 		double totalR = 0;
 	};
 
 	struct LogRow
 	{
-		int idx; double t; float o, h, l, c, v; float feat[F_COUNT]; float dcs; int regime; int setup; int dir;
+		int idx; double t; float o, h, l, c, v; float feat[F_COUNT]; float dcs; int regime; int setup; int dir; int tradingDay;
 		float atr; float fwd5, fwd15, fwd30, fwd60, mfe, mae; bool done;
 	};
 
@@ -507,6 +507,8 @@ namespace nqe
 		std::vector<LogRow> pending;
 		int lastQueuedIdx = -1;
 		bool headerWritten = false;
+		int generationWritten = -1;
+		int rowsWritten = 0;
 		std::string path;
 	};
 
@@ -656,8 +658,8 @@ namespace nqe
 			for (int k = 0; k < 10; ++k) { refs[k]->cumThrough = -1; refs[k]->emaThrough = -1; refs[k]->cumPV.clear(); refs[k]->cumV.clear(); refs[k]->ema.clear(); refs[k]->vwap.clear(); refs[k]->sessStart.clear(); refs[k]->lastRefSize = 0; refs[k]->symbol.Clear(); }
 		}
 		if (engine <= E_DCS) { S.dcs.signals.clear(); S.dcs.lastAlertIdx = -1; S.dcs.lastSignalCheckedIdx = -1; }
-		if (engine <= E_VAL) { for (int k = 0; k < SETUP_COUNT; ++k) S.val.stats[k] = SetupStats(); S.val.nextSignal = 0; S.val.totalR = 0; }
-		if (engine <= E_LOG) { S.log.pending.clear(); S.log.lastQueuedIdx = -1; }
+		if (engine <= E_VAL) { for (int k = 0; k < SETUP_COUNT; ++k) S.val.stats[k] = SetupStats(); S.val.nextSignal = 0; S.val.totalR = 0; S.val.addR.clear(); S.val.cumR.clear(); }
+		if (engine <= E_LOG) { S.log.pending.clear(); S.log.lastQueuedIdx = -1; S.log.headerWritten = false; }
 		++S.resetCount;
 	}
 
@@ -855,9 +857,7 @@ namespace nqe
 	void EnsureRegime(SCStudyInterfaceRef sc, ChartState& S);
 	void EnsureInter(SCStudyInterfaceRef sc, ChartState& S);
 	void EnsureDcs(SCStudyInterfaceRef sc, ChartState& S);
-	// ==== 12 Validation (phase 7) ===============================================
 	void EnsureVal(SCStudyInterfaceRef sc, ChartState& S);
-	// ==== 13 Logger (phase 7) ===================================================
 	void EnsureLog(SCStudyInterfaceRef sc, ChartState& S);
 
 	// ==== 6  Auction / Structure engine ========================================
@@ -1446,7 +1446,6 @@ namespace nqe
 		V.Stamp(sc);
 	}
 
-	// Phase stubs for engines not yet implemented: size arrays and mark computed so downstream code is safe.
 	// ==== 8  Order Flow engine ==================================================
 	namespace flow_detail
 	{
@@ -2472,14 +2471,174 @@ namespace nqe
 		D.Stamp(sc);
 	}
 
+	// ==== 12 Validation =========================================================
+	// Replays each signal forward on closed bars with slippage; stop-first on ambiguous bars.
 	void EnsureVal(SCStudyInterfaceRef sc, ChartState& S)
 	{
-		EnsureDcs(sc, S); const int n = sc.ArraySize; Fit(S.val.cumR, n);
-		S.val.computedThrough = n - 2; S.val.lastArraySize = n;
+		EnsureDcs(sc, S);
+		const int n = sc.ArraySize; if (n <= 0) return;
+		ValState& V = S.val; const ValParams& P = S.params.val; DcsState& D = S.dcs;
+		Fit(V.cumR, n); Fit(V.addR, n);
+		if (V.UpToDate(sc) && !D.newSignals) return;
+		D.newSignals = false;
+		const int lastClosed = n - 2;
+		const float slip = P.slippageTicks * S.tickSize;
+		int earliestRes = INT_MAX;
+		for (size_t k = V.nextSignal; k < D.signals.size(); ++k)
+		{
+			Signal& g = D.signals[k];
+			if (g.resolved != 0) continue;
+			const float entryFill = g.entry + g.dir * slip;
+			const float stopFill = g.stop - g.dir * slip;
+			const float risk = static_cast<float>(fabs(entryFill - stopFill));
+			if (risk <= 0) { g.resolved = -1; g.resultR = -1; g.resIdx = g.idx + 1; g.barsToRes = 1; }
+			else
+			{
+				float mfe = 0, mae = 0; bool t1Hit = false; int res = 0; float resultR = 0; int resIdx = -1;
+				const int last = Min(lastClosed, g.idx + Max(1, P.maxBars));
+				for (int j = g.idx + 1; j <= last; ++j)
+				{
+					const float hi = sc.High[j], lo = sc.Low[j];
+					const float fav = g.dir > 0 ? (hi - entryFill) / risk : (entryFill - lo) / risk;
+					const float adv = g.dir > 0 ? (entryFill - lo) / risk : (hi - entryFill) / risk;
+					const bool stopHit = g.dir > 0 ? lo <= stopFill : hi >= stopFill;
+					const bool t1Now = g.dir > 0 ? hi >= g.t1 : lo <= g.t1;
+					const bool t2Now = g.dir > 0 ? hi >= g.t2 : lo <= g.t2;
+					if (!t1Hit) { mfe = Max(mfe, fav); mae = Max(mae, adv); }
+					if (!t1Hit)
+					{
+						if (stopHit && (!t1Now || P.stopFirst)) { res = -1; resultR = -1.0f; resIdx = j; break; }
+						if (t1Now) { t1Hit = true; resultR = static_cast<float>(fabs(g.t1 - entryFill)) / risk; resIdx = j; if (t2Now && !P.stopFirst) { g.hitT2 = 1; } }
+						if (stopHit && t1Now && !P.stopFirst) { res = 1; break; }
+					}
+					else
+					{
+						// after T1: track whether T2 is reached before the stop (statistics only)
+						if (stopHit) { res = 1; break; }
+						if (t2Now) { g.hitT2 = 1; res = 1; break; }
+					}
+				}
+				if (res == 0 && t1Hit) res = 1;                                   // T1 hit, T2 still open: count as a resolved win
+				if (res == 0 && last == g.idx + Max(1, P.maxBars) && last <= lastClosed)
+				{
+					res = 2; resIdx = last; resultR = (g.dir > 0 ? sc.Close[last] - entryFill : entryFill - sc.Close[last]) / risk;   // timeout: mark to market
+				}
+				if (res == 0) { if (k == V.nextSignal) break; else continue; }   // still pending (needs more bars)
+				g.resolved = res; g.resultR = resultR; g.resIdx = resIdx; g.barsToRes = resIdx - g.idx; g.mfeR = mfe; g.maeR = mae;
+			}
+			if (g.resIdx >= 0 && g.resIdx < n) { V.addR[g.resIdx] += g.resultR; earliestRes = Min(earliestRes, g.resIdx); }
+			SetupStats& st = V.stats[Clamp(g.type, 0, SETUP_COUNT - 1)];
+			++st.count; st.sumR += g.resultR; st.sumMfe += g.mfeR; st.sumMae += g.maeR; st.sumBars += g.barsToRes;
+			if (g.resolved == 1) { ++st.wins; st.sumWinR += g.resultR; if (g.hitT2) ++st.t2; }
+			else if (g.resolved == -1) { ++st.losses; st.sumLossR += g.resultR; }
+			else { ++st.timeouts; if (g.resultR >= 0) st.sumWinR += g.resultR; else st.sumLossR += g.resultR; }
+			V.totalR += g.resultR;
+		}
+		while (V.nextSignal < static_cast<int>(D.signals.size()) && D.signals[V.nextSignal].resolved != 0) ++V.nextSignal;
+		// cumulative R curve
+		int from = Min(V.computedThrough + 1, earliestRes); if (from < 0) from = 0; if (from > n - 1) from = n - 1;
+		if (earliestRes != INT_MAX) V.dirtyFrom = Min(V.dirtyFrom, earliestRes);
+		for (int i = from; i < n; ++i) V.cumR[i] = (i > 0 ? V.cumR[i - 1] : 0.0f) + V.addR[i];
+		V.Stamp(sc);
 	}
+
+	// ==== 13 Feature logger =====================================================
+	namespace log_detail
+	{
+		inline int BarAtOrAfter(SCStudyInterfaceRef sc, int fromIdx, const SCDateTime& t, int lastClosed)
+		{
+			for (int k = fromIdx + 1; k <= lastClosed; ++k) if (sc.BaseDateTimeIn[k] >= t) return k;
+			return -1;
+		}
+		inline void WriteHeader(FILE* f)
+		{
+			fprintf(f, "time,idx,trading_day,open,high,low,close,volume,atr");
+			for (int k = 0; k < F_COUNT; ++k) fprintf(f, ",%s", kFeatureNames[k]);
+			fprintf(f, ",dcs,regime,setup,dir,fwd5,fwd15,fwd30,fwd60,mfe,mae\n");
+		}
+	}
+
 	void EnsureLog(SCStudyInterfaceRef sc, ChartState& S)
 	{
-		EnsureVal(sc, S); S.log.computedThrough = sc.ArraySize - 2; S.log.lastArraySize = sc.ArraySize;
+		using namespace log_detail;
+		EnsureVal(sc, S);
+		const int n = sc.ArraySize; if (n <= 0) return;
+		LogState& L = S.log; const LogParams& P = S.params.log; const DcsState& D = S.dcs; const BaseState& B = S.base;
+		if (L.UpToDate(sc)) return;
+		if (!P.enabled || !S.studyPresent[E_LOG]) { L.Stamp(sc); return; }
+		const int lastClosed = n - 2;
+		// queue new closed bars
+		for (int i = Max(0, L.lastQueuedIdx + 1); i <= lastClosed; ++i)
+		{
+			if (P.rthOnly && !B.isRth[i]) { L.lastQueuedIdx = i; continue; }
+			LogRow r; r.idx = i; r.t = sc.BaseDateTimeIn[i].GetAsDouble(); r.o = sc.Open[i]; r.h = sc.High[i]; r.l = sc.Low[i]; r.c = sc.Close[i]; r.v = sc.Volume[i];
+			for (int k = 0; k < F_COUNT; ++k) r.feat[k] = D.feat[static_cast<size_t>(i) * F_COUNT + k];
+			r.dcs = D.dcs[i]; r.regime = S.regime.regime[i]; r.setup = D.signalType[i]; r.dir = D.signalDir[i]; r.atr = AtrAt(S, i);
+			r.fwd5 = r.fwd15 = r.fwd30 = r.fwd60 = r.mfe = r.mae = 0; r.done = false; r.tradingDay = B.tradingDay[i];
+			L.pending.push_back(r);
+			L.lastQueuedIdx = i;
+		}
+		// complete rows whose 60-minute horizon has closed, then write them in order
+		size_t ready = 0;
+		for (size_t q = 0; q < L.pending.size(); ++q)
+		{
+			LogRow& r = L.pending[q];
+			if (!r.done)
+			{
+				const SCDateTime t0 = sc.BaseDateTimeIn[r.idx];
+				SCDateTime t60 = t0; t60.AddMinutes(60);
+				const int k60 = BarAtOrAfter(sc, r.idx, t60, lastClosed);
+				if (k60 < 0) break;
+				SCDateTime t5 = t0; t5.AddMinutes(5); SCDateTime t15 = t0; t15.AddMinutes(15); SCDateTime t30 = t0; t30.AddMinutes(30);
+				const int k5 = BarAtOrAfter(sc, r.idx, t5, lastClosed), k15 = BarAtOrAfter(sc, r.idx, t15, lastClosed), k30 = BarAtOrAfter(sc, r.idx, t30, lastClosed);
+				const float a = r.atr > 0 ? r.atr : S.tickSize;
+				r.fwd5 = k5 >= 0 ? (sc.Close[k5] - r.c) / a : 0; r.fwd15 = k15 >= 0 ? (sc.Close[k15] - r.c) / a : 0; r.fwd30 = k30 >= 0 ? (sc.Close[k30] - r.c) / a : 0; r.fwd60 = (sc.Close[k60] - r.c) / a;
+				float hi = -FLT_MAX, lo = FLT_MAX;
+				for (int k = r.idx + 1; k <= k60; ++k) { hi = Max(hi, sc.High[k]); lo = Min(lo, sc.Low[k]); }
+				r.mfe = (hi - r.c) / a; r.mae = (r.c - lo) / a;
+				r.done = true;
+			}
+			ready = q + 1;
+		}
+		if (ready > 0)
+		{
+			if (L.path.empty())
+			{
+				SCString path = sc.DataFilesFolder();
+				if (path.GetLength() > 0 && path.GetChars()[path.GetLength() - 1] != '\\' && path.GetChars()[path.GetLength() - 1] != '/') path += "\\";
+				std::string sym = sc.Symbol.GetChars();
+				for (size_t k = 0; k < sym.size(); ++k) if (sym[k] == '\\' || sym[k] == '/' || sym[k] == ':' || sym[k] == '*' || sym[k] == '?' || sym[k] == '"' || sym[k] == '<' || sym[k] == '>' || sym[k] == '|') sym[k] = '_';
+				L.path = std::string(path.GetChars()) + P.prefix + "_" + sym + ".csv";
+			}
+			FILE* f = nullptr;
+			if (!L.headerWritten)
+			{
+				const bool rewrite = P.rewriteOnRecalc != 0 || L.generationWritten != L.generation;
+				f = fopen(L.path.c_str(), rewrite ? "w" : "a");
+				if (f)
+				{
+					if (rewrite) WriteHeader(f);
+					else { fseek(f, 0, SEEK_END); if (ftell(f) == 0) WriteHeader(f); }
+					L.headerWritten = true; L.generationWritten = L.generation;
+				}
+			}
+			else f = fopen(L.path.c_str(), "a");
+			if (f)
+			{
+				for (size_t q = 0; q < ready; ++q)
+				{
+					const LogRow& r = L.pending[q];
+					SCDateTime dt(r.t); int Y, M, Dd, hh, mm, ss; dt.GetDateTimeYMDHMS(Y, M, Dd, hh, mm, ss);
+					fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g", Y, M, Dd, hh, mm, ss, r.idx, r.tradingDay, r.o, r.h, r.l, r.c, r.v, r.atr);
+					for (int k = 0; k < F_COUNT; ++k) { if (IsNan(r.feat[k])) fputs(",", f); else fprintf(f, ",%.4f", r.feat[k]); }
+					fprintf(f, ",%.2f,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", r.dcs, r.regime, r.setup, r.dir, r.fwd5, r.fwd15, r.fwd30, r.fwd60, r.mfe, r.mae);
+				}
+				fclose(f);
+				L.rowsWritten += static_cast<int>(ready);
+			}
+			L.pending.erase(L.pending.begin(), L.pending.begin() + ready);
+		}
+		L.Stamp(sc);
 	}
 
 	// ==== 14 HUD snapshot + GDI =================================================
@@ -3509,8 +3668,9 @@ SCSFExport scsf_NQEdge_Validation(SCStudyInterfaceRef sc)
 	EnsureVal(sc, S);
 	sc.Subgraph[VLS_CUMR].PrimaryColor = sc.Input[VLI_C_CURVE].GetColor(); sc.Subgraph[VLS_RESULT].PrimaryColor = sc.Input[VLI_C_MARK].GetColor();
 	int& gen = sc.GetPersistentInt(1);
-	int start = sc.UpdateStartIndex;
+	int start = Min(sc.UpdateStartIndex, S.val.dirtyFrom); S.val.dirtyFrom = INT_MAX;
 	if (gen != S.val.generation) { start = 0; gen = S.val.generation; }
+	if (start < 0) start = 0;
 	for (int i = start; i < sc.ArraySize; ++i) { sc.Subgraph[VLS_CUMR][i] = S.val.cumR[i]; sc.Subgraph[VLS_RESULT][i] = 0; }
 	for (size_t k = 0; k < S.dcs.signals.size(); ++k)
 	{
@@ -3545,6 +3705,7 @@ SCSFExport scsf_NQEdge_FeatureLogger(SCStudyInterfaceRef sc)
 	SetParams(S, E_LOG, S.params.log, lp);
 	CheckDataStamp(sc, S);
 	EnsureLog(sc, S);
+	if (sc.ArraySize > 0) sc.Subgraph[0][sc.ArraySize - 1] = static_cast<float>(S.log.rowsWritten);
 }
 
 // --- 9. HUD + Bar Painter -----------------------------------------------------
