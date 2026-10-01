@@ -390,8 +390,9 @@ namespace nqe
 	struct RefChart
 	{
 		int chartNumber = 0; bool ok = false; SCString symbol;
+		SCGraphData data; SCDateTimeArray times;                 // wrappers refreshed every call (no data copy)
 		std::vector<double> cumPV, cumV; int cumThrough = -1;   // for ref VWAP
-		std::vector<float> ema; int emaThrough = -1;
+		std::vector<float> ema, vwap; std::vector<int> sessStart; int emaThrough = -1;
 		int lastRefSize = 0;
 	};
 
@@ -401,9 +402,12 @@ namespace nqe
 		std::vector<signed char> smtMark;
 		RefChart ym, es, rty, tick, mega[6];
 		int available = 0;                           // bitmask: 1 YM, 2 ES, 4 RTY, 8 TICK, 16.. mega
-		double tickCumCommitted = 0; int tickSession = -1;
+		double tickCumCommitted = 0; int tickCount = 0; int tickSession = -1;
 		int lastSwingProcessed = -1;
-		std::vector<float> rsRet; // scratch
+		std::vector<double> rsPre1[3], rsPre2[3]; std::vector<float> rsRaw[3];
+		std::vector<float> tickVal, tickEmaArr;
+		int lastSmtIdx = -1; float lastSmtVal = 0, lastSmtPrice = 0;
+		signed char megaState[6] = { 0, 0, 0, 0, 0, 0 };
 	};
 
 	// Feature vector published to the composite. Index constants must match kFeatureNames.
@@ -643,9 +647,10 @@ namespace nqe
 		if (engine <= E_REGIME) { S.regime.candidate = RG_NONE; S.regime.candidateCount = 0; S.regime.current = RG_NONE; for (int t = 0; t < 4; ++t) S.regime.tf[t] = RegimeState::Tf(); }
 		if (engine <= E_INTER)
 		{
-			S.inter.tickCumCommitted = 0; S.inter.tickSession = -1; S.inter.lastSwingProcessed = -1;
+			S.inter.tickCumCommitted = 0; S.inter.tickCount = 0; S.inter.tickSession = -1; S.inter.lastSwingProcessed = -1;
+			S.inter.lastSmtIdx = -1; S.inter.lastSmtVal = 0; S.inter.lastSmtPrice = 0;
 			RefChart* refs[10] = { &S.inter.ym, &S.inter.es, &S.inter.rty, &S.inter.tick, &S.inter.mega[0], &S.inter.mega[1], &S.inter.mega[2], &S.inter.mega[3], &S.inter.mega[4], &S.inter.mega[5] };
-			for (int k = 0; k < 10; ++k) { refs[k]->cumThrough = -1; refs[k]->emaThrough = -1; refs[k]->cumPV.clear(); refs[k]->cumV.clear(); refs[k]->ema.clear(); refs[k]->lastRefSize = 0; }
+			for (int k = 0; k < 10; ++k) { refs[k]->cumThrough = -1; refs[k]->emaThrough = -1; refs[k]->cumPV.clear(); refs[k]->cumV.clear(); refs[k]->ema.clear(); refs[k]->vwap.clear(); refs[k]->sessStart.clear(); refs[k]->lastRefSize = 0; refs[k]->symbol.Clear(); }
 		}
 		if (engine <= E_DCS) { S.dcs.signals.clear(); S.dcs.lastAlertIdx = -1; S.dcs.lastSignalCheckedIdx = -1; }
 		if (engine <= E_VAL) { for (int k = 0; k < SETUP_COUNT; ++k) S.val.stats[k] = SetupStats(); S.val.nextSignal = 0; S.val.totalR = 0; }
@@ -845,7 +850,6 @@ namespace nqe
 	void EnsureVwap(SCStudyInterfaceRef sc, ChartState& S);
 	void EnsureFlow(SCStudyInterfaceRef sc, ChartState& S);
 	void EnsureRegime(SCStudyInterfaceRef sc, ChartState& S);
-	// ==== 10 Intermarket (phase 5) ==============================================
 	void EnsureInter(SCStudyInterfaceRef sc, ChartState& S);
 	// ==== 11 DCS (phase 6) ======================================================
 	void EnsureDcs(SCStudyInterfaceRef sc, ChartState& S);
@@ -1913,13 +1917,235 @@ namespace nqe
 		R.Stamp(sc);
 	}
 
+	// ==== 10 Intermarket engine =================================================
+	namespace inter_detail
+	{
+		// Loads / refreshes a reference chart: arrays, session starts, cumulative VWAP sums, EMA.
+		// Returns false when the chart has no data.
+		bool RefreshRef(SCStudyInterfaceRef sc, ChartState& S, RefChart& R, int chartNumber, int emaLen)
+		{
+			R.chartNumber = chartNumber; R.ok = false;
+			if (chartNumber <= 0) return false;
+			sc.GetChartBaseData(chartNumber, R.data);
+			sc.GetChartDateTimeArray(chartNumber, R.times);
+			const int rn = R.data[SC_LAST].GetArraySize();
+			if (rn <= 2) return false;
+			if (R.symbol.IsEmpty()) R.symbol = sc.GetChartSymbol(chartNumber);
+			if (rn < R.lastRefSize) { R.cumThrough = -1; }   // reload
+			Fit(R.cumPV, rn); Fit(R.cumV, rn); Fit(R.ema, rn); Fit(R.sessStart, rn); Fit(R.vwap, rn);
+			const BaseParams& BP = S.params.base;
+			const float a = 2.0f / (Max(2, emaLen) + 1.0f);
+			int from = R.cumThrough + 1; if (from < 0) from = 0;
+			for (int j = from; j < rn; ++j)
+			{
+				const SCDateTime& dt = R.times[j];
+				const int tod = dt.GetTimeInSeconds();
+				const bool rth = (BP.rthStartSec < BP.rthEndSec) ? (tod >= BP.rthStartSec && tod < BP.rthEndSec) : (tod >= BP.rthStartSec || tod < BP.rthEndSec);
+				const int key = rth ? dt.GetDate() : -1;
+				const int prevKey = (j > 0) ? ((R.sessStart[j - 1] >= 0) ? R.times[R.sessStart[j - 1]].GetDate() : -1) : -2;
+				const bool newSess = (j == 0) || key < 0 || key != prevKey || R.sessStart[j - 1] < 0;
+				R.sessStart[j] = (key < 0) ? -1 : (newSess ? j : R.sessStart[j - 1]);
+				const double v = R.data[SC_VOLUME][j];
+				const double tp = (R.data[SC_HIGH][j] + R.data[SC_LOW][j] + R.data[SC_LAST][j]) / 3.0;
+				R.cumPV[j] = (j > 0 ? R.cumPV[j - 1] : 0.0) + tp * v;
+				R.cumV[j] = (j > 0 ? R.cumV[j - 1] : 0.0) + v;
+				if (R.sessStart[j] >= 0)
+				{
+					const int s0 = R.sessStart[j];
+					const double pv = R.cumPV[j] - (s0 > 0 ? R.cumPV[s0 - 1] : 0.0), vv = R.cumV[j] - (s0 > 0 ? R.cumV[s0 - 1] : 0.0);
+					R.vwap[j] = vv > 0 ? static_cast<float>(pv / vv) : 0.0f;
+				}
+				else R.vwap[j] = 0;
+				R.ema[j] = (j == 0) ? R.data[SC_LAST][j] : R.ema[j - 1] + a * (R.data[SC_LAST][j] - R.ema[j - 1]);
+			}
+			R.cumThrough = rn - 2;      // the last reference bar is re-evaluated every call
+			R.lastRefSize = rn;
+			R.ok = true;
+			return true;
+		}
+
+		// Reference bar that had closed by the time primary bar i closed.
+		inline int Align(SCStudyInterfaceRef sc, const RefChart& R, int i, int n)
+		{
+			const int rn = R.data[SC_LAST].GetArraySize();
+			if (rn <= 0) return -1;
+			int j = sc.GetContainingIndexForSCDateTime(R.chartNumber, sc.BaseDateTimeIn[i]);
+			if (j < 0) return -1; if (j >= rn) j = rn - 1;
+			if (i + 1 < n && j + 1 < rn && R.times[j + 1] > sc.BaseDateTimeIn[i + 1] && j > 0) --j;   // reference bar still forming when i closed
+			return j;
+		}
+
+		inline float RefHighBetween(const RefChart& R, int j0, int j1, bool high)
+		{
+			float v = high ? -FLT_MAX : FLT_MAX;
+			const int rn = R.data[SC_LAST].GetArraySize();
+			for (int j = Max(0, j0); j <= Min(rn - 1, j1); ++j) v = high ? Max(v, R.data[SC_HIGH][j]) : Min(v, R.data[SC_LOW][j]);
+			return v;
+		}
+	}
+
 	void EnsureInter(SCStudyInterfaceRef sc, ChartState& S)
 	{
-		EnsureRegime(sc, S); const int n = sc.ArraySize; InterState& I = S.inter;
+		using namespace inter_detail;
+		EnsureRegime(sc, S);
+		const int n = sc.ArraySize; if (n <= 0) return;
+		InterState& I = S.inter; const InterParams& P = S.params.inter; const BaseState& B = S.base; const AuctionState& A = S.auction;
 		Fit(I.rsYM, n); Fit(I.rsES, n); Fit(I.rsRTY, n); Fit(I.rsIndex, n); Fit(I.smt, n); Fit(I.tickCum, n); Fit(I.tickExt, n);
 		Fit(I.tickDiv, n); Fit(I.megaCap, n); Fit(I.composite, n); Fit(I.smtMark, n);
-		I.computedThrough = n - 2; I.lastArraySize = n;
+		for (int k = 0; k < 3; ++k) { Fit(I.rsPre1[k], n); Fit(I.rsPre2[k], n); Fit(I.rsRaw[k], n); }
+		Fit(I.tickVal, n); Fit(I.tickEmaArr, n);
+		if (I.UpToDate(sc)) return;
+		int from = I.computedThrough + 1; if (from < 0) from = 0; if (from > n - 1) from = n - 1;
+
+		// ---- reference charts ----
+		RefChart* idx[3] = { &I.ym, &I.es, &I.rty };
+		const int idxCharts[3] = { P.chartYM, P.chartES, P.chartRTY };
+		I.available = 0;
+		char missing[160] = "";
+		for (int k = 0; k < 3; ++k)
+		{
+			if (RefreshRef(sc, S, *idx[k], idxCharts[k], P.megaEma)) I.available |= (1 << k);
+			else if (idxCharts[k] > 0) { strcat_s(missing, sizeof(missing), k == 0 ? "YM " : (k == 1 ? "ES " : "RTY ")); }
+		}
+		if (RefreshRef(sc, S, I.tick, P.chartTICK, P.tickEma)) I.available |= 8; else if (P.chartTICK > 0) strcat_s(missing, sizeof(missing), "TICK ");
+		int megaN = 0;
+		for (int k = 0; k < 6; ++k)
+		{
+			if (RefreshRef(sc, S, I.mega[k], P.chartMega[k], P.megaEma)) { I.available |= (16 << k); ++megaN; }
+			else if (P.chartMega[k] > 0) { char b[32]; sprintf_s(b, sizeof(b), "MegaCap%d ", k + 1); strcat_s(missing, sizeof(missing), b); }
+		}
+		strncpy_s(S.warn.interMissing, sizeof(S.warn.interMissing), missing, _TRUNCATE);
+		const int L = Max(2, P.rsLookback), Z = Max(10, P.rsZLength);
+
+		for (int i = from; i < n; ++i)
+		{
+			const bool closed = (i <= n - 2);
+			const float c = sc.Close[i];
+			const float atr = AtrAt(S, i);
+
+			// ---- relative strength vs each index ----
+			float rsSum = 0; int rsCnt = 0;
+			float rsOut[3] = { kNaN, kNaN, kNaN };
+			for (int k = 0; k < 3; ++k)
+			{
+				RefChart& R = *idx[k];
+				if (!R.ok) { I.rsRaw[k][i] = 0; if (closed) { I.rsPre1[k][i] = i > 0 ? I.rsPre1[k][i - 1] : 0; I.rsPre2[k][i] = i > 0 ? I.rsPre2[k][i - 1] : 0; } continue; }
+				const int j = Align(sc, R, i, n);
+				const int jPrev = (i - L >= 0) ? Align(sc, R, i - L, n) : -1;
+				double rs = 0;
+				if (j >= 0 && jPrev >= 0 && i - L >= 0 && sc.Close[i - L] > 0 && R.data[SC_LAST][jPrev] > 0)
+					rs = (c / sc.Close[i - L] - 1.0) - (R.data[SC_LAST][j] / R.data[SC_LAST][jPrev] - 1.0);
+				I.rsRaw[k][i] = static_cast<float>(rs);
+				// z-score vs the last Z closed values
+				double mean = 0, sd = 0; bool ok = false;
+				if (i - 1 >= 0)
+				{
+					const int upto = i - 1, lo = upto - Z;
+					const double s1 = I.rsPre1[k][upto] - (lo >= 0 ? I.rsPre1[k][lo] : 0.0), s2 = I.rsPre2[k][upto] - (lo >= 0 ? I.rsPre2[k][lo] : 0.0);
+					const int cnt = upto - Max(lo, -1);
+					if (cnt >= 10) { mean = s1 / cnt; const double var = s2 / cnt - mean * mean; sd = var > 0 ? sqrt(var) : 0; ok = sd > 0; }
+				}
+				const float z = ok ? Clamp1((rs - mean) / sd / 2.0) : 0.0f;
+				rsOut[k] = z; rsSum += z; ++rsCnt;
+				if (closed) { I.rsPre1[k][i] = (i > 0 ? I.rsPre1[k][i - 1] : 0.0) + rs; I.rsPre2[k][i] = (i > 0 ? I.rsPre2[k][i - 1] : 0.0) + rs * rs; }
+			}
+			I.rsYM[i] = IsNan(rsOut[0]) ? 0.0f : rsOut[0]; I.rsES[i] = IsNan(rsOut[1]) ? 0.0f : rsOut[1]; I.rsRTY[i] = IsNan(rsOut[2]) ? 0.0f : rsOut[2];
+			I.rsIndex[i] = rsCnt > 0 ? rsSum / rsCnt : kNaN;
+
+			// ---- SMT divergence at a freshly confirmed primary swing ----
+			float smtNow = 0;
+			if (closed && !A.swings.empty() && A.swings.back().confirmIdx == i && rsCnt > 0)
+			{
+				const Swing& ns = A.swings.back();
+				const int prevIdx = ns.high ? A.prevSwingHigh : A.prevSwingLow;
+				if (prevIdx >= 0 && prevIdx < static_cast<int>(A.swings.size()) - 1)
+				{
+					const Swing& ps = A.swings[prevIdx];
+					const int N = Max(1, S.params.auction.swingStrength);
+					int diverging = 0, checked = 0;
+					for (int k = 0; k < 3; ++k)
+					{
+						RefChart& R = *idx[k]; if (!R.ok) continue;
+						const int jn0 = Align(sc, R, Max(0, ns.idx - N), n), jn1 = Align(sc, R, Min(n - 1, ns.idx + N), n);
+						const int jp0 = Align(sc, R, Max(0, ps.idx - N), n), jp1 = Align(sc, R, Min(n - 1, ps.idx + N), n);
+						if (jn0 < 0 || jn1 < 0 || jp0 < 0 || jp1 < 0) continue;
+						++checked;
+						if (ns.high && ns.price > ps.price && RefHighBetween(R, jn0, jn1, true) <= RefHighBetween(R, jp0, jp1, true)) ++diverging;
+						if (!ns.high && ns.price < ps.price && RefHighBetween(R, jn0, jn1, false) >= RefHighBetween(R, jp0, jp1, false)) ++diverging;
+					}
+					if (checked > 0 && diverging > 0)
+					{
+						smtNow = (ns.high ? -1.0f : 1.0f) * static_cast<float>(diverging) / checked;
+						I.smtMark[i] = ns.high ? -1 : 1; I.lastSmtIdx = i; I.lastSmtVal = smtNow; I.lastSmtPrice = ns.price;
+					}
+				}
+			}
+			I.smt[i] = (rsCnt > 0 && I.lastSmtIdx >= 0 && i >= I.lastSmtIdx) ? I.lastSmtVal * static_cast<float>(exp(-(i - I.lastSmtIdx) / 16.0)) : (rsCnt > 0 ? 0.0f : kNaN);
+
+			// ---- NYSE TICK ----
+			if (I.tick.ok)
+			{
+				const int j = Align(sc, I.tick, i, n);
+				const float tv = j >= 0 ? I.tick.data[SC_LAST][j] : 0.0f;
+				I.tickVal[i] = tv;
+				const int key = B.isRth[i] ? B.rthSession[i] : -1;
+				if (key != I.tickSession) { I.tickCumCommitted = 0; I.tickCount = 0; I.tickSession = key; }
+				const double cum = I.tickCumCommitted + tv; const int cnt = I.tickCount + 1;
+				if (closed) { I.tickCumCommitted = cum; I.tickCount = cnt; }
+				I.tickCum[i] = (key >= 0 && cnt > 0) ? Clamp1((cum / cnt) / 400.0) : 0.0f;
+				// extremes in the lookback
+				int pos = 0, neg = 0; const int LB = Max(1, P.tickLookback);
+				for (int q = i; q > i - LB && q >= 0; --q)
+				{
+					const float x = I.tickVal[q];
+					if (x >= P.tickStrong) pos += 2; else if (x >= P.tickExtreme) pos += 1;
+					if (x <= -P.tickStrong) neg += 2; else if (x <= -P.tickExtreme) neg += 1;
+				}
+				I.tickExt[i] = Clamp1(static_cast<double>(pos - neg) / LB);
+				// trend divergence: TICK EMA slope vs price slope
+				const float a = 2.0f / (Max(2, P.tickEma) + 1.0f);
+				const float ema = (i == 0) ? tv : I.tickEmaArr[i - 1] + a * (tv - I.tickEmaArr[i - 1]);
+				I.tickEmaArr[i] = ema;
+				const int k = Max(2, P.tickEma);
+				if (i - k >= 0 && atr > 0)
+				{
+					const float ps = Sign(c - sc.Close[i - k]), ts = (fabs(ema - I.tickEmaArr[i - k]) >= 50.0f) ? Sign(ema - I.tickEmaArr[i - k]) : 0.0f;
+					I.tickDiv[i] = (ps != 0 && ts != 0 && ps != ts) ? ts : 0.0f;
+				}
+				else I.tickDiv[i] = 0;
+			}
+			else { I.tickVal[i] = 0; I.tickEmaArr[i] = 0; I.tickCum[i] = kNaN; I.tickExt[i] = kNaN; I.tickDiv[i] = kNaN; }
+
+			// ---- mega-cap leadership ----
+			if (megaN > 0)
+			{
+				float sum = 0; int cnt = 0;
+				for (int k = 0; k < 6; ++k)
+				{
+					RefChart& R = I.mega[k]; if (!R.ok) { I.megaState[k] = 0; continue; }
+					const int j = Align(sc, R, i, n); if (j < 0) { I.megaState[k] = 0; continue; }
+					const float rc = R.data[SC_LAST][j];
+					float s = 0;
+					if (R.vwap[j] > 0) s += rc > R.vwap[j] ? 0.5f : (rc < R.vwap[j] ? -0.5f : 0.0f);
+					s += rc > R.ema[j] ? 0.5f : (rc < R.ema[j] ? -0.5f : 0.0f);
+					I.megaState[k] = static_cast<signed char>(s >= 0.5f ? 1 : (s <= -0.5f ? -1 : 0));
+					sum += s; ++cnt;
+				}
+				I.megaCap[i] = cnt > 0 ? Clamp1(sum / cnt) : kNaN;
+			}
+			else I.megaCap[i] = kNaN;
+
+			// composite for the subgraph (mean of what is available)
+			{
+				float s = 0; int cnt = 0;
+				const float parts[4] = { I.rsIndex[i], I.tickCum[i], I.tickExt[i], I.megaCap[i] };
+				for (int k = 0; k < 4; ++k) if (!IsNan(parts[k])) { s += parts[k]; ++cnt; }
+				I.composite[i] = cnt > 0 ? s / cnt : 0.0f;
+			}
+		}
+		I.Stamp(sc);
 	}
+
 	void EnsureDcs(SCStudyInterfaceRef sc, ChartState& S)
 	{
 		EnsureInter(sc, S); const int n = sc.ArraySize; DcsState& D = S.dcs;
@@ -2727,14 +2953,15 @@ SCSFExport scsf_NQEdge_Intermarket(SCStudyInterfaceRef sc)
 	EnsureInter(sc, S);
 	sc.Subgraph[IS_RS_INDEX].PrimaryColor = sc.Input[II_C_RS].GetColor(); sc.Subgraph[IS_MEGA].PrimaryColor = sc.Input[II_C_BREADTH].GetColor();
 	int& gen = sc.GetPersistentInt(1);
-	int start = sc.UpdateStartIndex;
+	int start = Min(sc.UpdateStartIndex, S.inter.dirtyFrom); S.inter.dirtyFrom = INT_MAX;
 	if (gen != S.inter.generation) { start = 0; gen = S.inter.generation; }
+	if (start < 0) start = 0;
 	const InterState& I = S.inter;
 	for (int i = start; i < sc.ArraySize; ++i)
 	{
-		sc.Subgraph[IS_RS_YM][i] = I.rsYM[i]; sc.Subgraph[IS_RS_ES][i] = I.rsES[i]; sc.Subgraph[IS_RS_RTY][i] = I.rsRTY[i]; sc.Subgraph[IS_RS_INDEX][i] = I.rsIndex[i];
-		sc.Subgraph[IS_SMT][i] = I.smt[i]; sc.Subgraph[IS_TICK_CUM][i] = I.tickCum[i]; sc.Subgraph[IS_TICK_EXT][i] = I.tickExt[i]; sc.Subgraph[IS_TICK_DIV][i] = I.tickDiv[i];
-		sc.Subgraph[IS_MEGA][i] = I.megaCap[i]; sc.Subgraph[IS_COMPOSITE][i] = I.composite[i];
+		sc.Subgraph[IS_RS_YM][i] = I.rsYM[i]; sc.Subgraph[IS_RS_ES][i] = I.rsES[i]; sc.Subgraph[IS_RS_RTY][i] = I.rsRTY[i]; sc.Subgraph[IS_RS_INDEX][i] = IsNan(I.rsIndex[i]) ? 0.0f : I.rsIndex[i];
+		sc.Subgraph[IS_SMT][i] = IsNan(I.smt[i]) ? 0.0f : I.smt[i]; sc.Subgraph[IS_TICK_CUM][i] = IsNan(I.tickCum[i]) ? 0.0f : I.tickCum[i]; sc.Subgraph[IS_TICK_EXT][i] = IsNan(I.tickExt[i]) ? 0.0f : I.tickExt[i]; sc.Subgraph[IS_TICK_DIV][i] = IsNan(I.tickDiv[i]) ? 0.0f : I.tickDiv[i];
+		sc.Subgraph[IS_MEGA][i] = IsNan(I.megaCap[i]) ? 0.0f : I.megaCap[i]; sc.Subgraph[IS_COMPOSITE][i] = I.composite[i];
 	}
 }
 

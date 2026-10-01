@@ -22,3 +22,7 @@
 ## Phase 4 — Regime + MTF Bias
 - Kaufman efficiency ratio (prefix sums), ATR fast/slow expansion ratio, inside-value fraction, IB width vs N-day average, VWAP slope / structure / value migration fused into trendiness + direction scores; Trend Up / Trend Down / Balance / Volatile Chop with K-bar hysteresis; `regimeTrend` feature; background shading by regime.
 - MTF: 1/5/15/60-minute bars aggregated internally from the primary chart (committed when a new bucket starts), EMA and fractal pivots per timeframe; cell = structure + VWAP side + EMA slope; weighted `mtfBias`. Cells whose timeframe is finer than the chart's bar period are marked unavailable.
+
+## Phase 5 — Intermarket Engine
+- Reference charts by number (YM/ES/RTY/TICK/6 mega caps), refreshed each call, time-aligned with `GetContainingIndexForSCDateTime` and shifted back when the reference bar was still forming at the primary bar's close.
+- Relative strength z-scores vs each index (`rsIndex`), SMT divergence at freshly confirmed swings (any index failing to confirm), NYSE TICK session average, extremes count and TICK-vs-price trend divergence, mega-cap leadership (own RTH VWAP + EMA) breadth. Missing charts are reported in the HUD warnings and their features are NaN (dropped by the composite).
