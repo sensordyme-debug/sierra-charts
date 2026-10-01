@@ -18,3 +18,7 @@
 - Per-bar delta / delta %, session CVD (RTH / trading day / never), rolling z-scores for volume and CVD slope via prefix sums over closed bars.
 - Absorption zones (volume z, range/ATR, close back inside, new extreme), VAP exhaustion after a run, stacked diagonal imbalances (Numbers-Bars definition, ask@P vs bid@P-1), trapped traders (strong-delta breakout reversed within K bars), CVD divergence at freshly confirmed swings.
 - Large trades: live from Time & Sales (rolling percentile, merged per price/bar) and historical from VAP average trade size per level; bubbles sized by volume. Zones die when traded through; drawings bounded by inputs.
+
+## Phase 4 — Regime + MTF Bias
+- Kaufman efficiency ratio (prefix sums), ATR fast/slow expansion ratio, inside-value fraction, IB width vs N-day average, VWAP slope / structure / value migration fused into trendiness + direction scores; Trend Up / Trend Down / Balance / Volatile Chop with K-bar hysteresis; `regimeTrend` feature; background shading by regime.
+- MTF: 1/5/15/60-minute bars aggregated internally from the primary chart (committed when a new bucket starts), EMA and fractal pivots per timeframe; cell = structure + VWAP side + EMA slope; weighted `mtfBias`. Cells whose timeframe is finer than the chart's bar period are marked unavailable.

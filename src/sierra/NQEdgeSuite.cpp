@@ -372,10 +372,19 @@ namespace nqe
 
 	struct RegimeState : EngineCommon
 	{
-		std::vector<float> er, atrRatio, regimeTrend, mtfBias;
+		std::vector<float> er, atrRatio, regimeTrend, mtfBias, trendiness, dirScore;
 		std::vector<signed char> regime, mtf1, mtf5, mtf15, mtf60;
 		int candidate = RG_NONE; int candidateCount = 0; int current = RG_NONE;
 		std::vector<float> atrFast, atrSlow;
+		std::vector<double> absDcPre, insidePre;      // prefix sums over closed bars
+		struct TfBar { int startIdx = -1; int count = 0; float o = 0, h = 0, l = 0, c = 0; };
+		struct Tf
+		{
+			std::vector<TfBar> bars; TfBar cur; int curKey = INT_MIN; int committedKey = INT_MIN;
+			float ema = 0; int emaCount = 0; std::vector<float> emaHist;
+			float lastHigh = 0, prevHigh = 0, lastLow = 0, prevLow = 0; bool available = true;
+		};
+		Tf tf[4];
 	};
 
 	struct RefChart
@@ -631,7 +640,7 @@ namespace nqe
 			S.flow.lastAbsDir = S.flow.lastExhDir = S.flow.lastImbDir = S.flow.lastTrapDir = S.flow.lastDivDir = 0; S.flow.lastDivPrice = 0;
 			S.flow.lastEventIdx = -1; S.flow.lastEventText[0] = 0;
 		}
-		if (engine <= E_REGIME) { S.regime.candidate = RG_NONE; S.regime.candidateCount = 0; S.regime.current = RG_NONE; }
+		if (engine <= E_REGIME) { S.regime.candidate = RG_NONE; S.regime.candidateCount = 0; S.regime.current = RG_NONE; for (int t = 0; t < 4; ++t) S.regime.tf[t] = RegimeState::Tf(); }
 		if (engine <= E_INTER)
 		{
 			S.inter.tickCumCommitted = 0; S.inter.tickSession = -1; S.inter.lastSwingProcessed = -1;
@@ -835,7 +844,6 @@ namespace nqe
 	void EnsureAuction(SCStudyInterfaceRef sc, ChartState& S);
 	void EnsureVwap(SCStudyInterfaceRef sc, ChartState& S);
 	void EnsureFlow(SCStudyInterfaceRef sc, ChartState& S);
-	// ==== 9  Regime + MTF (phase 4) =============================================
 	void EnsureRegime(SCStudyInterfaceRef sc, ChartState& S);
 	// ==== 10 Intermarket (phase 5) ==============================================
 	void EnsureInter(SCStudyInterfaceRef sc, ChartState& S);
@@ -1737,13 +1745,174 @@ namespace nqe
 		F.Stamp(sc);
 	}
 
+	// ==== 9  Regime + MTF engine ================================================
+	namespace regime_detail
+	{
+		static const int kTfMinutes[4] = { 1, 5, 15, 60 };
+		static const float kTfWeight[4] = { 0.10f, 0.20f, 0.30f, 0.40f };
+
+		// Bucket key for a bar time at timeframe T minutes (date * 1440 + minute-of-day / T).
+		inline int BucketKey(const SCDateTime& dt, int tfMin) { return dt.GetDate() * 1440 + (dt.GetTimeInSeconds() / 60) / tfMin; }
+
+		// Commit a completed timeframe bar: EMA, fractal pivots, structure state.
+		void CommitTfBar(RegimeState::Tf& tf, const RegimeParams& P)
+		{
+			RegimeState::TfBar& b = tf.cur;
+			if (b.count == 0) return;
+			tf.bars.push_back(b);
+			if (tf.bars.size() > 2000) tf.bars.erase(tf.bars.begin(), tf.bars.begin() + 500);
+			const float a = 2.0f / (Max(2, P.mtfEmaLength) + 1.0f);
+			tf.ema = (tf.emaCount == 0) ? b.c : tf.ema + a * (b.c - tf.ema);
+			tf.emaHist.push_back(tf.ema);
+			if (tf.emaHist.size() > 2000) tf.emaHist.erase(tf.emaHist.begin(), tf.emaHist.begin() + 500);
+			++tf.emaCount;
+			// fractal pivot confirmed at bars.size()-1-s
+			const int s = Max(1, P.mtfSwing);
+			const int m = static_cast<int>(tf.bars.size());
+			const int p = m - 1 - s;
+			if (p - s >= 0)
+			{
+				bool ph = true, pl = true;
+				for (int k = 1; k <= s; ++k)
+				{
+					if (tf.bars[p].h <= tf.bars[p - k].h || tf.bars[p].h <= tf.bars[p + k].h) ph = false;
+					if (tf.bars[p].l >= tf.bars[p - k].l || tf.bars[p].l >= tf.bars[p + k].l) pl = false;
+				}
+				if (ph) { tf.prevHigh = tf.lastHigh; tf.lastHigh = tf.bars[p].h; }
+				if (pl) { tf.prevLow = tf.lastLow; tf.lastLow = tf.bars[p].l; }
+			}
+			b = RegimeState::TfBar();
+		}
+	}
+
 	void EnsureRegime(SCStudyInterfaceRef sc, ChartState& S)
 	{
-		EnsureFlow(sc, S); const int n = sc.ArraySize; RegimeState& R = S.regime;
+		using namespace regime_detail;
+		EnsureFlow(sc, S);
+		const int n = sc.ArraySize; if (n <= 0) return;
+		RegimeState& R = S.regime; const RegimeParams& P = S.params.regime; const BaseState& B = S.base; const AuctionState& A = S.auction; const VwapState& V = S.vwap;
 		Fit(R.er, n); Fit(R.atrRatio, n); Fit(R.regimeTrend, n); Fit(R.mtfBias, n); Fit(R.regime, n);
 		Fit(R.mtf1, n); Fit(R.mtf5, n); Fit(R.mtf15, n); Fit(R.mtf60, n); Fit(R.atrFast, n); Fit(R.atrSlow, n);
-		R.computedThrough = n - 2; R.lastArraySize = n;
+		Fit(R.absDcPre, n); Fit(R.insidePre, n); Fit(R.trendiness, n); Fit(R.dirScore, n);
+		if (R.UpToDate(sc)) return;
+		int from = R.computedThrough + 1; if (from < 0) from = 0; if (from > n - 1) from = n - 1;
+		const int L = Max(2, P.erLength);
+		const int fastL = Max(2, P.atrFast), slowL = Max(fastL + 1, P.atrSlow);
+		const int insideN = Max(5, P.insideValueBars);
+		const int secPerBar = sc.SecondsPerBar;
+
+		for (int i = from; i < n; ++i)
+		{
+			const bool closed = (i <= n - 2);
+			const float c = sc.Close[i];
+			const float atr = AtrAt(S, i);
+
+			// ---- efficiency ratio ----
+			const double adc = (i > 0) ? fabs(static_cast<double>(c) - sc.Close[i - 1]) : 0.0;
+			const double preBase = (i > 0) ? R.absDcPre[i - 1] : 0.0;
+			const double preLo = (i - L - 1 >= 0) ? R.absDcPre[i - L - 1] : 0.0;
+			double path = (preBase - preLo) + adc;         // sum of |dc| over bars i-L+1..i
+			if (i - L >= 0 && path > 0) R.er[i] = static_cast<float>(Clamp(fabs(static_cast<double>(c) - sc.Close[i - L]) / path, 0.0, 1.0)); else R.er[i] = 0;
+			if (closed) R.absDcPre[i] = preBase + adc;
+
+			// ---- ATR expansion ----
+			const float tr = S.base.tr[i];
+			if (i == 0) { R.atrFast[i] = tr; R.atrSlow[i] = tr; }
+			else
+			{
+				R.atrFast[i] = (i < fastL) ? (R.atrFast[i - 1] * i + tr) / (i + 1) : (R.atrFast[i - 1] * (fastL - 1) + tr) / fastL;
+				R.atrSlow[i] = (i < slowL) ? (R.atrSlow[i - 1] * i + tr) / (i + 1) : (R.atrSlow[i - 1] * (slowL - 1) + tr) / slowL;
+			}
+			R.atrRatio[i] = R.atrSlow[i] > 0 ? R.atrFast[i] / R.atrSlow[i] : 1.0f;
+
+			// ---- inside-value fraction ----
+			const double inside = (A.vah[i] > A.val[i] && c <= A.vah[i] && c >= A.val[i]) ? 1.0 : 0.0;
+			const double inBase = (i > 0) ? R.insidePre[i - 1] : 0.0;
+			const double inLo = (i - insideN - 1 >= 0) ? R.insidePre[i - insideN - 1] : 0.0;
+			const int cnt = Min(insideN, i + 1);
+			const float insideFrac = cnt > 0 ? static_cast<float>(((inBase - inLo) + inside) / cnt) : 0.0f;
+			if (closed) R.insidePre[i] = inBase + inside;
+
+			// ---- IB relative width (daily context) ----
+			float ibRel = 1.0f;
+			if (A.ibDone[i] && A.ibHigh[i] > A.ibLow[i] && !A.ibRangeHistory.empty())
+			{
+				double sum = 0; int m = 0;
+				for (int k = static_cast<int>(A.ibRangeHistory.size()) - 1; k >= 0 && m < P.ibAvgDays; --k, ++m) sum += A.ibRangeHistory[k];
+				if (m > 0 && sum > 0) ibRel = static_cast<float>((A.ibHigh[i] - A.ibLow[i]) / (sum / m));
+			}
+
+			// ---- scores ----
+			const float vs = V.slope[i], st = A.structTrend[i], vm = A.valueMig[i];
+			const float side = (V.vwap[i] > 0) ? Sign(c - V.vwap[i]) : 0.0f;
+			const float erN = Clamp(R.er[i] / Max(0.05f, P.erTrend), 0.0f, 1.0f);
+			float trendiness = 0.35f * erN + 0.25f * static_cast<float>(fabs(vs)) + 0.20f * static_cast<float>(fabs(st)) + 0.20f * (1.0f - insideFrac);
+			if (ibRel > 1.2f) trendiness += 0.05f; else if (ibRel < 0.8f) trendiness -= 0.05f;
+			trendiness = Clamp(trendiness, 0.0f, 1.0f);
+			const float dir = Clamp1(0.4 * vs + 0.3 * st + 0.2 * side + 0.1 * vm);
+			R.trendiness[i] = trendiness; R.dirScore[i] = dir;
+			const bool chop = R.atrRatio[i] >= P.chopExpansion && R.er[i] < P.erBalance;
+			int cand = R.current;
+			if (chop) cand = RG_CHOP;
+			else if (R.er[i] >= P.erTrend && fabs(dir) >= 0.3f && trendiness >= 0.45f) cand = dir > 0 ? RG_TREND_UP : RG_TREND_DOWN;
+			else if (R.er[i] <= P.erBalance || insideFrac >= 0.6f || trendiness < 0.3f) cand = RG_BALANCE;
+			else if (R.current == RG_NONE) cand = RG_BALANCE;
+			if (closed)
+			{
+				if (cand == R.current) { R.candidate = cand; R.candidateCount = 0; }
+				else if (cand == R.candidate) { if (++R.candidateCount >= Max(1, P.hysteresisBars) || R.current == RG_NONE) { R.current = cand; R.candidateCount = 0; } }
+				else { R.candidate = cand; R.candidateCount = 1; if (R.current == RG_NONE) R.current = cand; }
+			}
+			const int reg = (R.current == RG_NONE) ? cand : R.current;
+			R.regime[i] = static_cast<signed char>(reg);
+			float rt = 0;
+			if (reg == RG_TREND_UP || reg == RG_TREND_DOWN) rt = Clamp1(dir * (0.5 + 0.5 * trendiness));
+			else if (reg == RG_BALANCE) rt = 0.3f * dir;
+			else rt = 0.0f;
+			R.regimeTrend[i] = rt;
+
+			// ---- MTF cells (completed timeframe bars + current close vs VWAP) ----
+			float bias = 0, wsum = 0;
+			signed char cells[4] = { 0, 0, 0, 0 };
+			for (int t = 0; t < 4; ++t)
+			{
+				RegimeState::Tf& tf = R.tf[t];
+				const int tfMin = kTfMinutes[t];
+				tf.available = (secPerBar <= 0) || (secPerBar <= tfMin * 60);
+				if (!tf.available) { cells[t] = 0; continue; }
+				const int key = BucketKey(sc.BaseDateTimeIn[i], tfMin);
+				if (key != tf.curKey)
+				{
+					// the previous timeframe bar is complete once a bar of a new bucket exists (closed or forming)
+					if (tf.curKey != INT_MIN && tf.cur.count > 0 && tf.committedKey != tf.curKey) { tf.committedKey = tf.curKey; CommitTfBar(tf, P); }
+					if (closed) { tf.curKey = key; tf.cur = RegimeState::TfBar(); }
+				}
+				if (closed && key == tf.curKey)
+				{
+					RegimeState::TfBar& b = tf.cur;
+					if (b.count == 0) { b.o = sc.Open[i]; b.h = sc.High[i]; b.l = sc.Low[i]; } else { b.h = Max(b.h, sc.High[i]); b.l = Min(b.l, sc.Low[i]); }
+					b.c = c; b.startIdx = b.count == 0 ? i : b.startIdx; ++b.count;
+				}
+				// structure from confirmed TF pivots
+				float sTf = 0;
+				if (tf.lastHigh > 0 && tf.prevHigh > 0 && tf.lastLow > 0 && tf.prevLow > 0)
+				{
+					const bool hh = tf.lastHigh > tf.prevHigh, hl = tf.lastLow > tf.prevLow;
+					sTf = (hh && hl) ? 1.0f : ((!hh && !hl) ? -1.0f : 0.0f);
+				}
+				float eSl = 0;
+				const int eh = static_cast<int>(tf.emaHist.size());
+				if (eh >= 4 && atr > 0) eSl = Clamp1((tf.emaHist[eh - 1] - tf.emaHist[eh - 4]) / (atr * sqrt(static_cast<double>(tfMin))));
+				const float sum = 0.4f * sTf + 0.3f * side + 0.3f * eSl;
+				cells[t] = static_cast<signed char>(sum >= 0.3f ? 1 : (sum <= -0.3f ? -1 : 0));
+				bias += kTfWeight[t] * sum; wsum += kTfWeight[t];
+			}
+			R.mtf1[i] = cells[0]; R.mtf5[i] = cells[1]; R.mtf15[i] = cells[2]; R.mtf60[i] = cells[3];
+			R.mtfBias[i] = wsum > 0 ? Clamp1(bias / wsum) : 0.0f;
+		}
+		R.Stamp(sc);
 	}
+
 	void EnsureInter(SCStudyInterfaceRef sc, ChartState& S)
 	{
 		EnsureRegime(sc, S); const int n = sc.ArraySize; InterState& I = S.inter;
@@ -2498,8 +2667,9 @@ SCSFExport scsf_NQEdge_Regime(SCStudyInterfaceRef sc)
 	sc.Subgraph[RS_BG].DrawStyle = shade ? DRAWSTYLE_BACKGROUND : DRAWSTYLE_IGNORE;
 	const uint32_t cols[5] = { 0, sc.Input[RI_C_UP].GetColor(), sc.Input[RI_C_DN].GetColor(), sc.Input[RI_C_BAL].GetColor(), sc.Input[RI_C_CHOP].GetColor() };
 	int& gen = sc.GetPersistentInt(1);
-	int start = sc.UpdateStartIndex;
+	int start = Min(sc.UpdateStartIndex, S.regime.dirtyFrom); S.regime.dirtyFrom = INT_MAX;
 	if (gen != S.regime.generation) { start = 0; gen = S.regime.generation; }
+	if (start < 0) start = 0;
 	const RegimeState& R = S.regime;
 	for (int i = start; i < sc.ArraySize; ++i)
 	{
