@@ -43,6 +43,7 @@
 #include <map>
 #include <set>
 #include <climits>
+#include <algorithm>
 #include <mutex>
 #include <string>
 #include <cmath>
@@ -346,16 +347,26 @@ namespace nqe
 		std::vector<float> delta, deltaPct, cvd, cvdZ, volZ;
 		std::vector<float> fAbsorb, fExhaust, fImb, fTrapped, fCvdDiv, fLarge;   // features
 		std::vector<signed char> absorbMark, exhaustMark, imbMark, trapMark, divMark;
+		std::vector<double> volPre1, volPre2, dzPre1, dzPre2;                   // prefix sums over closed bars
+		std::vector<float> cvdDz;
 		double cvdCommitted = 0; int cvdSession = -1; int cvdDay = 0;
 		std::vector<Zone> absorbZones, imbZones;
 		std::vector<Bubble> bubbles;
 		std::vector<double> tradeSizes;             // rolling sample for live percentile
 		unsigned int lastTsSequence = 0;
+		int liveSampleCount = 0; double liveThreshold = 0;
 		std::vector<double> levelAvgSizes;          // rolling sample of VAP avg-trade-size per level
+		int ltSampleCount = 0; double ltThreshold = 0;
 		int lastProcessedSwing = -1;
 		// trapped: pending breakout candidates
 		struct Breakout { int idx; int dir; float extreme; };
 		std::vector<Breakout> pendingBreakouts;
+		// last events (for decayed features)
+		int lastAbsIdx = -1000, lastAbsDir = 0, lastExhIdx = -1000, lastExhDir = 0, lastImbIdx = -1000, lastImbDir = 0;
+		int lastTrapIdx = -1000, lastTrapDir = 0, lastDivIdx = -1000, lastDivDir = 0; float lastDivPrice = 0;
+		struct Marker { int idx; int dir; int kind; float price; int lineNumber; };
+		std::vector<Marker> markers;
+		std::vector<int> deadLines;
 		float lastEventPrice = 0; int lastEventIdx = -1; char lastEventText[64] = "";
 	};
 
@@ -609,8 +620,15 @@ namespace nqe
 		if (engine <= E_FLOW)
 		{
 			S.flow.cvdCommitted = 0; S.flow.cvdSession = -1; S.flow.cvdDay = 0;
-			S.flow.absorbZones.clear(); S.flow.imbZones.clear(); S.flow.bubbles.clear(); S.flow.tradeSizes.clear();
-			S.flow.levelAvgSizes.clear(); S.flow.lastProcessedSwing = -1; S.flow.pendingBreakouts.clear();
+			for (size_t k = 0; k < S.flow.absorbZones.size(); ++k) if (S.flow.absorbZones[k].lineNumber) S.flow.deadLines.push_back(S.flow.absorbZones[k].lineNumber);
+			for (size_t k = 0; k < S.flow.imbZones.size(); ++k) if (S.flow.imbZones[k].lineNumber) S.flow.deadLines.push_back(S.flow.imbZones[k].lineNumber);
+			for (size_t k = 0; k < S.flow.bubbles.size(); ++k) if (S.flow.bubbles[k].lineNumber) S.flow.deadLines.push_back(S.flow.bubbles[k].lineNumber);
+			for (size_t k = 0; k < S.flow.markers.size(); ++k) if (S.flow.markers[k].lineNumber) S.flow.deadLines.push_back(S.flow.markers[k].lineNumber);
+			S.flow.absorbZones.clear(); S.flow.imbZones.clear(); S.flow.bubbles.clear(); S.flow.markers.clear();
+			S.flow.tradeSizes.clear(); S.flow.lastTsSequence = 0; S.flow.liveSampleCount = 0; S.flow.liveThreshold = 0;
+			S.flow.levelAvgSizes.clear(); S.flow.ltSampleCount = 0; S.flow.ltThreshold = 0; S.flow.lastProcessedSwing = -1; S.flow.pendingBreakouts.clear();
+			S.flow.lastAbsIdx = S.flow.lastExhIdx = S.flow.lastImbIdx = S.flow.lastTrapIdx = S.flow.lastDivIdx = -1000;
+			S.flow.lastAbsDir = S.flow.lastExhDir = S.flow.lastImbDir = S.flow.lastTrapDir = S.flow.lastDivDir = 0; S.flow.lastDivPrice = 0;
 			S.flow.lastEventIdx = -1; S.flow.lastEventText[0] = 0;
 		}
 		if (engine <= E_REGIME) { S.regime.candidate = RG_NONE; S.regime.candidateCount = 0; S.regime.current = RG_NONE; }
@@ -816,7 +834,6 @@ namespace nqe
 
 	void EnsureAuction(SCStudyInterfaceRef sc, ChartState& S);
 	void EnsureVwap(SCStudyInterfaceRef sc, ChartState& S);
-	// ==== 8  Order Flow engine (phase 3) ========================================
 	void EnsureFlow(SCStudyInterfaceRef sc, ChartState& S);
 	// ==== 9  Regime + MTF (phase 4) =============================================
 	void EnsureRegime(SCStudyInterfaceRef sc, ChartState& S);
@@ -1414,14 +1431,312 @@ namespace nqe
 	}
 
 	// Phase stubs for engines not yet implemented: size arrays and mark computed so downstream code is safe.
+	// ==== 8  Order Flow engine ==================================================
+	namespace flow_detail
+	{
+		// Mean / std of the last L committed values using prefix sums (pre1/pre2 valid through index 'upto').
+		inline bool WindowStats(const std::vector<double>& pre1, const std::vector<double>& pre2, int upto, int L, double& mean, double& sd)
+		{
+			if (upto < 0 || L < 2) return false;
+			const int lo = upto - L;            // window = (lo, upto]
+			const double s1 = pre1[upto] - (lo >= 0 ? pre1[lo] : 0.0);
+			const double s2 = pre2[upto] - (lo >= 0 ? pre2[lo] : 0.0);
+			const int cnt = upto - Max(lo, -1);
+			if (cnt < 2) return false;
+			mean = s1 / cnt;
+			const double var = s2 / cnt - mean * mean;
+			sd = var > 0 ? sqrt(var) : 0.0;
+			return true;
+		}
+
+		inline double Percentile(std::vector<double> v, double pct)
+		{
+			if (v.empty()) return 0;
+			size_t k = static_cast<size_t>(Clamp(pct, 0.0, 100.0) / 100.0 * (v.size() - 1));
+			std::nth_element(v.begin(), v.begin() + k, v.end());
+			return v[k];
+		}
+
+		inline float Decayed(int dir, int eventIdx, int i, int decayBars)
+		{
+			if (dir == 0 || eventIdx < 0 || i < eventIdx) return 0.0f;
+			return static_cast<float>(dir) * static_cast<float>(exp(-static_cast<double>(i - eventIdx) / Max(1, decayBars)));
+		}
+
+		inline void SetEvent(FlowState& F, int idx, float price, const char* text)
+		{
+			if (idx >= F.lastEventIdx) { F.lastEventIdx = idx; F.lastEventPrice = price; strncpy_s(F.lastEventText, sizeof(F.lastEventText), text, _TRUNCATE); }
+		}
+
+		inline void PushMarker(FlowState& F, int idx, int dir, int kind, float price)
+		{
+			FlowState::Marker m; m.idx = idx; m.dir = dir; m.kind = kind; m.price = price; m.lineNumber = 0;
+			F.markers.push_back(m);
+			while (F.markers.size() > 80) { if (F.markers[0].lineNumber) F.deadLines.push_back(F.markers[0].lineNumber); F.markers.erase(F.markers.begin()); }
+		}
+	}
+
 	void EnsureFlow(SCStudyInterfaceRef sc, ChartState& S)
 	{
-		EnsureVwap(sc, S); const int n = sc.ArraySize; FlowState& F = S.flow;
+		using namespace flow_detail;
+		EnsureVwap(sc, S);
+		const int n = sc.ArraySize; if (n <= 0) return;
+		FlowState& F = S.flow; const FlowParams& P = S.params.flow; const BaseState& B = S.base; const AuctionState& A = S.auction;
 		Fit(F.delta, n); Fit(F.deltaPct, n); Fit(F.cvd, n); Fit(F.cvdZ, n); Fit(F.volZ, n);
 		Fit(F.fAbsorb, n); Fit(F.fExhaust, n); Fit(F.fImb, n); Fit(F.fTrapped, n); Fit(F.fCvdDiv, n); Fit(F.fLarge, n);
 		Fit(F.absorbMark, n); Fit(F.exhaustMark, n); Fit(F.imbMark, n); Fit(F.trapMark, n); Fit(F.divMark, n);
-		F.computedThrough = n - 2; F.lastArraySize = n;
+		Fit(F.volPre1, n); Fit(F.volPre2, n); Fit(F.dzPre1, n); Fit(F.dzPre2, n); Fit(F.cvdDz, n);
+		if (F.UpToDate(sc)) return;
+		int from = F.computedThrough + 1; if (from < 0) from = 0; if (from > n - 1) from = n - 1;
+		const int L = Max(5, P.volZLength);
+		const int k = Max(1, P.cvdSlopeBars);
+		const float tick = S.tickSize;
+		const bool haveVap = (sc.VolumeAtPriceForBars != nullptr);
+
+		// ---- live large trades from Time & Sales (real time only; bounded buffer) ----
+		{
+			c_SCTimeAndSalesArray TS;
+			sc.GetTimeAndSales(TS);
+			const int sz = TS.Size();
+			S.warn.noTS = (sz == 0);
+			if (sz > 0)
+			{
+				TS.ValidateAndCorrectPriorSequenceNumber(F.lastTsSequence);
+				int startIdx = (F.lastTsSequence == 0) ? Max(0, sz - 500) : static_cast<int>(TS.GetRecordIndexAtGreaterThanSequenceNumber(F.lastTsSequence));
+				if (startIdx < 0) startIdx = 0;
+				const double volMult = sc.MultiplierFromVolumeValueFormat();
+				for (int t = startIdx; t < sz; ++t)
+				{
+					const s_TimeAndSales& r = TS[t];
+					if (r.Sequence <= F.lastTsSequence && F.lastTsSequence != 0) continue;
+					F.lastTsSequence = r.Sequence;
+					if (r.Type != SC_TS_BID && r.Type != SC_TS_ASK) continue;
+					const double size = r.GetVolume() * volMult;
+					if (size <= 0) continue;
+					F.tradeSizes.push_back(size);
+					if (static_cast<int>(F.tradeSizes.size()) > Max(100, P.largeLookback)) F.tradeSizes.erase(F.tradeSizes.begin(), F.tradeSizes.begin() + (F.tradeSizes.size() - P.largeLookback));
+					if (++F.liveSampleCount % 100 == 1 || F.liveThreshold <= 0) F.liveThreshold = Percentile(F.tradeSizes, P.largePercentile);
+					if (static_cast<int>(F.tradeSizes.size()) < 50 || size < F.liveThreshold || size < P.largeMinSize) continue;
+					// locate the bar: records are UTC; convert to the chart's time zone
+					SCDateTime dt = r.DateTime;
+					if (sc.ConvertDateTimeUTCToChartTimeZone != nullptr) dt = sc.ConvertDateTimeUTCToChartTimeZone(dt);
+					int bi = n - 1;
+					if (dt < sc.BaseDateTimeIn[n - 1]) { bi = sc.GetContainingIndexForSCDateTime(sc.ChartNumber, dt); if (bi < 0 || bi >= n || bi < n - 50) continue; }
+					const float price = static_cast<float>(r.GetPrice() * sc.RealTimePriceMultiplier);
+					const int dir = (r.Type == SC_TS_ASK) ? 1 : -1;
+					bool merged = false;
+					for (int q = static_cast<int>(F.bubbles.size()) - 1; q >= 0 && q >= static_cast<int>(F.bubbles.size()) - 20; --q)
+					{
+						Bubble& bq = F.bubbles[q];
+						if (bq.idx == bi && bq.live && bq.dir == dir && fabs(bq.price - price) < 0.5f * tick) { bq.size += size; merged = true; break; }
+					}
+					if (!merged) { Bubble bb; bb.idx = bi; bb.price = price; bb.size = size; bb.dir = dir; bb.live = true; bb.lineNumber = 0; F.bubbles.push_back(bb); }
+				}
+			}
+		}
+
+		for (int i = from; i < n; ++i)
+		{
+			const bool closed = (i <= n - 2);
+			const float atr = AtrAt(S, i);
+			const float c = sc.Close[i], h = sc.High[i], l = sc.Low[i], o = sc.Open[i];
+			const double vol = sc.Volume[i];
+			const double ask = sc.AskVolume[i], bid = sc.BidVolume[i];
+			const float range = h - l;
+
+			// ---- delta / CVD ----
+			const double delta = ask - bid;
+			F.delta[i] = static_cast<float>(delta);
+			F.deltaPct[i] = vol > 0 ? static_cast<float>(delta / vol) : 0.0f;
+			int key = 0;
+			if (P.cvdReset == 0) key = B.isRth[i] ? B.rthSession[i] : -1;
+			else if (P.cvdReset == 1) key = B.tradingDay[i];
+			else key = 1;
+			if (key != F.cvdSession) { F.cvdCommitted = 0; F.cvdSession = key; }
+			const double cvd = F.cvdCommitted + delta;
+			F.cvd[i] = static_cast<float>(cvd);
+			if (closed) F.cvdCommitted = cvd;
+
+			// ---- rolling z-scores via prefix sums over closed bars ----
+			const double dz = (i - k >= 0) ? static_cast<double>(F.cvd[i]) - F.cvd[i - k] : 0.0;
+			F.cvdDz[i] = static_cast<float>(dz);
+			{
+				const int upto = i - 1;
+				double m = 0, sd = 0;
+				if (WindowStats(F.volPre1, F.volPre2, upto, L, m, sd) && sd > 0) F.volZ[i] = static_cast<float>(Clamp((vol - m) / sd, -6.0, 6.0)); else F.volZ[i] = 0;
+				if (WindowStats(F.dzPre1, F.dzPre2, upto, L, m, sd) && sd > 0) F.cvdZ[i] = static_cast<float>(Clamp((dz - m) / sd, -6.0, 6.0)); else F.cvdZ[i] = 0;
+			}
+			if (closed)
+			{
+				F.volPre1[i] = (i > 0 ? F.volPre1[i - 1] : 0.0) + vol; F.volPre2[i] = (i > 0 ? F.volPre2[i - 1] : 0.0) + vol * vol;
+				F.dzPre1[i] = (i > 0 ? F.dzPre1[i - 1] : 0.0) + dz; F.dzPre2[i] = (i > 0 ? F.dzPre2[i - 1] : 0.0) + dz * dz;
+			}
+
+			// ---- events (closed bars only) ----
+			if (closed)
+			{
+				F.absorbMark[i] = F.exhaustMark[i] = F.imbMark[i] = F.trapMark[i] = F.divMark[i] = 0;
+
+				// absorption: heavy aggressive volume, little progress, close back inside
+				if (F.volZ[i] >= P.absorbVolZ && atr > 0 && range <= P.absorbMaxRangeAtr * atr && range > 0 && i >= 3)
+				{
+					const float prevLow = Min(sc.Low[i - 1], Min(sc.Low[i - 2], sc.Low[i - 3]));
+					const float prevHigh = Max(sc.High[i - 1], Max(sc.High[i - 2], sc.High[i - 3]));
+					if (F.deltaPct[i] <= -0.10f && (c - l) >= 0.4f * range && l <= prevLow)
+					{
+						Zone z; z.bornIdx = i; z.bottom = l; z.top = l + P.absorbZoneFrac * range; z.dir = 1; z.kind = LVL_ABSORB; z.active = true;
+						F.absorbZones.push_back(z); F.absorbMark[i] = 1; F.lastAbsIdx = i; F.lastAbsDir = 1; SetEvent(F, i, l, "Absorption (buyers)");
+					}
+					else if (F.deltaPct[i] >= 0.10f && (h - c) >= 0.4f * range && h >= prevHigh)
+					{
+						Zone z; z.bornIdx = i; z.top = h; z.bottom = h - P.absorbZoneFrac * range; z.dir = -1; z.kind = LVL_ABSORB; z.active = true;
+						F.absorbZones.push_back(z); F.absorbMark[i] = -1; F.lastAbsIdx = i; F.lastAbsDir = -1; SetEvent(F, i, h, "Absorption (sellers)");
+					}
+					while (static_cast<int>(F.absorbZones.size()) > Max(5, P.maxActiveZones) * 2) { if (F.absorbZones[0].lineNumber) F.deadLines.push_back(F.absorbZones[0].lineNumber); F.absorbZones.erase(F.absorbZones.begin()); }
+				}
+
+				// VAP-based: exhaustion, stacked imbalances, historical large-trade clusters
+				if (haveVap && static_cast<int>(sc.VolumeAtPriceForBars->GetNumberOfBars()) > i)
+				{
+					const int cnt = sc.VolumeAtPriceForBars->GetSizeAtBarIndex(i);
+					if (cnt >= 2)
+					{
+						std::vector<const s_VolumeAtPriceV2*> lv; lv.reserve(cnt);
+						for (int q = 0; q < cnt; ++q) { const s_VolumeAtPriceV2* p = nullptr; if (sc.VolumeAtPriceForBars->GetVAPElementAtIndex(i, q, &p) && p) lv.push_back(p); }
+						const int m = static_cast<int>(lv.size());
+						if (m >= 2)
+						{
+							// exhaustion: thin volume at the extreme after a run
+							double maxLevelVol = 0; for (int q = 0; q < m; ++q) maxLevelVol = Max(maxLevelVol, lv[q]->Volume);
+							const int run = Max(1, P.exhaustRunBars);
+							if (i - run >= 0 && maxLevelVol > 0)
+							{
+								bool upRun = c > sc.Close[i - run], downRun = c < sc.Close[i - run];
+								for (int q = 1; q <= run && q <= i; ++q) { if (sc.High[i - q + 1] < sc.High[i - q]) upRun = false; if (sc.Low[i - q + 1] > sc.Low[i - q]) downRun = false; }
+								const double thin = P.exhaustExtremePct / 100.0 * maxLevelVol;
+								if (upRun && lv[m - 1]->Volume <= thin && (m < 3 || lv[m - 2]->Volume <= thin * 1.5)) { F.exhaustMark[i] = -1; F.lastExhIdx = i; F.lastExhDir = -1; SetEvent(F, i, h, "Exhaustion top"); PushMarker(F, i, -1, 3, h); }
+								else if (downRun && lv[0]->Volume <= thin && (m < 3 || lv[1]->Volume <= thin * 1.5)) { F.exhaustMark[i] = 1; F.lastExhIdx = i; F.lastExhDir = 1; SetEvent(F, i, l, "Exhaustion bottom"); PushMarker(F, i, 1, 3, l); }
+							}
+
+							// stacked diagonal imbalances (Sierra Numbers Bars definition)
+							const double ratio = P.imbRatioPct / 100.0; const double minV = P.imbMinVolume;
+							int buyRun = 0, sellRun = 0; int buyStart = -1, sellStart = -1;
+							for (int q = 0; q < m; ++q)
+							{
+								const bool adjBelow = q > 0 && lv[q]->PriceInTicks - lv[q - 1]->PriceInTicks == 1;
+								const bool adjAbove = q + 1 < m && lv[q + 1]->PriceInTicks - lv[q]->PriceInTicks == 1;
+								const bool buyImb = adjBelow && lv[q]->AskVolume >= minV && lv[q - 1]->BidVolume >= minV && lv[q]->AskVolume >= ratio * lv[q - 1]->BidVolume;
+								const bool sellImb = adjAbove && lv[q]->BidVolume >= minV && lv[q + 1]->AskVolume >= minV && lv[q]->BidVolume >= ratio * lv[q + 1]->AskVolume;
+								if (buyImb) { if (buyRun == 0) buyStart = q; ++buyRun; } else buyRun = 0;
+								if (sellImb) { if (sellRun == 0) sellStart = q; ++sellRun; } else sellRun = 0;
+								if (buyRun >= P.imbStackLevels && (q + 1 >= m || !(q + 1 < m && lv[q + 1]->PriceInTicks - lv[q]->PriceInTicks == 1 && lv[q + 1]->AskVolume >= minV && lv[q]->BidVolume >= minV && lv[q + 1]->AskVolume >= ratio * lv[q]->BidVolume)))
+								{
+									Zone z; z.bornIdx = i; z.bottom = (lv[buyStart]->PriceInTicks - 0.5f) * tick; z.top = (lv[q]->PriceInTicks + 0.5f) * tick; z.dir = 1; z.kind = LVL_IMB; z.active = true;
+									F.imbZones.push_back(z); F.imbMark[i] = static_cast<signed char>(F.imbMark[i] == -1 ? 2 : 1); F.lastImbIdx = i; F.lastImbDir = 1; SetEvent(F, i, z.bottom, "Stacked buy imbalance");
+									buyRun = 0;
+								}
+								if (sellRun >= P.imbStackLevels && (q + 1 >= m || !(q + 2 < m && lv[q + 2]->PriceInTicks - lv[q + 1]->PriceInTicks == 1 && lv[q + 1]->BidVolume >= minV && lv[q + 2]->AskVolume >= minV && lv[q + 1]->BidVolume >= ratio * lv[q + 2]->AskVolume)))
+								{
+									Zone z; z.bornIdx = i; z.bottom = (lv[sellStart]->PriceInTicks - 0.5f) * tick; z.top = (lv[q]->PriceInTicks + 0.5f) * tick; z.dir = -1; z.kind = LVL_IMB; z.active = true;
+									F.imbZones.push_back(z); F.imbMark[i] = static_cast<signed char>(F.imbMark[i] == 1 ? 2 : -1); F.lastImbIdx = i; F.lastImbDir = -1; SetEvent(F, i, z.top, "Stacked sell imbalance");
+									sellRun = 0;
+								}
+							}
+							while (static_cast<int>(F.imbZones.size()) > Max(5, P.maxActiveZones) * 2) { if (F.imbZones[0].lineNumber) F.deadLines.push_back(F.imbZones[0].lineNumber); F.imbZones.erase(F.imbZones.begin()); }
+
+							// historical large-trade clusters (skip bars that already got live bubbles)
+							bool hasLive = false;
+							for (int q = static_cast<int>(F.bubbles.size()) - 1; q >= 0 && F.bubbles[q].idx >= i; --q) if (F.bubbles[q].idx == i && F.bubbles[q].live) { hasLive = true; break; }
+							for (int q = 0; q < m; ++q)
+							{
+								if (lv[q]->NumberOfTrades == 0) continue;
+								const double avg = lv[q]->Volume / lv[q]->NumberOfTrades;
+								F.levelAvgSizes.push_back(avg);
+								if (static_cast<int>(F.levelAvgSizes.size()) > 4000) F.levelAvgSizes.erase(F.levelAvgSizes.begin(), F.levelAvgSizes.begin() + 1000);
+							}
+							if (++F.ltSampleCount % 25 == 1 || F.ltThreshold <= 0) F.ltThreshold = Percentile(F.levelAvgSizes, P.largePercentile);
+							if (!hasLive && static_cast<int>(F.levelAvgSizes.size()) >= 200)
+							{
+								for (int q = 0; q < m; ++q)
+								{
+									if (lv[q]->NumberOfTrades == 0) continue;
+									const double avg = lv[q]->Volume / lv[q]->NumberOfTrades;
+									if (avg < F.ltThreshold || avg < P.largeMinSize) continue;
+									Bubble bb; bb.idx = i; bb.price = lv[q]->PriceInTicks * tick; bb.size = lv[q]->Volume; bb.dir = lv[q]->AskVolume >= lv[q]->BidVolume ? 1 : -1; bb.live = false; bb.lineNumber = 0;
+									F.bubbles.push_back(bb);
+								}
+							}
+						}
+					}
+				}
+				while (static_cast<int>(F.bubbles.size()) > Max(10, P.maxBubbles) + 50) { if (F.bubbles[0].lineNumber) F.deadLines.push_back(F.bubbles[0].lineNumber); F.bubbles.erase(F.bubbles.begin()); }
+
+				// zones die when traded through
+				for (size_t z = 0; z < F.absorbZones.size(); ++z) { Zone& Z = F.absorbZones[z]; if (Z.active && i > Z.bornIdx && ((Z.dir > 0 && c < Z.bottom) || (Z.dir < 0 && c > Z.top))) { Z.active = false; Z.deadIdx = i; } }
+				for (size_t z = 0; z < F.imbZones.size(); ++z) { Zone& Z = F.imbZones[z]; if (Z.active && i > Z.bornIdx && ((Z.dir > 0 && c < Z.bottom) || (Z.dir < 0 && c > Z.top))) { Z.active = false; Z.deadIdx = i; } }
+
+				// trapped traders: strong-delta breakout fully reversed within K bars
+				{
+					const int LB = Max(3, P.trapLookback);
+					for (size_t q = 0; q < F.pendingBreakouts.size(); )
+					{
+						FlowState::Breakout& bo = F.pendingBreakouts[q];
+						bool done = false;
+						if (i - bo.idx > P.trapReversalBars) done = true;
+						else if (bo.dir > 0 && c < bo.extreme) { F.trapMark[i] = -1; F.lastTrapIdx = i; F.lastTrapDir = -1; SetEvent(F, i, bo.extreme, "Trapped longs"); PushMarker(F, i, -1, 2, h); done = true; }
+						else if (bo.dir < 0 && c > bo.extreme) { F.trapMark[i] = 1; F.lastTrapIdx = i; F.lastTrapDir = 1; SetEvent(F, i, bo.extreme, "Trapped shorts"); PushMarker(F, i, 1, 2, l); done = true; }
+						if (done) F.pendingBreakouts.erase(F.pendingBreakouts.begin() + q); else ++q;
+					}
+					if (i - LB >= 0)
+					{
+						float hh = -FLT_MAX, ll = FLT_MAX;
+						for (int q = i - LB; q < i; ++q) { hh = Max(hh, sc.High[q]); ll = Min(ll, sc.Low[q]); }
+						const float minD = P.trapMinDeltaPct / 100.0f;
+						if (c > hh && F.deltaPct[i] >= minD && F.volZ[i] >= 0.5f) { FlowState::Breakout bo; bo.idx = i; bo.dir = 1; bo.extreme = l; F.pendingBreakouts.push_back(bo); }
+						else if (c < ll && F.deltaPct[i] <= -minD && F.volZ[i] >= 0.5f) { FlowState::Breakout bo; bo.idx = i; bo.dir = -1; bo.extreme = h; F.pendingBreakouts.push_back(bo); }
+					}
+				}
+
+				// CVD divergence at a freshly confirmed swing (confirmation bar = i)
+				if (!A.swings.empty() && A.swings.back().confirmIdx == i)
+				{
+					const Swing& ns = A.swings.back();
+					const int prevIdx = ns.high ? A.prevSwingHigh : A.prevSwingLow;
+					if (prevIdx >= 0 && prevIdx < static_cast<int>(A.swings.size()) - 1)
+					{
+						const Swing& ps = A.swings[prevIdx];
+						if (fabs(ns.price - ps.price) >= P.divMinAtr * atr && ns.idx < n && ps.idx < n)
+						{
+							const float cvdNew = F.cvd[ns.idx], cvdOld = F.cvd[ps.idx];
+							if (ns.high && ns.price > ps.price && cvdNew <= cvdOld) { F.divMark[i] = -1; F.lastDivIdx = i; F.lastDivDir = -1; F.lastDivPrice = ns.price; PushMarker(F, ns.idx, -1, 1, ns.price); }
+							else if (!ns.high && ns.price < ps.price && cvdNew >= cvdOld) { F.divMark[i] = 1; F.lastDivIdx = i; F.lastDivDir = 1; F.lastDivPrice = ns.price; PushMarker(F, ns.idx, 1, 1, ns.price); }
+						}
+					}
+				}
+			}
+
+			// ---- features ----
+			const int decay = Max(1, P.eventDecayBars);
+			F.fAbsorb[i] = Decayed(F.lastAbsDir, F.lastAbsIdx, i, decay);
+			F.fExhaust[i] = Decayed(F.lastExhDir, F.lastExhIdx, i, decay);
+			F.fImb[i] = Decayed(F.lastImbDir, F.lastImbIdx, i, decay);
+			F.fTrapped[i] = Decayed(F.lastTrapDir, F.lastTrapIdx, i, decay);
+			F.fCvdDiv[i] = Decayed(F.lastDivDir, F.lastDivIdx, i, decay * 2);
+			{
+				double buy = 0, sell = 0;
+				for (int q = static_cast<int>(F.bubbles.size()) - 1; q >= 0; --q)
+				{
+					const Bubble& bb = F.bubbles[q];
+					if (bb.idx > i - 1) continue;            // closed bars only
+					if (bb.idx < i - 10) break;
+					if (bb.dir > 0) buy += bb.size; else sell += bb.size;
+				}
+				F.fLarge[i] = (buy + sell) > 0 ? static_cast<float>((buy - sell) / (buy + sell)) : 0.0f;
+			}
+		}
+		F.Stamp(sc);
 	}
+
 	void EnsureRegime(SCStudyInterfaceRef sc, ChartState& S)
 	{
 		EnsureFlow(sc, S); const int n = sc.ArraySize; RegimeState& R = S.regime;
@@ -2058,8 +2373,9 @@ SCSFExport scsf_NQEdge_OrderFlow(SCStudyInterfaceRef sc)
 
 	sc.Subgraph[FS_CVD].DrawStyle = sc.Input[FI_D_CVD].GetYesNo() ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE;
 	int& gen = sc.GetPersistentInt(1);
-	int start = sc.UpdateStartIndex;
+	int start = Min(sc.UpdateStartIndex, S.flow.dirtyFrom); S.flow.dirtyFrom = INT_MAX;
 	if (gen != S.flow.generation) { start = 0; gen = S.flow.generation; }
+	if (start < 0) start = 0;
 	const FlowState& F = S.flow;
 	const uint32_t cUp = sc.Input[FI_C_CVD_UP].GetColor(), cDn = sc.Input[FI_C_CVD_DN].GetColor();
 	for (int i = start; i < sc.ArraySize; ++i)
@@ -2068,6 +2384,68 @@ SCSFExport scsf_NQEdge_OrderFlow(SCStudyInterfaceRef sc)
 		sc.Subgraph[FS_DELTA][i] = F.delta[i]; sc.Subgraph[FS_DELTA_PCT][i] = F.deltaPct[i]; sc.Subgraph[FS_VOLZ][i] = F.volZ[i]; sc.Subgraph[FS_CVDZ][i] = F.cvdZ[i];
 		sc.Subgraph[FS_F_ABS][i] = F.fAbsorb[i]; sc.Subgraph[FS_F_EXH][i] = F.fExhaust[i]; sc.Subgraph[FS_F_IMB][i] = F.fImb[i]; sc.Subgraph[FS_F_TRAP][i] = F.fTrapped[i];
 		sc.Subgraph[FS_F_DIV][i] = F.fCvdDiv[i]; sc.Subgraph[FS_F_LARGE][i] = F.fLarge[i];
+	}
+
+	// ---- drawings on the price chart (region 0) owned by this study ----
+	FlowState& FW = S.flow;
+	for (size_t k = 0; k < FW.deadLines.size(); ++k) { int ln = FW.deadLines[k]; DeleteDrawing(sc, ln); }
+	FW.deadLines.clear();
+	const int last = sc.ArraySize - 1;
+	const int maxZones = Max(1, sc.Input[FI_MAX_ZONES].GetInt());
+	struct ZoneDrawer
+	{
+		static void Draw(SCStudyInterfaceRef sc, std::vector<Zone>& zones, bool on, int last, int maxZones, uint32_t cBull, uint32_t cBear, const char* bullTxt, const char* bearTxt)
+		{
+			int drawn = 0;
+			for (int z = static_cast<int>(zones.size()) - 1; z >= 0; --z)
+			{
+				Zone& Z = zones[z];
+				if (!on) { DeleteDrawing(sc, Z.lineNumber); continue; }
+				if (!Z.active)
+				{
+					if (Z.deadIdx >= 0 && last - Z.deadIdx > 3) DeleteDrawing(sc, Z.lineNumber);
+					else if (Z.lineNumber) DrawRect(sc, Z.lineNumber, Z.bornIdx, Z.deadIdx, Z.top, Z.bottom, Z.dir > 0 ? cBull : cBear, 88);
+					continue;
+				}
+				if (drawn++ >= maxZones) { DeleteDrawing(sc, Z.lineNumber); continue; }
+				DrawRect(sc, Z.lineNumber, Z.bornIdx, last, Z.top, Z.bottom, Z.dir > 0 ? cBull : cBear, 70, Z.dir > 0 ? bullTxt : bearTxt);
+			}
+		}
+	};
+	ZoneDrawer::Draw(sc, FW.absorbZones, sc.Input[FI_D_ABS].GetYesNo() != 0, last, maxZones, sc.Input[FI_C_ABS_BULL].GetColor(), sc.Input[FI_C_ABS_BEAR].GetColor(), "absorption", "absorption");
+	ZoneDrawer::Draw(sc, FW.imbZones, sc.Input[FI_D_IMB].GetYesNo() != 0, last, maxZones, sc.Input[FI_C_IMB_BUY].GetColor(), sc.Input[FI_C_IMB_SELL].GetColor(), "stacked buy imb", "stacked sell imb");
+
+	// bubbles: size scaled by rank within the visible set
+	{
+		const bool on = sc.Input[FI_D_BUBBLE].GetYesNo() != 0;
+		const int maxB = Max(0, sc.Input[FI_LT_MAX].GetInt());
+		double maxSize = 1; for (size_t q = 0; q < FW.bubbles.size(); ++q) maxSize = Max(maxSize, FW.bubbles[q].size);
+		int drawn = 0;
+		for (int q = static_cast<int>(FW.bubbles.size()) - 1; q >= 0; --q)
+		{
+			Bubble& bb = FW.bubbles[q];
+			if (!on || drawn >= maxB) { DeleteDrawing(sc, bb.lineNumber); continue; }
+			++drawn;
+			const int sz = 4 + static_cast<int>(12.0 * sqrt(bb.size / maxSize));
+			const uint32_t col = bb.dir > 0 ? sc.Input[FI_C_BUB_BUY].GetColor() : sc.Input[FI_C_BUB_SELL].GetColor();
+			// live bubbles on the forming bar can still grow; everything else is drawn once
+			if (bb.lineNumber == 0 || (bb.live && bb.idx == last)) DrawMarker(sc, bb.lineNumber, bb.idx, bb.price, bb.live ? MARKER_POINT : MARKER_SQUARE, sz, col, bb.live ? sz : 1);
+		}
+	}
+
+	// event markers (divergence = 1, trapped = 2, exhaustion = 3)
+	{
+		const bool dDiv = sc.Input[FI_D_DIV].GetYesNo() != 0, dTrap = sc.Input[FI_D_TRAP].GetYesNo() != 0, dExh = sc.Input[FI_D_EXH].GetYesNo() != 0;
+		for (size_t q = 0; q < FW.markers.size(); ++q)
+		{
+			FlowState::Marker& m = FW.markers[q];
+			const bool on = (m.kind == 1 && dDiv) || (m.kind == 2 && dTrap) || (m.kind == 3 && dExh);
+			if (!on) { DeleteDrawing(sc, m.lineNumber); continue; }
+			if (m.lineNumber != 0) continue;
+			const uint32_t col = m.kind == 1 ? sc.Input[FI_C_DIV].GetColor() : (m.kind == 2 ? sc.Input[FI_C_TRAP].GetColor() : sc.Input[FI_C_EXH].GetColor());
+			const int type = m.kind == 1 ? (m.dir > 0 ? MARKER_TRIANGLEUP : MARKER_TRIANGLEDOWN) : (m.kind == 2 ? MARKER_X : MARKER_DIAMOND);
+			DrawMarker(sc, m.lineNumber, m.idx, m.price, type, 7, col, 2);
+		}
 	}
 }
 
