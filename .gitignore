@@ -1,0 +1,10 @@
+third_party/
+tools/
+*.dll
+*.obj
+*.o
+__pycache__/
+*.pyc
+research/data/
+research/output/
+.venv/

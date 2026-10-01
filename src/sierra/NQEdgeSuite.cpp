@@ -1,0 +1,1751 @@
+// ============================================================================
+//  NQ Edge Suite — directional-intelligence cockpit for NQ/MNQ (Sierra Chart ACSIL)
+//
+//  One self-contained DLL. Studies exported (add in this order):
+//    1. NQ Edge: Auction/Structure Engine     scsf_NQEdge_Auction
+//    2. NQ Edge: VWAP Engine                  scsf_NQEdge_VWAP
+//    3. NQ Edge: Order Flow Engine            scsf_NQEdge_OrderFlow
+//    4. NQ Edge: Regime + MTF Bias            scsf_NQEdge_Regime
+//    5. NQ Edge: Intermarket Engine           scsf_NQEdge_Intermarket
+//    6. NQ Edge: Directional Conviction Score scsf_NQEdge_DCS
+//    7. NQ Edge: Signal Validation            scsf_NQEdge_Validation
+//    8. NQ Edge: Feature Logger               scsf_NQEdge_FeatureLogger
+//    9. NQ Edge: HUD + Bar Painter            scsf_NQEdge_HUD
+//
+//  Architecture (docs/ARCHITECTURE.md): every study shares one per-chart ChartState held in a
+//  DLL-global registry. Engines are lazy and idempotent (EnsureBase/EnsureAuction/...), so the
+//  order in which Sierra calls the studies does not matter. All decision-relevant values are
+//  final only on closed bars; the forming bar is provisional and never enters statistics.
+//
+//  Section index (search for "// ==== "):
+//    ==== 0  Includes, DLL name, small helpers
+//    ==== 1  Params (inputs copied from each study)
+//    ==== 2  Engine states + ChartState + registry
+//    ==== 3  Stamp / reset / params versioning
+//    ==== 4  Base pass (ATR, sessions)
+//    ==== 5  Drawing helpers
+//    ==== 6  Auction / Structure engine
+//    ==== 7  VWAP engine
+//    ==== 8  Order Flow engine
+//    ==== 9  Regime + MTF engine
+//    ==== 10 Intermarket engine
+//    ==== 11 Weights + DCS composite + setups
+//    ==== 12 Validation
+//    ==== 13 Feature logger
+//    ==== 14 HUD snapshot + GDI
+//    ==== 15 Study functions (scsf_*)
+// ============================================================================
+
+// ==== 0  Includes, DLL name, small helpers ==================================
+#include "sierrachart.h"
+
+#include <vector>
+#include <map>
+#include <mutex>
+#include <string>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <cfloat>
+#include <sys/stat.h>
+
+SCDLLName("NQ Edge Suite")
+
+namespace nqe
+{
+	// windows.h defines min/max macros (Sierra does not define NOMINMAX), so std::min/max are
+	// unusable here. Local helpers instead.
+	template<class T> inline T Min(T a, T b) { return a < b ? a : b; }
+	template<class T> inline T Max(T a, T b) { return a > b ? a : b; }
+	template<class T> inline T Clamp(T v, T lo, T hi) { return v < lo ? lo : (v > hi ? hi : v); }
+	inline float Clamp1(double v) { return static_cast<float>(v < -1.0 ? -1.0 : (v > 1.0 ? 1.0 : v)); }
+	inline float Sign(double v) { return v > 0 ? 1.0f : (v < 0 ? -1.0f : 0.0f); }
+	inline bool IsNan(float v) { return v != v; }
+	inline bool IsNan(double v) { return v != v; }
+	static const float kNaN = std::numeric_limits<float>::quiet_NaN();
+	inline float SafeDiv(double a, double b, float dflt = 0.0f) { return b != 0.0 ? static_cast<float>(a / b) : dflt; }
+
+	// Sierra's own GetBarHasClosedStatus: every bar except the last one has closed.
+	inline bool BarClosed(SCStudyInterfaceRef sc, int i) { return sc.GetBarHasClosedStatus(i) == BHCS_BAR_HAS_CLOSED; }
+
+	// Storage time unit value that means "1 tick" (see docs/DECISIONS.md, unverified).
+	static const unsigned int kStorageUnitTick = 0;
+
+	enum Regime { RG_NONE = 0, RG_TREND_UP = 1, RG_TREND_DOWN = 2, RG_BALANCE = 3, RG_CHOP = 4 };
+	enum OpenType
+	{
+		OT_NONE = 0, OT_DRIVE_UP, OT_DRIVE_DOWN, OT_TEST_DRIVE_UP, OT_TEST_DRIVE_DOWN,
+		OT_REJECT_REVERSE_UP, OT_REJECT_REVERSE_DOWN, OT_AUCTION
+	};
+	enum SetupType
+	{
+		SETUP_NONE = 0, SETUP_TREND_PULLBACK = 1, SETUP_VALUE_EDGE = 2, SETUP_FAILED_BREAKOUT = 3,
+		SETUP_BREAK_ACCEPT = 4, SETUP_DIVERGENCE = 5, SETUP_COUNT = 6
+	};
+	static const char* kSetupNames[SETUP_COUNT] =
+	{ "None", "Trend Pullback", "Value Edge", "Failed Breakout", "Break+Accept", "Divergence" };
+	static const char* kRegimeNames[5] = { "--", "TREND UP", "TREND DOWN", "BALANCE", "VOLATILE CHOP" };
+	static const char* kOpenTypeNames[8] =
+	{ "--", "Open-Drive Up", "Open-Drive Down", "Open-Test-Drive Up", "Open-Test-Drive Down",
+	  "Open-Reject-Reverse Up", "Open-Reject-Reverse Down", "Open-Auction" };
+
+	// ==== 1  Params =============================================================
+	// Plain structs so a byte compare can detect input changes. Always construct with {}.
+
+	struct BaseParams
+	{
+		int rthStartSec = 9 * 3600 + 30 * 60;
+		int rthEndSec = 16 * 3600;
+		int atrLength = 14;
+	};
+
+	struct AuctionParams
+	{
+		int ibMinutes = 60;
+		int openTypeMinutes = 30;
+		float valueAreaPct = 70.0f;
+		int profileTicksPerLevel = 1;
+		int nakedPocsTracked = 10;
+		int tpoMinutes = 30;
+		int swingStrength = 5;
+		float swingMinAtr = 0.5f;
+		int equalTolTicks = 2;
+		int bosDecayBars = 10;
+		float ibExtA = 0.5f, ibExtB = 1.0f, ibExtC = 2.0f;
+	};
+
+	struct VwapParams
+	{
+		int anchor = 0;            // 0 = RTH open, 1 = trading day start
+		float band1 = 1.0f, band2 = 2.0f, band3 = 3.0f;
+		int slopeBars = 10;
+		int acceptCloses = 3;
+	};
+
+	struct FlowParams
+	{
+		int cvdReset = 0;          // 0 = RTH open, 1 = trading day, 2 = never
+		int cvdSlopeBars = 10;
+		int volZLength = 50;
+		float absorbVolZ = 2.0f;
+		float absorbMaxRangeAtr = 0.6f;
+		float absorbZoneFrac = 0.25f;
+		int exhaustRunBars = 3;
+		float exhaustExtremePct = 15.0f;
+		float imbRatioPct = 300.0f;
+		int imbMinVolume = 10;
+		int imbStackLevels = 3;
+		float largePercentile = 99.0f;
+		int largeMinSize = 20;
+		int largeLookback = 2000;
+		int maxBubbles = 100;
+		int trapLookback = 20;
+		int trapReversalBars = 3;
+		float trapMinDeltaPct = 20.0f;
+		float divMinAtr = 0.5f;
+		int eventDecayBars = 8;
+		int maxActiveZones = 30;
+	};
+
+	struct RegimeParams
+	{
+		int erLength = 20;
+		float erTrend = 0.35f;
+		float erBalance = 0.20f;
+		int atrFast = 7;
+		int atrSlow = 50;
+		float chopExpansion = 1.3f;
+		int ibAvgDays = 20;
+		int insideValueBars = 30;
+		int hysteresisBars = 3;
+		int mtfEmaLength = 20;
+		int mtfSwing = 3;
+	};
+
+	struct InterParams
+	{
+		int chartYM = 0, chartES = 0, chartRTY = 0, chartTICK = 0;
+		int chartMega[6] = { 0, 0, 0, 0, 0, 0 };
+		int rsLookback = 20;
+		int rsZLength = 100;
+		float tickExtreme = 800.0f;
+		float tickStrong = 1000.0f;
+		int tickLookback = 10;
+		int tickEma = 10;
+		int megaEma = 20;
+	};
+
+	struct DcsParams
+	{
+		char weightsFile[128] = "NQEdge_weights.txt";
+		int hotReloadSec = 5;
+		float signalThr = 40.0f;
+		float fadeThr = 20.0f;
+		int smoothLen = 5;
+		float strongThr = 60.0f;
+		float weakThr = 25.0f;
+		int setupOn[SETUP_COUNT] = { 0, 1, 1, 1, 1, 1 };
+		int requireMtf = 1;
+		float levelTolAtr = 0.3f;
+		float stopBufferAtr = 0.5f;
+		float minRR = 1.0f;
+		float minTargetAtr = 0.5f;
+		int maxSignalsDrawn = 30;
+		int targetLineBars = 20;
+		int alertsOn = 1;
+		int alertSound = 1;
+	};
+
+	struct ValParams
+	{
+		int slippageTicks = 1;
+		int maxBars = 120;
+		int stopFirst = 1;
+		int minSample = 30;
+	};
+
+	struct LogParams
+	{
+		int enabled = 1;
+		char prefix[64] = "NQEdge_features";
+		int rewriteOnRecalc = 1;
+		int rthOnly = 0;
+	};
+
+	struct Params
+	{
+		BaseParams base; AuctionParams auction; VwapParams vwap; FlowParams flow;
+		RegimeParams regime; InterParams inter; DcsParams dcs; ValParams val; LogParams log;
+	};
+
+	template<class T> inline bool SameBytes(const T& a, const T& b) { return std::memcmp(&a, &b, sizeof(T)) == 0; }
+
+	// ==== 2  Engine states + ChartState + registry =============================
+
+	enum EngineId { E_BASE = 0, E_AUCTION, E_VWAP, E_FLOW, E_REGIME, E_INTER, E_DCS, E_VAL, E_LOG, E_COUNT };
+
+	struct EngineCommon
+	{
+		int computedThrough = -1;   // last closed bar with final values
+		int generation = 0;         // bumped on every reset (studies use it to rewrite subgraphs)
+		int lastArraySize = 0;
+		void Reset() { computedThrough = -1; ++generation; lastArraySize = 0; }
+	};
+
+	struct BaseState : EngineCommon
+	{
+		std::vector<float> atr, tr;
+		std::vector<int> tradingDay;      // sc.GetTradingDayDate per bar
+		std::vector<unsigned char> isRth;
+		std::vector<int> rthSession;      // increasing id, -1 outside RTH
+		std::vector<int> secIntoRth;      // seconds since RTH start (RTH bars only)
+		std::vector<int> dayStartIdx;     // first bar index of this trading day
+		std::vector<int> rthStartIdx;     // first RTH bar index of this trading day (-1 if none yet)
+		std::vector<int> lastRthId;       // highest RTH session id seen up to and including bar i
+	};
+
+	// Price level published by the auction engine (for HUD distances and setup targets).
+	enum LevelKind
+	{
+		LVL_NONE = 0, LVL_POC, LVL_VAH, LVL_VAL, LVL_PD_POC, LVL_PD_VAH, LVL_PD_VAL, LVL_PDH, LVL_PDL,
+		LVL_ONH, LVL_ONL, LVL_IBH, LVL_IBL, LVL_IBEXT, LVL_NAKED_POC, LVL_SWING_H, LVL_SWING_L,
+		LVL_LIQ_EQH, LVL_LIQ_EQL, LVL_VWAP, LVL_VWAP_B1U, LVL_VWAP_B1D, LVL_VWAP_B2U, LVL_VWAP_B2D,
+		LVL_VWAP_B3U, LVL_VWAP_B3D, LVL_ABSORB, LVL_IMB, LVL_SINGLE_PRINT
+	};
+	struct Level { float price; int kind; int bornIdx; };
+
+	struct Swing { int idx; float price; int confirmIdx; bool high; };
+
+	struct Zone
+	{
+		int bornIdx = 0; float top = 0, bottom = 0; int dir = 0;   // dir +1 = support-type (bull), -1 = resistance-type (bear)
+		int kind = 0; bool active = true; int lineNumber = 0; int deadIdx = -1;
+	};
+
+	struct AuctionState : EngineCommon
+	{
+		// per-bar outputs
+		std::vector<float> poc, vah, val;                 // developing RTH profile
+		std::vector<float> pdPoc, pdVah, pdVal, pdh, pdl; // prior day
+		std::vector<float> onHigh, onLow;                 // overnight range (dev. during ON, frozen in RTH)
+		std::vector<float> ibHigh, ibLow;                 // initial balance (dev. during IB, frozen after)
+		std::vector<unsigned char> ibDone;
+		std::vector<float> structTrend, bos, vaPos, pocPos, ibPos, valueMig, openTypeDir;
+		std::vector<signed char> openType;
+		std::vector<signed char> swingHighMark, swingLowMark; // 1 at the pivot bar (set at confirmation)
+		std::vector<signed char> bosMark, chochMark;          // +1/-1 at the bar that broke
+		// swings
+		std::vector<Swing> swings;
+		int lastSwingHigh = -1, lastSwingLow = -1;           // indices into swings
+		int prevSwingHigh = -1, prevSwingLow = -1;
+		// profile (committed through computedThrough)
+		int profSession = -1;
+		int profBaseTick = 0;                                // price tick of profile[0]
+		std::vector<double> profVol;                         // volume per level
+		std::vector<int> profTpo;                            // TPO count per level
+		int lastTpoPeriod = -1;
+		std::vector<unsigned char> tpoTouched;               // scratch: level touched in current TPO period
+		// day bookkeeping
+		int curDay = 0; float dayHigh = -FLT_MAX, dayLow = FLT_MAX;
+		float onH = -FLT_MAX, onL = FLT_MAX;
+		float ibH = -FLT_MAX, ibL = FLT_MAX; bool ibClosed = false;
+		float prevDayHigh = 0, prevDayLow = 0, prevPoc = 0, prevVah = 0, prevVal = 0;
+		float rthOpen = 0; int rthOpenIdx = -1; float firstHalfHourHigh = -FLT_MAX, firstHalfHourLow = FLT_MAX;
+		signed char todayOpenType = OT_NONE;
+		std::vector<float> ibRangeHistory;                   // one per completed IB (for regime)
+		std::vector<float> nakedPocs;                        // untested prior-session POCs
+		std::vector<int> nakedPocBorn;
+		std::vector<int> nakedPocLine;
+		std::vector<Zone> singlePrints;
+		std::vector<Zone> liquidity;                         // equal highs/lows
+		std::vector<Level> levels;                           // snapshot of all active levels (rebuilt each update)
+		int lastBosDir = 0, lastBosIdx = -1000;
+		int lastChochDir = 0, lastChochIdx = -1000;
+	};
+
+	struct VwapState : EngineCommon
+	{
+		std::vector<float> vwap, sd, b1u, b1d, b2u, b2d, b3u, b3d;
+		std::vector<float> avOn, avRth, avSwHi, avSwLo;
+		std::vector<float> slope, pos, accept;     // features
+		// committed sums (through computedThrough)
+		double sPV = 0, sPPV = 0, sV = 0; int sSession = -1; int sStartIdx = -1;
+		double oPV = 0, oV = 0; int oDay = 0;
+		double rPV = 0, rV = 0; int rSession = -1;
+		double hPV = 0, hV = 0; int hAnchor = -1;
+		double lPV = 0, lV = 0; int lAnchor = -1;
+		int acceptRun = 0;                          // consecutive closes on one side (signed)
+	};
+
+	struct Bubble { int idx; float price; double size; int dir; bool live; int lineNumber; };
+
+	struct FlowState : EngineCommon
+	{
+		std::vector<float> delta, deltaPct, cvd, cvdZ, volZ;
+		std::vector<float> fAbsorb, fExhaust, fImb, fTrapped, fCvdDiv, fLarge;   // features
+		std::vector<signed char> absorbMark, exhaustMark, imbMark, trapMark, divMark;
+		double cvdCommitted = 0; int cvdSession = -1; int cvdDay = 0;
+		std::vector<Zone> absorbZones, imbZones;
+		std::vector<Bubble> bubbles;
+		std::vector<double> tradeSizes;             // rolling sample for live percentile
+		unsigned int lastTsSequence = 0;
+		std::vector<double> levelAvgSizes;          // rolling sample of VAP avg-trade-size per level
+		int lastProcessedSwing = -1;
+		// trapped: pending breakout candidates
+		struct Breakout { int idx; int dir; float extreme; };
+		std::vector<Breakout> pendingBreakouts;
+		float lastEventPrice = 0; int lastEventIdx = -1; char lastEventText[64] = "";
+	};
+
+	struct RegimeState : EngineCommon
+	{
+		std::vector<float> er, atrRatio, regimeTrend, mtfBias;
+		std::vector<signed char> regime, mtf1, mtf5, mtf15, mtf60;
+		int candidate = RG_NONE; int candidateCount = 0; int current = RG_NONE;
+		std::vector<float> atrFast, atrSlow;
+	};
+
+	struct RefChart
+	{
+		int chartNumber = 0; bool ok = false; SCString symbol;
+		std::vector<double> cumPV, cumV; int cumThrough = -1;   // for ref VWAP
+		std::vector<float> ema; int emaThrough = -1;
+		int lastRefSize = 0;
+	};
+
+	struct InterState : EngineCommon
+	{
+		std::vector<float> rsYM, rsES, rsRTY, rsIndex, smt, tickCum, tickExt, tickDiv, megaCap, composite;
+		std::vector<signed char> smtMark;
+		RefChart ym, es, rty, tick, mega[6];
+		int available = 0;                           // bitmask: 1 YM, 2 ES, 4 RTY, 8 TICK, 16.. mega
+		double tickCumCommitted = 0; int tickSession = -1;
+		int lastSwingProcessed = -1;
+		std::vector<float> rsRet; // scratch
+	};
+
+	// Feature vector published to the composite. Index constants must match kFeatureNames.
+	enum FeatureId
+	{
+		F_VWAP_POS = 0, F_VWAP_SLOPE, F_VWAP_ACCEPT, F_STRUCT_TREND, F_BOS, F_VA_POS, F_POC_POS, F_IB_POS,
+		F_VALUE_MIG, F_OPEN_TYPE, F_DELTA, F_CVD_Z, F_CVD_DIV, F_ABSORB, F_EXHAUST, F_IMBALANCE, F_TRAPPED,
+		F_LARGE_TRADE, F_REGIME_TREND, F_MTF_BIAS, F_RS_INDEX, F_SMT, F_TICK_CUM, F_TICK_EXT, F_TICK_DIV,
+		F_MEGA_CAP, F_COUNT
+	};
+	static const char* kFeatureNames[F_COUNT] =
+	{
+		"vwapPos", "vwapSlope", "vwapAccept", "structTrend", "bos", "vaPos", "pocPos", "ibPos",
+		"valueMig", "openType", "delta", "cvdZ", "cvdDiv", "absorb", "exhaust", "imbalance", "trapped",
+		"largeTrade", "regimeTrend", "mtfBias", "rsIndex", "smt", "tickCum", "tickExt", "tickDiv", "megaCap"
+	};
+	enum FeatureGroup { G_TREND = 0, G_FLOW, G_REVERSAL, G_LOCATION, G_INTERMARKET, G_CONTEXT, G_COUNT };
+	static const char* kGroupNames[G_COUNT] = { "trend", "flow", "reversal", "location", "intermarket", "context" };
+	static const int kFeatureGroup[F_COUNT] =
+	{
+		G_LOCATION, G_TREND, G_TREND, G_TREND, G_TREND, G_LOCATION, G_LOCATION, G_LOCATION,
+		G_CONTEXT, G_CONTEXT, G_FLOW, G_FLOW, G_REVERSAL, G_REVERSAL, G_REVERSAL, G_FLOW, G_REVERSAL,
+		G_FLOW, G_TREND, G_TREND, G_INTERMARKET, G_REVERSAL, G_INTERMARKET, G_INTERMARKET, G_REVERSAL,
+		G_INTERMARKET
+	};
+
+	struct Weights
+	{
+		float w[F_COUNT];
+		float gate[5][G_COUNT];     // by regime (index by Regime enum)
+		float thrSignal = 40.0f, thrFade = 20.0f;
+		int version = 1;
+		time_t fileMtime = 0; double lastCheck = 0; bool loadedFromFile = false;
+		void SetDefaults()
+		{
+			static const float d[F_COUNT] =
+			{
+				0.6f, 0.8f, 0.5f, 0.9f, 0.6f, 0.5f, 0.4f, 0.3f,
+				0.4f, 0.4f, 0.6f, 0.8f, 0.7f, 0.8f, 0.5f, 0.7f, 0.8f,
+				0.5f, 1.0f, 0.9f, 0.5f, 0.7f, 0.4f, 0.4f, 0.5f, 0.5f
+			};
+			for (int i = 0; i < F_COUNT; ++i) w[i] = d[i];
+			for (int r = 0; r < 5; ++r) for (int g = 0; g < G_COUNT; ++g) gate[r][g] = 1.0f;
+			// Trend: favor continuation, damp reversal. Balance: invert location (fade edges), damp trend.
+			gate[RG_TREND_UP][G_TREND] = 1.2f;  gate[RG_TREND_UP][G_REVERSAL] = 0.5f;  gate[RG_TREND_UP][G_LOCATION] = 0.5f;
+			gate[RG_TREND_DOWN][G_TREND] = 1.2f; gate[RG_TREND_DOWN][G_REVERSAL] = 0.5f; gate[RG_TREND_DOWN][G_LOCATION] = 0.5f;
+			gate[RG_BALANCE][G_TREND] = 0.6f; gate[RG_BALANCE][G_REVERSAL] = 1.3f; gate[RG_BALANCE][G_LOCATION] = -0.8f;
+			for (int g = 0; g < G_COUNT; ++g) gate[RG_CHOP][g] = 0.5f;
+			thrSignal = 40.0f; thrFade = 20.0f;
+		}
+		Weights() { SetDefaults(); }
+	};
+
+	struct Signal
+	{
+		int idx = 0; int type = SETUP_NONE; int dir = 0; float entry = 0, stop = 0, t1 = 0, t2 = 0;
+		float dcs = 0; float rr = 0; char label[96] = "";
+		int lineArrow = 0, lineEntry = 0, lineStop = 0, lineT1 = 0, lineT2 = 0, lineText = 0;
+		// validation (filled by the validation engine)
+		int resolved = 0;          // 0 pending, 1 win (T1), -1 loss, 2 timeout
+		int hitT2 = 0; float mfeR = 0, maeR = 0; int barsToRes = 0; float resultR = 0; int resIdx = -1;
+	};
+
+	struct DcsState : EngineCommon
+	{
+		std::vector<float> feat;         // F_COUNT per bar (row-major)
+		std::vector<float> dcs, dcsSmooth;
+		std::vector<signed char> barState; // -2..+2
+		std::vector<signed char> signalType, signalDir;
+		Weights weights;
+		std::vector<Signal> signals;
+		int lastAlertIdx = -1;
+		int lastSignalCheckedIdx = -1;
+	};
+
+	struct SetupStats { int count = 0, wins = 0, losses = 0, t2 = 0, timeouts = 0; double sumR = 0, sumWinR = 0, sumLossR = 0, sumMfe = 0, sumMae = 0, sumBars = 0; };
+
+	struct ValState : EngineCommon
+	{
+		SetupStats stats[SETUP_COUNT];
+		std::vector<float> cumR;
+		int nextSignal = 0;      // first signal index not yet fully resolved
+		double totalR = 0;
+	};
+
+	struct LogRow
+	{
+		int idx; double t; float o, h, l, c, v; float feat[F_COUNT]; float dcs; int regime; int setup; int dir;
+		float atr; float fwd5, fwd15, fwd30, fwd60, mfe, mae; bool done;
+	};
+
+	struct LogState : EngineCommon
+	{
+		std::vector<LogRow> pending;
+		int lastQueuedIdx = -1;
+		bool headerWritten = false;
+		std::string path;
+	};
+
+	struct Warnings
+	{
+		bool storageNotTick = false, tzNotNY = false, vapOff = false, noDepth = false, noTS = false;
+		char interMissing[160] = "";
+		char text[512] = "";
+	};
+
+	struct HudSnapshot
+	{
+		int lastClosedIdx = -1;
+		float dcs = 0, dcsSmooth = 0, dcsTrend = 0; int barState = 0; int bias = 0;
+		int regime = 0; int openType = 0; float valueMig = 0;
+		int mtf[4] = { 0, 0, 0, 0 }; bool mtfAvail[4] = { false, false, false, false };
+		int ym = 0, tick = 0, mega[6] = { 0, 0, 0, 0, 0, 0 }; int megaCount = 0; char megaNames[6][12] = {};
+		bool ymAvail = false, tickAvail = false; int smt = 0;
+		float cvdZ = 0; int cvdTrend = 0; char lastEvent[64] = ""; float lastEventPrice = 0;
+		float supPrice = 0, resPrice = 0; int supKind = 0, resKind = 0; float atr = 0; float close = 0;
+		char stateLine[160] = "";
+		int curSetup = 0; SetupStats curStats; bool statsAvail = false;
+		char vwapText[64] = "";
+		int signalsTotal = 0;
+	};
+
+	struct DataStamp { int arraySize = 0; double t0 = 0, tMid = 0, tLast = 0; int midIdx = -1, lastIdx = -1; bool valid = false; };
+
+	struct ChartState
+	{
+		int chartNumber = 0;
+		int refCount = 0;
+		DataStamp stamp;
+		Params params;
+		bool paramsSet[E_COUNT] = { false, false, false, false, false, false, false, false, false };
+		bool studyPresent[E_COUNT] = { false, false, false, false, false, false, false, false, false };
+		BaseState base; AuctionState auction; VwapState vwap; FlowState flow; RegimeState regime;
+		InterState inter; DcsState dcs; ValState val; LogState log;
+		Warnings warn; HudSnapshot hud;
+		float tickSize = 0.25f;
+		int resetCount = 0;
+
+		EngineCommon& Engine(int e)
+		{
+			switch (e)
+			{
+			case E_BASE: return base; case E_AUCTION: return auction; case E_VWAP: return vwap;
+			case E_FLOW: return flow; case E_REGIME: return regime; case E_INTER: return inter;
+			case E_DCS: return dcs; case E_VAL: return val; default: return log;
+			}
+		}
+	};
+
+	static std::recursive_mutex g_mutex;
+	static std::map<int, ChartState*> g_charts;
+	static int g_instanceId = 0;   // random per DLL load, lets study instances detect a reload
+
+	inline int InstanceId()
+	{
+		if (g_instanceId == 0) g_instanceId = static_cast<int>(GetTickCount64() & 0x7fffffff) | 1;
+		return g_instanceId;
+	}
+
+	static const int kPersistAttached = 990001;
+
+	// Returns the chart state, creating it on first use. Each study instance attaches once.
+	ChartState& Acquire(SCStudyInterfaceRef sc)
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_mutex);
+		ChartState*& S = g_charts[sc.ChartNumber];
+		if (S == nullptr) { S = new ChartState(); S->chartNumber = sc.ChartNumber; }
+		int& attached = sc.GetPersistentInt(kPersistAttached);
+		if (attached != InstanceId()) { attached = InstanceId(); ++S->refCount; }
+		S->tickSize = sc.TickSize > 0 ? sc.TickSize : 0.25f;
+		return *S;
+	}
+
+	void Release(SCStudyInterfaceRef sc, int engine)
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_mutex);
+		std::map<int, ChartState*>::iterator it = g_charts.find(sc.ChartNumber);
+		if (it == g_charts.end()) return;
+		ChartState* S = it->second;
+		int& attached = sc.GetPersistentInt(kPersistAttached);
+		if (attached == InstanceId()) { attached = 0; --S->refCount; }
+		if (engine >= 0 && engine < E_COUNT) S->studyPresent[engine] = false;
+		if (S->refCount <= 0) { delete S; g_charts.erase(it); }
+	}
+
+	ChartState* Peek(int chartNumber)
+	{
+		std::map<int, ChartState*>::iterator it = g_charts.find(chartNumber);
+		return it == g_charts.end() ? nullptr : it->second;
+	}
+
+	// ==== 3  Stamp / reset / params versioning ==================================
+
+	void ResetFrom(ChartState& S, int engine)
+	{
+		for (int e = engine; e < E_COUNT; ++e) S.Engine(e).Reset();
+		if (engine <= E_AUCTION)
+		{
+			S.auction.swings.clear(); S.auction.lastSwingHigh = S.auction.lastSwingLow = -1;
+			S.auction.prevSwingHigh = S.auction.prevSwingLow = -1;
+			S.auction.profSession = -1; S.auction.profVol.clear(); S.auction.profTpo.clear(); S.auction.tpoTouched.clear();
+			S.auction.curDay = 0; S.auction.dayHigh = -FLT_MAX; S.auction.dayLow = FLT_MAX;
+			S.auction.onH = -FLT_MAX; S.auction.onL = FLT_MAX; S.auction.ibH = -FLT_MAX; S.auction.ibL = FLT_MAX; S.auction.ibClosed = false;
+			S.auction.prevDayHigh = S.auction.prevDayLow = S.auction.prevPoc = S.auction.prevVah = S.auction.prevVal = 0;
+			S.auction.rthOpen = 0; S.auction.rthOpenIdx = -1; S.auction.todayOpenType = OT_NONE;
+			S.auction.ibRangeHistory.clear(); S.auction.nakedPocs.clear(); S.auction.nakedPocBorn.clear();
+			S.auction.singlePrints.clear(); S.auction.liquidity.clear(); S.auction.levels.clear();
+			S.auction.lastBosDir = 0; S.auction.lastBosIdx = -1000; S.auction.lastChochDir = 0; S.auction.lastChochIdx = -1000;
+			S.auction.lastTpoPeriod = -1;
+		}
+		if (engine <= E_VWAP)
+		{
+			S.vwap.sPV = S.vwap.sPPV = S.vwap.sV = 0; S.vwap.sSession = -1; S.vwap.sStartIdx = -1;
+			S.vwap.oPV = S.vwap.oV = 0; S.vwap.oDay = 0; S.vwap.rPV = S.vwap.rV = 0; S.vwap.rSession = -1;
+			S.vwap.hPV = S.vwap.hV = 0; S.vwap.hAnchor = -1; S.vwap.lPV = S.vwap.lV = 0; S.vwap.lAnchor = -1; S.vwap.acceptRun = 0;
+		}
+		if (engine <= E_FLOW)
+		{
+			S.flow.cvdCommitted = 0; S.flow.cvdSession = -1; S.flow.cvdDay = 0;
+			S.flow.absorbZones.clear(); S.flow.imbZones.clear(); S.flow.bubbles.clear(); S.flow.tradeSizes.clear();
+			S.flow.levelAvgSizes.clear(); S.flow.lastProcessedSwing = -1; S.flow.pendingBreakouts.clear();
+			S.flow.lastEventIdx = -1; S.flow.lastEventText[0] = 0;
+		}
+		if (engine <= E_REGIME) { S.regime.candidate = RG_NONE; S.regime.candidateCount = 0; S.regime.current = RG_NONE; }
+		if (engine <= E_INTER)
+		{
+			S.inter.tickCumCommitted = 0; S.inter.tickSession = -1; S.inter.lastSwingProcessed = -1;
+			RefChart* refs[10] = { &S.inter.ym, &S.inter.es, &S.inter.rty, &S.inter.tick, &S.inter.mega[0], &S.inter.mega[1], &S.inter.mega[2], &S.inter.mega[3], &S.inter.mega[4], &S.inter.mega[5] };
+			for (int k = 0; k < 10; ++k) { refs[k]->cumThrough = -1; refs[k]->emaThrough = -1; refs[k]->cumPV.clear(); refs[k]->cumV.clear(); refs[k]->ema.clear(); refs[k]->lastRefSize = 0; }
+		}
+		if (engine <= E_DCS) { S.dcs.signals.clear(); S.dcs.lastAlertIdx = -1; S.dcs.lastSignalCheckedIdx = -1; }
+		if (engine <= E_VAL) { for (int k = 0; k < SETUP_COUNT; ++k) S.val.stats[k] = SetupStats(); S.val.nextSignal = 0; S.val.totalR = 0; }
+		if (engine <= E_LOG) { S.log.pending.clear(); S.log.lastQueuedIdx = -1; }
+		++S.resetCount;
+	}
+
+	// Detects reloads / back-fills by comparing bar times at a few checkpoints.
+	void CheckDataStamp(SCStudyInterfaceRef sc, ChartState& S)
+	{
+		const int n = sc.ArraySize;
+		DataStamp& st = S.stamp;
+		bool ok = st.valid && n > 0 && n >= st.arraySize - 0 && st.lastIdx < n;
+		if (ok && st.lastIdx >= 0)
+		{
+			if (sc.BaseDateTimeIn[0].GetAsDouble() != st.t0) ok = false;
+			else if (st.midIdx >= 0 && sc.BaseDateTimeIn[st.midIdx].GetAsDouble() != st.tMid) ok = false;
+			else if (sc.BaseDateTimeIn[st.lastIdx].GetAsDouble() != st.tLast) ok = false;
+		}
+		else if (ok && st.lastIdx < 0 && st.arraySize > 0 && n > 0)
+		{
+			if (sc.BaseDateTimeIn[0].GetAsDouble() != st.t0) ok = false;
+		}
+		if (n < st.arraySize) ok = false;
+		if (!ok)
+		{
+			ResetFrom(S, E_BASE);
+			st.valid = (n > 0);
+			st.arraySize = n; st.lastIdx = -1; st.midIdx = -1;
+			st.t0 = n > 0 ? sc.BaseDateTimeIn[0].GetAsDouble() : 0; st.tMid = 0; st.tLast = 0;
+		}
+	}
+
+	void UpdateDataStamp(SCStudyInterfaceRef sc, ChartState& S)
+	{
+		const int n = sc.ArraySize;
+		DataStamp& st = S.stamp;
+		st.arraySize = n;
+		st.lastIdx = S.base.computedThrough;
+		if (st.lastIdx >= 0)
+		{
+			st.tLast = sc.BaseDateTimeIn[st.lastIdx].GetAsDouble();
+			st.midIdx = st.lastIdx / 2;
+			st.tMid = sc.BaseDateTimeIn[st.midIdx].GetAsDouble();
+		}
+		st.t0 = n > 0 ? sc.BaseDateTimeIn[0].GetAsDouble() : 0;
+		st.valid = n > 0;
+	}
+
+	// Store a parameter block; resets the engine (and dependents) when it changed.
+	template<class T>
+	void SetParams(ChartState& S, int engine, T& slot, const T& fresh)
+	{
+		if (!S.paramsSet[engine] || !SameBytes(slot, fresh))
+		{
+			slot = fresh;
+			if (S.paramsSet[engine]) ResetFrom(S, engine);
+			S.paramsSet[engine] = true;
+		}
+	}
+
+	template<class V> inline void Fit(V& v, int n) { if (static_cast<int>(v.size()) != n) v.resize(static_cast<size_t>(n)); }
+
+	// ==== 4  Base pass (ATR, sessions) ==========================================
+
+	void EnsureBase(SCStudyInterfaceRef sc, ChartState& S)
+	{
+		const int n = sc.ArraySize;
+		if (n <= 0) return;
+		BaseState& B = S.base;
+		Fit(B.atr, n); Fit(B.tr, n); Fit(B.tradingDay, n); Fit(B.isRth, n); Fit(B.rthSession, n);
+		Fit(B.secIntoRth, n); Fit(B.dayStartIdx, n); Fit(B.rthStartIdx, n); Fit(B.lastRthId, n);
+		int from = B.computedThrough + 1;
+		if (from < 0) from = 0;
+		if (from > n - 1) from = n - 1;
+		const BaseParams& P = S.params.base;
+		const int len = Max(1, P.atrLength);
+		for (int i = from; i < n; ++i)
+		{
+			const float h = sc.High[i], l = sc.Low[i];
+			const float pc = i > 0 ? sc.Close[i - 1] : sc.Open[i];
+			float tr = h - l;
+			tr = Max(tr, static_cast<float>(fabs(h - pc)));
+			tr = Max(tr, static_cast<float>(fabs(l - pc)));
+			B.tr[i] = tr;
+			if (i == 0) B.atr[i] = tr;
+			else if (i < len) B.atr[i] = (B.atr[i - 1] * i + tr) / (i + 1);
+			else B.atr[i] = (B.atr[i - 1] * (len - 1) + tr) / len;
+			if (B.atr[i] <= 0) B.atr[i] = Max(S.tickSize, tr);
+
+			const SCDateTime& dt = sc.BaseDateTimeIn[i];
+			B.tradingDay[i] = sc.GetTradingDayDate(dt);
+			const int tod = dt.GetTimeInSeconds();
+			const bool rth = (P.rthStartSec < P.rthEndSec) ? (tod >= P.rthStartSec && tod < P.rthEndSec) : (tod >= P.rthStartSec || tod < P.rthEndSec);
+			B.isRth[i] = rth ? 1 : 0;
+			const bool newDay = (i == 0) || (B.tradingDay[i] != B.tradingDay[i - 1]);
+			B.dayStartIdx[i] = newDay ? i : B.dayStartIdx[i - 1];
+			const int prevLastId = (i > 0) ? B.lastRthId[i - 1] : 0;
+			if (rth)
+			{
+				const bool prevRthSameDay = (i > 0) && B.isRth[i - 1] && !newDay;
+				if (!prevRthSameDay) { B.rthSession[i] = prevLastId + 1; B.rthStartIdx[i] = i; }
+				else { B.rthSession[i] = B.rthSession[i - 1]; B.rthStartIdx[i] = B.rthStartIdx[i - 1]; }
+				B.lastRthId[i] = B.rthSession[i];
+				int sec = tod - P.rthStartSec; if (sec < 0) sec += 86400;
+				B.secIntoRth[i] = sec;
+			}
+			else
+			{
+				B.rthSession[i] = -1;
+				B.secIntoRth[i] = -1;
+				B.rthStartIdx[i] = (i > 0 && !newDay) ? B.rthStartIdx[i - 1] : -1;
+				B.lastRthId[i] = prevLastId;
+			}
+		}
+		B.computedThrough = n - 2;
+		B.lastArraySize = n;
+		UpdateDataStamp(sc, S);
+	}
+
+	// Rolling helpers over base arrays
+	inline float AtrAt(const ChartState& S, int i) { return (i >= 0 && i < static_cast<int>(S.base.atr.size())) ? S.base.atr[i] : S.tickSize * 10; }
+
+	// ==== 5  Drawing helpers ====================================================
+
+	inline bool DrawingAlive(SCStudyInterfaceRef sc, int& lineNumber)
+	{
+		if (lineNumber != 0 && sc.ChartDrawingExists(sc.ChartNumber, lineNumber) == 0) lineNumber = 0;
+		return lineNumber != 0;
+	}
+
+	inline void DeleteDrawing(SCStudyInterfaceRef sc, int& lineNumber)
+	{
+		if (lineNumber != 0) { sc.DeleteACSChartDrawing(sc.ChartNumber, TOOL_DELETE_CHARTDRAWING, lineNumber); lineNumber = 0; }
+	}
+
+	void DrawRect(SCStudyInterfaceRef sc, int& lineNumber, int beginIdx, int endIdx, float top, float bottom,
+		uint32_t color, int transparency, const char* text = nullptr)
+	{
+		DrawingAlive(sc, lineNumber);
+		s_UseTool T;
+		T.ChartNumber = sc.ChartNumber; T.DrawingType = DRAWING_RECTANGLEHIGHLIGHT; T.Region = 0;
+		T.AddMethod = UTAM_ADD_OR_ADJUST;
+		if (lineNumber != 0) T.LineNumber = lineNumber;
+		T.BeginIndex = Max(0, beginIdx); T.EndIndex = Max(beginIdx, endIdx);
+		T.BeginValue = top; T.EndValue = bottom;
+		T.Color = color; T.SecondaryColor = color; T.LineWidth = 1; T.TransparencyLevel = transparency;
+		if (text) { T.Text = text; T.FontSize = 8; T.TextAlignment = DT_LEFT | DT_TOP; }
+		if (sc.UseTool(T) > 0) lineNumber = T.LineNumber;
+	}
+
+	void DrawMarker(SCStudyInterfaceRef sc, int& lineNumber, int idx, float value, int markerType, int size, uint32_t color, int lineWidth = 2)
+	{
+		DrawingAlive(sc, lineNumber);
+		s_UseTool T;
+		T.ChartNumber = sc.ChartNumber; T.DrawingType = DRAWING_MARKER; T.Region = 0; T.AddMethod = UTAM_ADD_OR_ADJUST;
+		if (lineNumber != 0) T.LineNumber = lineNumber;
+		T.BeginIndex = idx; T.BeginValue = value; T.MarkerType = markerType; T.MarkerSize = size; T.Color = color; T.LineWidth = static_cast<uint16_t>(lineWidth);
+		if (sc.UseTool(T) > 0) lineNumber = T.LineNumber;
+	}
+
+	void DrawSegment(SCStudyInterfaceRef sc, int& lineNumber, int beginIdx, int endIdx, float value, uint32_t color, int width, int style)
+	{
+		DrawingAlive(sc, lineNumber);
+		s_UseTool T;
+		T.ChartNumber = sc.ChartNumber; T.DrawingType = DRAWING_LINE; T.Region = 0; T.AddMethod = UTAM_ADD_OR_ADJUST;
+		if (lineNumber != 0) T.LineNumber = lineNumber;
+		T.BeginIndex = beginIdx; T.EndIndex = endIdx; T.BeginValue = value; T.EndValue = value;
+		T.Color = color; T.LineWidth = static_cast<uint16_t>(width); T.LineStyle = static_cast<SubgraphLineStyles>(style);
+		if (sc.UseTool(T) > 0) lineNumber = T.LineNumber;
+	}
+
+	void DrawRay(SCStudyInterfaceRef sc, int& lineNumber, int beginIdx, float value, uint32_t color, int width, int style, const char* text = nullptr)
+	{
+		DrawingAlive(sc, lineNumber);
+		s_UseTool T;
+		T.ChartNumber = sc.ChartNumber; T.DrawingType = DRAWING_HORIZONTAL_RAY; T.Region = 0; T.AddMethod = UTAM_ADD_OR_ADJUST;
+		if (lineNumber != 0) T.LineNumber = lineNumber;
+		T.BeginIndex = beginIdx; T.BeginValue = value; T.EndValue = value;
+		T.Color = color; T.LineWidth = static_cast<uint16_t>(width); T.LineStyle = static_cast<SubgraphLineStyles>(style);
+		if (text) { T.Text = text; T.FontSize = 8; T.ShowPrice = 0; }
+		if (sc.UseTool(T) > 0) lineNumber = T.LineNumber;
+	}
+
+	void DrawLabel(SCStudyInterfaceRef sc, int& lineNumber, int idx, float value, const char* text, uint32_t color, int fontSize, bool bold)
+	{
+		DrawingAlive(sc, lineNumber);
+		s_UseTool T;
+		T.ChartNumber = sc.ChartNumber; T.DrawingType = DRAWING_TEXT; T.Region = 0; T.AddMethod = UTAM_ADD_OR_ADJUST;
+		if (lineNumber != 0) T.LineNumber = lineNumber;
+		T.BeginIndex = idx; T.BeginValue = value; T.Text = text; T.Color = color; T.FontSize = fontSize; T.FontBold = bold ? 1 : 0;
+		T.TransparentLabelBackground = 1; T.TextAlignment = DT_LEFT | DT_BOTTOM;
+		if (sc.UseTool(T) > 0) lineNumber = T.LineNumber;
+	}
+
+	// ==== 6  Auction / Structure engine (phase 2) ===============================
+	void EnsureAuction(SCStudyInterfaceRef sc, ChartState& S);
+	// ==== 7  VWAP engine (phase 2) ==============================================
+	void EnsureVwap(SCStudyInterfaceRef sc, ChartState& S);
+	// ==== 8  Order Flow engine (phase 3) ========================================
+	void EnsureFlow(SCStudyInterfaceRef sc, ChartState& S);
+	// ==== 9  Regime + MTF (phase 4) =============================================
+	void EnsureRegime(SCStudyInterfaceRef sc, ChartState& S);
+	// ==== 10 Intermarket (phase 5) ==============================================
+	void EnsureInter(SCStudyInterfaceRef sc, ChartState& S);
+	// ==== 11 DCS (phase 6) ======================================================
+	void EnsureDcs(SCStudyInterfaceRef sc, ChartState& S);
+	// ==== 12 Validation (phase 7) ===============================================
+	void EnsureVal(SCStudyInterfaceRef sc, ChartState& S);
+	// ==== 13 Logger (phase 7) ===================================================
+	void EnsureLog(SCStudyInterfaceRef sc, ChartState& S);
+
+	// Phase-1 stubs: size arrays and mark computed so downstream code is safe.
+	void EnsureAuction(SCStudyInterfaceRef sc, ChartState& S)
+	{
+		EnsureBase(sc, S); const int n = sc.ArraySize; AuctionState& A = S.auction;
+		Fit(A.poc, n); Fit(A.vah, n); Fit(A.val, n); Fit(A.pdPoc, n); Fit(A.pdVah, n); Fit(A.pdVal, n); Fit(A.pdh, n); Fit(A.pdl, n);
+		Fit(A.onHigh, n); Fit(A.onLow, n); Fit(A.ibHigh, n); Fit(A.ibLow, n); Fit(A.ibDone, n);
+		Fit(A.structTrend, n); Fit(A.bos, n); Fit(A.vaPos, n); Fit(A.pocPos, n); Fit(A.ibPos, n); Fit(A.valueMig, n); Fit(A.openTypeDir, n);
+		Fit(A.openType, n); Fit(A.swingHighMark, n); Fit(A.swingLowMark, n); Fit(A.bosMark, n); Fit(A.chochMark, n);
+		A.computedThrough = n - 2; A.lastArraySize = n;
+	}
+	void EnsureVwap(SCStudyInterfaceRef sc, ChartState& S)
+	{
+		EnsureAuction(sc, S); const int n = sc.ArraySize; VwapState& V = S.vwap;
+		Fit(V.vwap, n); Fit(V.sd, n); Fit(V.b1u, n); Fit(V.b1d, n); Fit(V.b2u, n); Fit(V.b2d, n); Fit(V.b3u, n); Fit(V.b3d, n);
+		Fit(V.avOn, n); Fit(V.avRth, n); Fit(V.avSwHi, n); Fit(V.avSwLo, n); Fit(V.slope, n); Fit(V.pos, n); Fit(V.accept, n);
+		V.computedThrough = n - 2; V.lastArraySize = n;
+	}
+	void EnsureFlow(SCStudyInterfaceRef sc, ChartState& S)
+	{
+		EnsureVwap(sc, S); const int n = sc.ArraySize; FlowState& F = S.flow;
+		Fit(F.delta, n); Fit(F.deltaPct, n); Fit(F.cvd, n); Fit(F.cvdZ, n); Fit(F.volZ, n);
+		Fit(F.fAbsorb, n); Fit(F.fExhaust, n); Fit(F.fImb, n); Fit(F.fTrapped, n); Fit(F.fCvdDiv, n); Fit(F.fLarge, n);
+		Fit(F.absorbMark, n); Fit(F.exhaustMark, n); Fit(F.imbMark, n); Fit(F.trapMark, n); Fit(F.divMark, n);
+		F.computedThrough = n - 2; F.lastArraySize = n;
+	}
+	void EnsureRegime(SCStudyInterfaceRef sc, ChartState& S)
+	{
+		EnsureFlow(sc, S); const int n = sc.ArraySize; RegimeState& R = S.regime;
+		Fit(R.er, n); Fit(R.atrRatio, n); Fit(R.regimeTrend, n); Fit(R.mtfBias, n); Fit(R.regime, n);
+		Fit(R.mtf1, n); Fit(R.mtf5, n); Fit(R.mtf15, n); Fit(R.mtf60, n); Fit(R.atrFast, n); Fit(R.atrSlow, n);
+		R.computedThrough = n - 2; R.lastArraySize = n;
+	}
+	void EnsureInter(SCStudyInterfaceRef sc, ChartState& S)
+	{
+		EnsureRegime(sc, S); const int n = sc.ArraySize; InterState& I = S.inter;
+		Fit(I.rsYM, n); Fit(I.rsES, n); Fit(I.rsRTY, n); Fit(I.rsIndex, n); Fit(I.smt, n); Fit(I.tickCum, n); Fit(I.tickExt, n);
+		Fit(I.tickDiv, n); Fit(I.megaCap, n); Fit(I.composite, n); Fit(I.smtMark, n);
+		I.computedThrough = n - 2; I.lastArraySize = n;
+	}
+	void EnsureDcs(SCStudyInterfaceRef sc, ChartState& S)
+	{
+		EnsureInter(sc, S); const int n = sc.ArraySize; DcsState& D = S.dcs;
+		Fit(D.feat, n * F_COUNT); Fit(D.dcs, n); Fit(D.dcsSmooth, n); Fit(D.barState, n); Fit(D.signalType, n); Fit(D.signalDir, n);
+		D.computedThrough = n - 2; D.lastArraySize = n;
+	}
+	void EnsureVal(SCStudyInterfaceRef sc, ChartState& S)
+	{
+		EnsureDcs(sc, S); const int n = sc.ArraySize; Fit(S.val.cumR, n);
+		S.val.computedThrough = n - 2; S.val.lastArraySize = n;
+	}
+	void EnsureLog(SCStudyInterfaceRef sc, ChartState& S)
+	{
+		EnsureVal(sc, S); S.log.computedThrough = sc.ArraySize - 2; S.log.lastArraySize = sc.ArraySize;
+	}
+
+	// ==== 14 HUD snapshot + GDI =================================================
+
+	void CheckWarnings(SCStudyInterfaceRef sc, ChartState& S)
+	{
+		Warnings& W = S.warn;
+		W.storageNotTick = (sc.IntradayDataStorageTimeUnit != kStorageUnitTick);
+		W.tzNotNY = false;
+		if (sc.GetChartTimeZone != nullptr)
+		{
+			SCString tz = sc.GetChartTimeZone(sc.ChartNumber);
+			const char* s = tz.GetChars();
+			std::string t = s ? s : "";
+			for (size_t k = 0; k < t.size(); ++k) t[k] = static_cast<char>(tolower(static_cast<unsigned char>(t[k])));
+			W.tzNotNY = !(t.find("new_york") != std::string::npos || t.find("new york") != std::string::npos || t.find("eastern") != std::string::npos);
+		}
+		W.vapOff = (sc.MaintainVolumeAtPriceData == 0);
+		W.noDepth = (sc.GetBidMarketDepthNumberOfLevels != nullptr) ? (sc.GetBidMarketDepthNumberOfLevels() <= 0) : true;
+		W.text[0] = 0;
+		if (W.storageNotTick) strcat_s(W.text, sizeof(W.text), "Storage unit must be 1 TICK (Global Settings>>Data/Trade Service Settings)\n");
+		if (W.tzNotNY) strcat_s(W.text, sizeof(W.text), "Chart time zone must be New York (Chart>>Chart Settings)\n");
+		if (W.vapOff) strcat_s(W.text, sizeof(W.text), "Volume at Price data off (reload chart after adding NQ Edge studies)\n");
+		if (W.interMissing[0]) { strcat_s(W.text, sizeof(W.text), "Missing intermarket: "); strcat_s(W.text, sizeof(W.text), W.interMissing); strcat_s(W.text, sizeof(W.text), "\n"); }
+		if (W.noDepth) strcat_s(W.text, sizeof(W.text), "No market depth (optional; depth features disabled)\n");
+	}
+
+	void BuildHudSnapshot(SCStudyInterfaceRef sc, ChartState& S)
+	{
+		HudSnapshot& H = S.hud;
+		const int n = sc.ArraySize;
+		const int i = n - 2;   // last closed bar
+		H.lastClosedIdx = i;
+		if (i < 0) return;
+		H.close = sc.Close[n - 1];
+		H.atr = AtrAt(S, i);
+		if (i < static_cast<int>(S.dcs.dcs.size()))
+		{
+			H.dcs = S.dcs.dcs[i]; H.dcsSmooth = S.dcs.dcsSmooth[i];
+			H.dcsTrend = (i >= 5) ? S.dcs.dcs[i] - S.dcs.dcs[i - 5] : 0;
+			H.barState = S.dcs.barState[i];
+			H.bias = (H.dcs >= S.dcs.weights.thrSignal) ? 1 : (H.dcs <= -S.dcs.weights.thrSignal ? -1 : 0);
+		}
+		if (i < static_cast<int>(S.regime.regime.size()))
+		{
+			H.regime = S.regime.regime[i];
+			H.mtf[0] = S.regime.mtf1[i]; H.mtf[1] = S.regime.mtf5[i]; H.mtf[2] = S.regime.mtf15[i]; H.mtf[3] = S.regime.mtf60[i];
+		}
+		if (i < static_cast<int>(S.auction.openType.size())) { H.openType = S.auction.openType[i]; H.valueMig = S.auction.valueMig[i]; }
+		if (i < static_cast<int>(S.flow.cvdZ.size()))
+		{
+			H.cvdZ = S.flow.cvdZ[i]; H.cvdTrend = H.cvdZ > 0.5f ? 1 : (H.cvdZ < -0.5f ? -1 : 0);
+			strcpy_s(H.lastEvent, sizeof(H.lastEvent), S.flow.lastEventText); H.lastEventPrice = S.flow.lastEventPrice;
+		}
+		H.signalsTotal = static_cast<int>(S.dcs.signals.size());
+		if (i < static_cast<int>(S.vwap.vwap.size()) && S.vwap.vwap[i] > 0)
+			sprintf_s(H.vwapText, sizeof(H.vwapText), "VWAP %s", sc.FormatGraphValue(S.vwap.vwap[i], sc.BaseGraphValueFormat).GetChars());
+		else H.vwapText[0] = 0;
+	}
+
+	inline n_ACSIL::s_GraphicsColor GColor(uint32_t c) { n_ACSIL::s_GraphicsColor g; g.SetColorValue(c); return g; }
+
+	struct HudPainter
+	{
+		SCStudyInterfaceRef sc; int x, y, w, lineH, fontPt; uint32_t textColor;
+		HudPainter(SCStudyInterfaceRef s, int px, int py, int pw, int lh, int fp, uint32_t tc) : sc(s), x(px), y(py), w(pw), lineH(lh), fontPt(fp), textColor(tc) {}
+		void Font(int pt, bool bold)
+		{
+			n_ACSIL::s_GraphicsFont f; f.m_FaceName = "Consolas"; f.m_Height = pt; f.m_Weight = bold ? FW_BOLD : FW_NORMAL;
+			sc.Graphics.SetTextFont(f);
+		}
+		void Text(const char* s, uint32_t color, int dx = 0) { sc.Graphics.SetTextColor(GColor(color)); sc.Graphics.DrawTextAt(SCString(s), x + 8 + dx, y); }
+		void Line(const char* s, uint32_t color) { Text(s, color); y += lineH; }
+		int TextWidth(const char* s) { n_ACSIL::s_GraphicsSize sz; sc.Graphics.GetTextSize(SCString(s), sz); return sz.Width; }
+		void Dot(int cx, int cy, int r, uint32_t color)
+		{
+			n_ACSIL::s_GraphicsBrush b; b.m_BrushType = n_ACSIL::s_GraphicsBrush::BRUSH_TYPE_SOLID; b.m_BrushColor.SetColorValue(color);
+			n_ACSIL::s_GraphicsPen p; p.m_PenColor.SetColorValue(color); p.m_Width = 1; sc.Graphics.SetPen(p);
+			sc.Graphics.FillEllipse(cx - r, cy - r, cx + r, cy + r, b);
+		}
+		void Box(int left, int top, int right, int bottom, uint32_t color)
+		{
+			n_ACSIL::s_GraphicsBrush b; b.m_BrushType = n_ACSIL::s_GraphicsBrush::BRUSH_TYPE_SOLID; b.m_BrushColor.SetColorValue(color);
+			n_ACSIL::s_GraphicsRectangle r; r.Left = left; r.Top = top; r.Right = right; r.Bottom = bottom;
+			sc.Graphics.FillRectangle(r, b);
+		}
+	};
+
+	// HUD input indices (shared by the study function and the GDI callback)
+	enum HudInput
+	{
+		HI_POSITION = 0, HI_PRESET, HI_FONT, HI_WIDTH, HI_OPACITY, HI_PAINT, HI_SHOW_WARN, HI_SHOW_STATS, HI_SHOW_INTER, HI_SHOW_FLOW, HI_SHOW_LEVELS,
+		HI_C_BG, HI_C_TEXT, HI_C_BULL, HI_C_BEAR, HI_C_NEUTRAL, HI_C_LEVEL, HI_C_VWAP, HI_C_WARN,
+		HI_C_STRONG_BULL, HI_C_WEAK_BULL, HI_C_NEUTRAL_BAR, HI_C_WEAK_BEAR, HI_C_STRONG_BEAR, HI_COUNT
+	};
+
+	void DrawHUD(HWND WindowHandle, HDC DeviceContext, SCStudyInterfaceRef sc)
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_mutex);
+		ChartState* Sp = Peek(sc.ChartNumber);
+		if (Sp == nullptr) return;
+		ChartState& S = *Sp;
+		const HudSnapshot& H = S.hud;
+		if (sc.Graphics.DrawTextAt == nullptr || sc.Graphics.FillRectangle == nullptr) return;
+
+		const int fontPt = Max(7, sc.Input[HI_FONT].GetInt());
+		const int lineH = fontPt + 6;
+		const int panelW = Max(200, sc.Input[HI_WIDTH].GetInt());
+		const bool full = sc.Input[HI_PRESET].GetIndex() == 1;
+		const uint32_t cBg = sc.Input[HI_C_BG].GetColor(), cText = sc.Input[HI_C_TEXT].GetColor();
+		const uint32_t cBull = sc.Input[HI_C_BULL].GetColor(), cBear = sc.Input[HI_C_BEAR].GetColor(), cNeu = sc.Input[HI_C_NEUTRAL].GetColor();
+		const uint32_t cLevel = sc.Input[HI_C_LEVEL].GetColor(), cVwap = sc.Input[HI_C_VWAP].GetColor(), cWarn = sc.Input[HI_C_WARN].GetColor();
+
+		// line budget
+		int lines = 2;                      // bias + regime
+		lines += 1;                         // mtf
+		if (sc.Input[HI_SHOW_INTER].GetYesNo()) lines += 1;
+		if (sc.Input[HI_SHOW_FLOW].GetYesNo()) lines += 1;
+		if (sc.Input[HI_SHOW_LEVELS].GetYesNo()) lines += 1;
+		lines += 1;                         // state line
+		if (full && sc.Input[HI_SHOW_STATS].GetYesNo()) lines += 2;
+		int warnLines = 0;
+		if (sc.Input[HI_SHOW_WARN].GetYesNo() && S.warn.text[0]) { for (const char* p = S.warn.text; *p; ++p) if (*p == '\n') ++warnLines; }
+		lines += warnLines;
+		const int panelH = lines * lineH + lineH + 10;
+
+		const int pos = sc.Input[HI_POSITION].GetIndex();
+		const int left0 = sc.StudyRegionLeftCoordinate, top0 = sc.StudyRegionTopCoordinate;
+		const int right0 = sc.StudyRegionRightCoordinate, bottom0 = sc.StudyRegionBottomCoordinate;
+		int px = left0 + 10, py = top0 + 10;
+		if (pos == 1 || pos == 3) px = right0 - panelW - 10;
+		if (pos == 2 || pos == 3) py = bottom0 - panelH - 10;
+		if (px < left0) px = left0; if (py < top0) py = top0;
+
+		// panel background
+		n_ACSIL::s_GraphicsRectangle rect; rect.Left = px; rect.Top = py; rect.Right = px + panelW; rect.Bottom = py + panelH;
+		const int opacity = Clamp(sc.Input[HI_OPACITY].GetInt(), 0, 100);
+		if (sc.Graphics.FillRectangleWithColorTransparent != nullptr && opacity < 100)
+			sc.Graphics.FillRectangleWithColorTransparent(rect, GColor(cBg), static_cast<uint8_t>(100 - opacity));
+		else
+			sc.Graphics.FillRectangleWithColor(rect, GColor(cBg));
+		if (sc.Graphics.SetBackgroundMode != nullptr) sc.Graphics.SetBackgroundMode(TRANSPARENT);
+		if (sc.Graphics.SetTextAlign != nullptr) sc.Graphics.SetTextAlign(TA_LEFT | TA_TOP | TA_NOUPDATECP);
+
+		HudPainter P(sc, px, py + 5, panelW, lineH, fontPt, cText);
+		char buf[256];
+
+		// 1. BIAS line
+		P.Font(fontPt + 4, true);
+		const char* biasTxt = H.bias > 0 ? "BIAS: LONG" : (H.bias < 0 ? "BIAS: SHORT" : "BIAS: NEUTRAL");
+		const uint32_t biasCol = H.bias > 0 ? cBull : (H.bias < 0 ? cBear : cNeu);
+		P.Text(biasTxt, biasCol);
+		P.Font(fontPt, true);
+		const char* arrow = H.dcsTrend > 5 ? "^" : (H.dcsTrend < -5 ? "v" : "-");
+		sprintf_s(buf, sizeof(buf), "DCS %+.0f  %s", H.dcs, arrow);
+		P.Text(buf, H.dcs > 0 ? cBull : (H.dcs < 0 ? cBear : cNeu), panelW / 2 + 10);
+		P.y += lineH + 6;
+
+		// 2. regime / open / value
+		P.Font(fontPt, false);
+		const uint32_t regCol = (H.regime == RG_TREND_UP) ? cBull : (H.regime == RG_TREND_DOWN ? cBear : cNeu);
+		sprintf_s(buf, sizeof(buf), "%-14s %s", kRegimeNames[Clamp(H.regime, 0, 4)], full ? kOpenTypeNames[Clamp(H.openType, 0, 7)] : "");
+		P.Line(buf, regCol);
+		if (full)
+		{
+			const char* vm = H.valueMig > 0.5f ? "Value HIGHER" : (H.valueMig < -0.5f ? "Value LOWER" : "Value OVERLAP");
+			sprintf_s(buf, sizeof(buf), "%s   %s", vm, H.vwapText);
+			P.Line(buf, H.valueMig > 0.5f ? cBull : (H.valueMig < -0.5f ? cBear : cNeu));
+		}
+
+		// 3. MTF strip
+		{
+			static const char* names[4] = { "1m", "5m", "15m", "60m" };
+			int cx = px + 8;
+			P.Text("MTF", cText);
+			cx += P.TextWidth("MTF ") + 6;
+			for (int k = 0; k < 4; ++k)
+			{
+				const uint32_t c = !H.mtfAvail[k] ? RGB(70, 70, 70) : (H.mtf[k] > 0 ? cBull : (H.mtf[k] < 0 ? cBear : cNeu));
+				P.Box(cx, P.y + 2, cx + 34, P.y + lineH - 3, c);
+				sc.Graphics.SetTextColor(GColor(RGB(0, 0, 0)));
+				sc.Graphics.DrawTextAt(SCString(names[k]), cx + 6, P.y + 1);
+				cx += 40;
+			}
+			P.y += lineH;
+		}
+
+		// 4. intermarket
+		if (sc.Input[HI_SHOW_INTER].GetYesNo())
+		{
+			int cx = px + 8;
+			P.Text("MKT", cText); cx += P.TextWidth("MKT ") + 6;
+			struct Item { const char* name; int v; bool avail; };
+			Item items[8]; int cnt = 0;
+			items[cnt++] = { "YM", H.ym, H.ymAvail };
+			items[cnt++] = { "TICK", H.tick, H.tickAvail };
+			for (int k = 0; k < H.megaCount && k < 6; ++k) items[cnt++] = { H.megaNames[k], H.mega[k], true };
+			for (int k = 0; k < cnt; ++k)
+			{
+				const uint32_t c = !items[k].avail ? RGB(70, 70, 70) : (items[k].v > 0 ? cBull : (items[k].v < 0 ? cBear : cNeu));
+				P.Dot(cx + 5, P.y + lineH / 2, 4, c);
+				sc.Graphics.SetTextColor(GColor(cText));
+				sc.Graphics.DrawTextAt(SCString(items[k].name), cx + 12, P.y);
+				cx += 12 + P.TextWidth(items[k].name) + 10;
+			}
+			if (H.smt != 0) { sc.Graphics.SetTextColor(GColor(cWarn)); sc.Graphics.DrawTextAt(SCString(H.smt > 0 ? "SMT+" : "SMT-"), cx + 4, P.y); }
+			P.y += lineH;
+		}
+
+		// 5. order flow
+		if (sc.Input[HI_SHOW_FLOW].GetYesNo())
+		{
+			const char* cvdT = H.cvdTrend > 0 ? "CVD up" : (H.cvdTrend < 0 ? "CVD down" : "CVD flat");
+			if (H.lastEvent[0]) sprintf_s(buf, sizeof(buf), "%s (z%+.1f)  %s @ %s", cvdT, H.cvdZ, H.lastEvent, sc.FormatGraphValue(H.lastEventPrice, sc.BaseGraphValueFormat).GetChars());
+			else sprintf_s(buf, sizeof(buf), "%s (z%+.1f)", cvdT, H.cvdZ);
+			P.Line(buf, H.cvdTrend > 0 ? cBull : (H.cvdTrend < 0 ? cBear : cNeu));
+		}
+
+		// 6. nearest levels
+		if (sc.Input[HI_SHOW_LEVELS].GetYesNo())
+		{
+			const float ts = S.tickSize > 0 ? S.tickSize : 0.25f;
+			if (H.resPrice > 0 && H.supPrice > 0)
+				sprintf_s(buf, sizeof(buf), "R %s +%d t (%.1f A) | S %s -%d t (%.1f A)",
+					sc.FormatGraphValue(H.resPrice, sc.BaseGraphValueFormat).GetChars(), static_cast<int>((H.resPrice - H.close) / ts + 0.5f), H.atr > 0 ? (H.resPrice - H.close) / H.atr : 0,
+					sc.FormatGraphValue(H.supPrice, sc.BaseGraphValueFormat).GetChars(), static_cast<int>((H.close - H.supPrice) / ts + 0.5f), H.atr > 0 ? (H.close - H.supPrice) / H.atr : 0);
+			else sprintf_s(buf, sizeof(buf), "Levels: waiting for session data");
+			P.Line(buf, cLevel);
+		}
+
+		// 7. state line
+		P.Font(fontPt, true);
+		P.Line(H.stateLine[0] ? H.stateLine : "Warming up...", cVwap);
+		P.Font(fontPt, false);
+
+		// 8. stats
+		if (full && sc.Input[HI_SHOW_STATS].GetYesNo())
+		{
+			if (H.statsAvail && H.curStats.count > 0)
+			{
+				const SetupStats& st = H.curStats;
+				const double pf = st.sumLossR < 0 ? st.sumWinR / -st.sumLossR : (st.sumWinR > 0 ? 99.0 : 0.0);
+				sprintf_s(buf, sizeof(buf), "%s: n=%d win %.0f%% avgR %+.2f PF %.2f%s", kSetupNames[Clamp(H.curSetup, 0, SETUP_COUNT - 1)], st.count,
+					100.0 * st.wins / Max(1, st.wins + st.losses), st.sumR / st.count, pf, st.count < S.params.val.minSample ? "  (small n)" : "");
+				P.Line(buf, st.count < S.params.val.minSample ? cWarn : cText);
+				sprintf_s(buf, sizeof(buf), "T2 %.0f%%  MFE %.2fR  MAE %.2fR  %d signals total", 100.0 * st.t2 / st.count, st.sumMfe / st.count, st.sumMae / st.count, H.signalsTotal);
+				P.Line(buf, cText);
+			}
+			else { P.Line("Stats: no resolved signals yet", cNeu); P.Line("", cNeu); }
+		}
+
+		// 9. warnings
+		if (sc.Input[HI_SHOW_WARN].GetYesNo() && S.warn.text[0])
+		{
+			const char* p = S.warn.text;
+			while (*p)
+			{
+				const char* e = strchr(p, '\n'); if (!e) e = p + strlen(p);
+				std::string ln(p, e);
+				P.Line(ln.c_str(), cWarn);
+				p = *e ? e + 1 : e;
+			}
+		}
+	}
+} // namespace nqe
+
+using namespace nqe;
+
+// ==== 15 Study functions ======================================================
+
+// Helper: colour input declaration
+#define NQE_COLOR_INPUT(IDX, NAME, R, G, B) { sc.Input[IDX].Name = NAME; sc.Input[IDX].SetColor(RGB(R, G, B)); }
+#define NQE_YESNO_INPUT(IDX, NAME, V)       { sc.Input[IDX].Name = NAME; sc.Input[IDX].SetYesNo(V); }
+#define NQE_INT_INPUT(IDX, NAME, V, LO, HI) { sc.Input[IDX].Name = NAME; sc.Input[IDX].SetInt(V); sc.Input[IDX].SetIntLimits(LO, HI); }
+#define NQE_FLT_INPUT(IDX, NAME, V, LO, HI) { sc.Input[IDX].Name = NAME; sc.Input[IDX].SetFloat(static_cast<float>(V)); sc.Input[IDX].SetFloatLimits(static_cast<float>(LO), static_cast<float>(HI)); }
+
+// --- 1. Auction / Structure ---------------------------------------------------
+enum AuctionInput
+{
+	AI_RTH_START = 0, AI_RTH_END, AI_ATR_LEN, AI_IB_MIN, AI_OPEN_MIN, AI_VA_PCT, AI_PROF_TICKS, AI_NAKED_N, AI_TPO_MIN,
+	AI_SWING_N, AI_SWING_ATR, AI_EQ_TOL, AI_BOS_DECAY, AI_IBEXT_A, AI_IBEXT_B, AI_IBEXT_C,
+	AI_D_DEVVA, AI_D_PDVA, AI_D_NAKED, AI_D_SINGLE, AI_D_ON, AI_D_IB, AI_D_PDHL, AI_D_SWING, AI_D_BOS, AI_D_LIQ, AI_MAX_ZONES,
+	AI_C_POC, AI_C_VA, AI_C_PD, AI_C_NAKED, AI_C_SINGLE, AI_C_ON, AI_C_IB, AI_C_IBEXT, AI_C_SWH, AI_C_SWL, AI_C_BOS, AI_C_CHOCH, AI_C_LIQ, AI_COUNT
+};
+enum AuctionSubgraph
+{
+	AS_POC = 0, AS_VAH, AS_VAL, AS_PDPOC, AS_PDVAH, AS_PDVAL, AS_ONH, AS_ONL, AS_IBH, AS_IBL, AS_IBEXT_AU, AS_IBEXT_AD, AS_IBEXT_BU, AS_IBEXT_BD,
+	AS_IBEXT_CU, AS_IBEXT_CD, AS_PDH, AS_PDL, AS_SWH, AS_SWL, AS_BOSU, AS_BOSD, AS_CHU, AS_CHD, AS_F_STRUCT, AS_F_BOS, AS_F_VAPOS, AS_F_POCPOS,
+	AS_F_IBPOS, AS_F_VALMIG, AS_F_OPEN, AS_COUNT
+};
+
+SCSFExport scsf_NQEdge_Auction(SCStudyInterfaceRef sc)
+{
+	if (sc.SetDefaults)
+	{
+		sc.GraphName = "NQ Edge: Auction/Structure Engine";
+		sc.StudyDescription = "Developing/prior-day volume profile, naked POCs, single prints, ON range, IB, swings, BOS/CHoCH, liquidity pools. Owns the session and ATR settings for the whole suite.";
+		sc.GraphRegion = 0; sc.AutoLoop = 0; sc.CalculationPrecedence = STD_PREC_LEVEL; sc.ValueFormat = VALUEFORMAT_INHERITED;
+		sc.MaintainVolumeAtPriceData = 1; sc.ScaleRangeType = SCALE_SAMEASREGION; sc.DrawZeros = 0;
+
+		const char* names[AS_COUNT] = { "Dev POC", "Dev VAH", "Dev VAL", "PD POC", "PD VAH", "PD VAL", "ON High", "ON Low", "IB High", "IB Low",
+			"IB Ext A Up", "IB Ext A Dn", "IB Ext B Up", "IB Ext B Dn", "IB Ext C Up", "IB Ext C Dn", "PDH", "PDL", "Swing High", "Swing Low",
+			"BOS Up", "BOS Down", "CHoCH Up", "CHoCH Down", "f.structTrend", "f.bos", "f.vaPos", "f.pocPos", "f.ibPos", "f.valueMig", "f.openType" };
+		for (int k = 0; k < AS_COUNT; ++k)
+		{
+			sc.Subgraph[k].Name = names[k]; sc.Subgraph[k].DrawZeros = 0; sc.Subgraph[k].LineWidth = 1;
+			sc.Subgraph[k].DrawStyle = (k >= AS_F_STRUCT) ? DRAWSTYLE_IGNORE : DRAWSTYLE_DASH;
+		}
+		sc.Subgraph[AS_POC].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[AS_POC].LineWidth = 2;
+		sc.Subgraph[AS_SWH].DrawStyle = DRAWSTYLE_TRIANGLE_DOWN; sc.Subgraph[AS_SWL].DrawStyle = DRAWSTYLE_TRIANGLE_UP;
+		sc.Subgraph[AS_BOSU].DrawStyle = DRAWSTYLE_ARROW_UP; sc.Subgraph[AS_BOSD].DrawStyle = DRAWSTYLE_ARROW_DOWN;
+		sc.Subgraph[AS_CHU].DrawStyle = DRAWSTYLE_DIAMOND; sc.Subgraph[AS_CHD].DrawStyle = DRAWSTYLE_DIAMOND;
+		sc.Subgraph[AS_SWH].LineWidth = 3; sc.Subgraph[AS_SWL].LineWidth = 3; sc.Subgraph[AS_BOSU].LineWidth = 3; sc.Subgraph[AS_BOSD].LineWidth = 3; sc.Subgraph[AS_CHU].LineWidth = 3; sc.Subgraph[AS_CHD].LineWidth = 3;
+
+		sc.Input[AI_RTH_START].Name = "Session: RTH Start Time"; sc.Input[AI_RTH_START].SetTime(HMS_TIME(9, 30, 0));
+		sc.Input[AI_RTH_END].Name = "Session: RTH End Time"; sc.Input[AI_RTH_END].SetTime(HMS_TIME(16, 0, 0));
+		NQE_INT_INPUT(AI_ATR_LEN, "Session: ATR Length (suite-wide)", 14, 2, 500);
+		NQE_INT_INPUT(AI_IB_MIN, "Profile: Initial Balance Minutes", 60, 5, 240);
+		NQE_INT_INPUT(AI_OPEN_MIN, "Profile: Open Type Evaluation Minutes", 30, 5, 120);
+		NQE_FLT_INPUT(AI_VA_PCT, "Profile: Value Area Percent", 70.0, 50.0, 95.0);
+		NQE_INT_INPUT(AI_PROF_TICKS, "Profile: Ticks Per Level", 1, 1, 20);
+		NQE_INT_INPUT(AI_NAKED_N, "Profile: Naked POCs To Track", 10, 0, 50);
+		NQE_INT_INPUT(AI_TPO_MIN, "Profile: TPO Period Minutes (single prints)", 30, 5, 120);
+		NQE_INT_INPUT(AI_SWING_N, "Structure: Swing Strength Bars", 5, 2, 50);
+		NQE_FLT_INPUT(AI_SWING_ATR, "Structure: Swing Min Distance (ATR)", 0.5, 0.0, 10.0);
+		NQE_INT_INPUT(AI_EQ_TOL, "Structure: Equal High/Low Tolerance (ticks)", 2, 0, 50);
+		NQE_INT_INPUT(AI_BOS_DECAY, "Structure: BOS/CHoCH Decay Bars", 10, 1, 200);
+		NQE_FLT_INPUT(AI_IBEXT_A, "IB Extension Multiple A", 0.5, 0.0, 5.0);
+		NQE_FLT_INPUT(AI_IBEXT_B, "IB Extension Multiple B", 1.0, 0.0, 5.0);
+		NQE_FLT_INPUT(AI_IBEXT_C, "IB Extension Multiple C", 2.0, 0.0, 5.0);
+		NQE_YESNO_INPUT(AI_D_DEVVA, "Draw: Developing POC/VAH/VAL", 1);
+		NQE_YESNO_INPUT(AI_D_PDVA, "Draw: Prior Day POC/VAH/VAL", 1);
+		NQE_YESNO_INPUT(AI_D_NAKED, "Draw: Naked POCs", 1);
+		NQE_YESNO_INPUT(AI_D_SINGLE, "Draw: Single Prints", 1);
+		NQE_YESNO_INPUT(AI_D_ON, "Draw: Overnight High/Low", 1);
+		NQE_YESNO_INPUT(AI_D_IB, "Draw: IB and Extensions", 1);
+		NQE_YESNO_INPUT(AI_D_PDHL, "Draw: Prior Day High/Low", 1);
+		NQE_YESNO_INPUT(AI_D_SWING, "Draw: Swing Points", 1);
+		NQE_YESNO_INPUT(AI_D_BOS, "Draw: BOS/CHoCH Markers", 1);
+		NQE_YESNO_INPUT(AI_D_LIQ, "Draw: Liquidity Pools", 1);
+		NQE_INT_INPUT(AI_MAX_ZONES, "Draw: Max Zone Drawings", 40, 5, 200);
+		NQE_COLOR_INPUT(AI_C_POC, "Color: Developing POC", 0, 200, 255);
+		NQE_COLOR_INPUT(AI_C_VA, "Color: Developing VAH/VAL", 0, 150, 190);
+		NQE_COLOR_INPUT(AI_C_PD, "Color: Prior Day POC/VA", 120, 120, 160);
+		NQE_COLOR_INPUT(AI_C_NAKED, "Color: Naked POC", 255, 120, 255);
+		NQE_COLOR_INPUT(AI_C_SINGLE, "Color: Single Prints", 160, 120, 60);
+		NQE_COLOR_INPUT(AI_C_ON, "Color: Overnight High/Low", 90, 140, 200);
+		NQE_COLOR_INPUT(AI_C_IB, "Color: Initial Balance", 230, 200, 60);
+		NQE_COLOR_INPUT(AI_C_IBEXT, "Color: IB Extensions", 140, 120, 40);
+		NQE_COLOR_INPUT(AI_C_SWH, "Color: Swing High", 220, 80, 80);
+		NQE_COLOR_INPUT(AI_C_SWL, "Color: Swing Low", 80, 220, 120);
+		NQE_COLOR_INPUT(AI_C_BOS, "Color: BOS", 255, 255, 255);
+		NQE_COLOR_INPUT(AI_C_CHOCH, "Color: CHoCH", 255, 160, 0);
+		NQE_COLOR_INPUT(AI_C_LIQ, "Color: Liquidity Pool", 0, 220, 220);
+		return;
+	}
+	if (sc.LastCallToFunction) { Release(sc, E_AUCTION); return; }
+	std::lock_guard<std::recursive_mutex> lock(g_mutex);
+	ChartState& S = Acquire(sc);
+	S.studyPresent[E_AUCTION] = true;
+	if (sc.MaintainVolumeAtPriceData == 0) { sc.MaintainVolumeAtPriceData = 1; sc.FlagToReloadChartData = 1; }
+
+	BaseParams bp{}; bp.rthStartSec = sc.Input[AI_RTH_START].GetTime(); bp.rthEndSec = sc.Input[AI_RTH_END].GetTime(); bp.atrLength = sc.Input[AI_ATR_LEN].GetInt();
+	SetParams(S, E_BASE, S.params.base, bp);
+	AuctionParams ap{};
+	ap.ibMinutes = sc.Input[AI_IB_MIN].GetInt(); ap.openTypeMinutes = sc.Input[AI_OPEN_MIN].GetInt(); ap.valueAreaPct = sc.Input[AI_VA_PCT].GetFloat();
+	ap.profileTicksPerLevel = sc.Input[AI_PROF_TICKS].GetInt(); ap.nakedPocsTracked = sc.Input[AI_NAKED_N].GetInt(); ap.tpoMinutes = sc.Input[AI_TPO_MIN].GetInt();
+	ap.swingStrength = sc.Input[AI_SWING_N].GetInt(); ap.swingMinAtr = sc.Input[AI_SWING_ATR].GetFloat(); ap.equalTolTicks = sc.Input[AI_EQ_TOL].GetInt();
+	ap.bosDecayBars = sc.Input[AI_BOS_DECAY].GetInt(); ap.ibExtA = sc.Input[AI_IBEXT_A].GetFloat(); ap.ibExtB = sc.Input[AI_IBEXT_B].GetFloat(); ap.ibExtC = sc.Input[AI_IBEXT_C].GetFloat();
+	SetParams(S, E_AUCTION, S.params.auction, ap);
+
+	CheckDataStamp(sc, S);
+	CheckWarnings(sc, S);
+	EnsureAuction(sc, S);
+
+	// Subgraph mirror (phase 2 fills the engine; here arrays are zero)
+	int& gen = sc.GetPersistentInt(1);
+	int start = sc.UpdateStartIndex;
+	if (gen != S.auction.generation) { start = 0; gen = S.auction.generation; }
+	const AuctionState& A = S.auction;
+	for (int i = start; i < sc.ArraySize; ++i)
+	{
+		sc.Subgraph[AS_POC][i] = A.poc[i]; sc.Subgraph[AS_VAH][i] = A.vah[i]; sc.Subgraph[AS_VAL][i] = A.val[i];
+		sc.Subgraph[AS_PDPOC][i] = A.pdPoc[i]; sc.Subgraph[AS_PDVAH][i] = A.pdVah[i]; sc.Subgraph[AS_PDVAL][i] = A.pdVal[i];
+		sc.Subgraph[AS_ONH][i] = A.onHigh[i]; sc.Subgraph[AS_ONL][i] = A.onLow[i]; sc.Subgraph[AS_IBH][i] = A.ibHigh[i]; sc.Subgraph[AS_IBL][i] = A.ibLow[i];
+		sc.Subgraph[AS_PDH][i] = A.pdh[i]; sc.Subgraph[AS_PDL][i] = A.pdl[i];
+		sc.Subgraph[AS_F_STRUCT][i] = A.structTrend[i]; sc.Subgraph[AS_F_BOS][i] = A.bos[i]; sc.Subgraph[AS_F_VAPOS][i] = A.vaPos[i];
+		sc.Subgraph[AS_F_POCPOS][i] = A.pocPos[i]; sc.Subgraph[AS_F_IBPOS][i] = A.ibPos[i]; sc.Subgraph[AS_F_VALMIG][i] = A.valueMig[i]; sc.Subgraph[AS_F_OPEN][i] = A.openTypeDir[i];
+	}
+}
+
+// --- 2. VWAP ------------------------------------------------------------------
+enum VwapInput { VI_ANCHOR = 0, VI_B1, VI_B2, VI_B3, VI_SLOPE, VI_ACCEPT, VI_D_SESSION, VI_D_ON, VI_D_RTH, VI_D_SWING, VI_C_VWAP, VI_C_B1, VI_C_B2, VI_C_B3, VI_C_ON, VI_C_RTH, VI_C_SWH, VI_C_SWL, VI_COUNT };
+enum VwapSubgraph { VS_VWAP = 0, VS_B1U, VS_B1D, VS_B2U, VS_B2D, VS_B3U, VS_B3D, VS_ON, VS_RTH, VS_SWH, VS_SWL, VS_F_SLOPE, VS_F_POS, VS_F_ACCEPT, VS_COUNT };
+
+SCSFExport scsf_NQEdge_VWAP(SCStudyInterfaceRef sc)
+{
+	if (sc.SetDefaults)
+	{
+		sc.GraphName = "NQ Edge: VWAP Engine";
+		sc.StudyDescription = "Session VWAP with variance bands, anchored VWAPs (overnight open, RTH open, last swing high/low), ATR-normalized slope and acceptance state.";
+		sc.GraphRegion = 0; sc.AutoLoop = 0; sc.CalculationPrecedence = STD_PREC_LEVEL; sc.ValueFormat = VALUEFORMAT_INHERITED; sc.ScaleRangeType = SCALE_SAMEASREGION; sc.DrawZeros = 0;
+		const char* names[VS_COUNT] = { "VWAP", "+1 SD", "-1 SD", "+2 SD", "-2 SD", "+3 SD", "-3 SD", "AVWAP ON", "AVWAP RTH", "AVWAP Swing High", "AVWAP Swing Low", "f.vwapSlope", "f.vwapPos", "f.vwapAccept" };
+		for (int k = 0; k < VS_COUNT; ++k) { sc.Subgraph[k].Name = names[k]; sc.Subgraph[k].DrawZeros = 0; sc.Subgraph[k].DrawStyle = k >= VS_F_SLOPE ? DRAWSTYLE_IGNORE : DRAWSTYLE_LINE; sc.Subgraph[k].LineWidth = 1; }
+		sc.Subgraph[VS_VWAP].LineWidth = 2;
+		sc.Input[VI_ANCHOR].Name = "Session VWAP Anchor"; sc.Input[VI_ANCHOR].SetCustomInputStrings("RTH Open;Trading Day Start"); sc.Input[VI_ANCHOR].SetCustomInputIndex(0);
+		NQE_FLT_INPUT(VI_B1, "Band 1 Std Dev Multiplier", 1.0, 0.1, 10.0);
+		NQE_FLT_INPUT(VI_B2, "Band 2 Std Dev Multiplier", 2.0, 0.1, 10.0);
+		NQE_FLT_INPUT(VI_B3, "Band 3 Std Dev Multiplier", 3.0, 0.1, 10.0);
+		NQE_INT_INPUT(VI_SLOPE, "Slope Lookback Bars", 10, 1, 200);
+		NQE_INT_INPUT(VI_ACCEPT, "Acceptance Closes", 3, 1, 20);
+		NQE_YESNO_INPUT(VI_D_SESSION, "Draw: Session VWAP + Bands", 1);
+		NQE_YESNO_INPUT(VI_D_ON, "Draw: Overnight-anchored VWAP", 1);
+		NQE_YESNO_INPUT(VI_D_RTH, "Draw: RTH-anchored VWAP", 0);
+		NQE_YESNO_INPUT(VI_D_SWING, "Draw: Swing-anchored VWAPs", 1);
+		NQE_COLOR_INPUT(VI_C_VWAP, "Color: VWAP", 255, 215, 0);
+		NQE_COLOR_INPUT(VI_C_B1, "Color: Band 1", 190, 170, 60);
+		NQE_COLOR_INPUT(VI_C_B2, "Color: Band 2", 150, 130, 50);
+		NQE_COLOR_INPUT(VI_C_B3, "Color: Band 3", 110, 95, 40);
+		NQE_COLOR_INPUT(VI_C_ON, "Color: AVWAP Overnight", 120, 170, 255);
+		NQE_COLOR_INPUT(VI_C_RTH, "Color: AVWAP RTH", 255, 170, 90);
+		NQE_COLOR_INPUT(VI_C_SWH, "Color: AVWAP Swing High", 230, 100, 100);
+		NQE_COLOR_INPUT(VI_C_SWL, "Color: AVWAP Swing Low", 100, 230, 140);
+		return;
+	}
+	if (sc.LastCallToFunction) { Release(sc, E_VWAP); return; }
+	std::lock_guard<std::recursive_mutex> lock(g_mutex);
+	ChartState& S = Acquire(sc);
+	S.studyPresent[E_VWAP] = true;
+	VwapParams vp{}; vp.anchor = sc.Input[VI_ANCHOR].GetIndex(); vp.band1 = sc.Input[VI_B1].GetFloat(); vp.band2 = sc.Input[VI_B2].GetFloat(); vp.band3 = sc.Input[VI_B3].GetFloat();
+	vp.slopeBars = sc.Input[VI_SLOPE].GetInt(); vp.acceptCloses = sc.Input[VI_ACCEPT].GetInt();
+	SetParams(S, E_VWAP, S.params.vwap, vp);
+	CheckDataStamp(sc, S);
+	EnsureVwap(sc, S);
+
+	// colours + visibility follow inputs
+	sc.Subgraph[VS_VWAP].PrimaryColor = sc.Input[VI_C_VWAP].GetColor();
+	sc.Subgraph[VS_B1U].PrimaryColor = sc.Subgraph[VS_B1D].PrimaryColor = sc.Input[VI_C_B1].GetColor();
+	sc.Subgraph[VS_B2U].PrimaryColor = sc.Subgraph[VS_B2D].PrimaryColor = sc.Input[VI_C_B2].GetColor();
+	sc.Subgraph[VS_B3U].PrimaryColor = sc.Subgraph[VS_B3D].PrimaryColor = sc.Input[VI_C_B3].GetColor();
+	sc.Subgraph[VS_ON].PrimaryColor = sc.Input[VI_C_ON].GetColor(); sc.Subgraph[VS_RTH].PrimaryColor = sc.Input[VI_C_RTH].GetColor();
+	sc.Subgraph[VS_SWH].PrimaryColor = sc.Input[VI_C_SWH].GetColor(); sc.Subgraph[VS_SWL].PrimaryColor = sc.Input[VI_C_SWL].GetColor();
+	const bool dS = sc.Input[VI_D_SESSION].GetYesNo() != 0, dO = sc.Input[VI_D_ON].GetYesNo() != 0, dR = sc.Input[VI_D_RTH].GetYesNo() != 0, dW = sc.Input[VI_D_SWING].GetYesNo() != 0;
+	for (int k = VS_VWAP; k <= VS_B3D; ++k) sc.Subgraph[k].DrawStyle = dS ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE;
+	sc.Subgraph[VS_ON].DrawStyle = dO ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE; sc.Subgraph[VS_RTH].DrawStyle = dR ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE;
+	sc.Subgraph[VS_SWH].DrawStyle = dW ? DRAWSTYLE_DASH : DRAWSTYLE_IGNORE; sc.Subgraph[VS_SWL].DrawStyle = dW ? DRAWSTYLE_DASH : DRAWSTYLE_IGNORE;
+
+	int& gen = sc.GetPersistentInt(1);
+	int start = sc.UpdateStartIndex;
+	if (gen != S.vwap.generation) { start = 0; gen = S.vwap.generation; }
+	const VwapState& V = S.vwap;
+	for (int i = start; i < sc.ArraySize; ++i)
+	{
+		sc.Subgraph[VS_VWAP][i] = V.vwap[i]; sc.Subgraph[VS_B1U][i] = V.b1u[i]; sc.Subgraph[VS_B1D][i] = V.b1d[i]; sc.Subgraph[VS_B2U][i] = V.b2u[i]; sc.Subgraph[VS_B2D][i] = V.b2d[i];
+		sc.Subgraph[VS_B3U][i] = V.b3u[i]; sc.Subgraph[VS_B3D][i] = V.b3d[i]; sc.Subgraph[VS_ON][i] = V.avOn[i]; sc.Subgraph[VS_RTH][i] = V.avRth[i];
+		sc.Subgraph[VS_SWH][i] = V.avSwHi[i]; sc.Subgraph[VS_SWL][i] = V.avSwLo[i]; sc.Subgraph[VS_F_SLOPE][i] = V.slope[i]; sc.Subgraph[VS_F_POS][i] = V.pos[i]; sc.Subgraph[VS_F_ACCEPT][i] = V.accept[i];
+	}
+}
+
+// --- 3. Order Flow ------------------------------------------------------------
+enum FlowInput
+{
+	FI_CVD_RESET = 0, FI_CVD_SLOPE, FI_VOLZ_LEN, FI_ABS_Z, FI_ABS_RANGE, FI_ABS_FRAC, FI_EXH_RUN, FI_EXH_PCT, FI_IMB_RATIO, FI_IMB_MINVOL, FI_IMB_STACK,
+	FI_LT_PCT, FI_LT_MIN, FI_LT_LOOK, FI_LT_MAX, FI_TRAP_LOOK, FI_TRAP_K, FI_TRAP_DELTA, FI_DIV_ATR, FI_DECAY, FI_MAX_ZONES,
+	FI_D_CVD, FI_D_ABS, FI_D_IMB, FI_D_BUBBLE, FI_D_DIV, FI_D_TRAP, FI_D_EXH,
+	FI_C_CVD_UP, FI_C_CVD_DN, FI_C_ABS_BULL, FI_C_ABS_BEAR, FI_C_IMB_BUY, FI_C_IMB_SELL, FI_C_BUB_BUY, FI_C_BUB_SELL, FI_C_DIV, FI_C_TRAP, FI_C_EXH, FI_COUNT
+};
+enum FlowSubgraph { FS_CVD = 0, FS_DELTA, FS_DELTA_PCT, FS_VOLZ, FS_CVDZ, FS_F_ABS, FS_F_EXH, FS_F_IMB, FS_F_TRAP, FS_F_DIV, FS_F_LARGE, FS_COUNT };
+
+SCSFExport scsf_NQEdge_OrderFlow(SCStudyInterfaceRef sc)
+{
+	if (sc.SetDefaults)
+	{
+		sc.GraphName = "NQ Edge: Order Flow Engine";
+		sc.StudyDescription = "Tick-level delta/CVD, CVD divergence, absorption, exhaustion, stacked imbalances, large trades (T&S + VAP), trapped traders. Zones drawn on the price chart.";
+		sc.GraphRegion = 1; sc.AutoLoop = 0; sc.CalculationPrecedence = STD_PREC_LEVEL; sc.ValueFormat = 0; sc.MaintainVolumeAtPriceData = 1; sc.DrawZeros = 0;
+		const char* names[FS_COUNT] = { "CVD", "Delta", "Delta %", "Volume Z", "CVD Z", "f.absorb", "f.exhaust", "f.imbalance", "f.trapped", "f.cvdDiv", "f.largeTrade" };
+		for (int k = 0; k < FS_COUNT; ++k) { sc.Subgraph[k].Name = names[k]; sc.Subgraph[k].DrawStyle = DRAWSTYLE_IGNORE; sc.Subgraph[k].DrawZeros = 1; }
+		sc.Subgraph[FS_CVD].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[FS_CVD].LineWidth = 2; sc.Subgraph[FS_CVD].PrimaryColor = RGB(0, 200, 120); sc.Subgraph[FS_CVD].SecondaryColor = RGB(220, 70, 70); sc.Subgraph[FS_CVD].SecondaryColorUsed = 1;
+		sc.Subgraph[FS_DELTA].DrawStyle = DRAWSTYLE_BAR; sc.Subgraph[FS_DELTA].PrimaryColor = RGB(90, 90, 90);
+
+		sc.Input[FI_CVD_RESET].Name = "CVD Reset"; sc.Input[FI_CVD_RESET].SetCustomInputStrings("RTH Open;Trading Day Start;Never"); sc.Input[FI_CVD_RESET].SetCustomInputIndex(0);
+		NQE_INT_INPUT(FI_CVD_SLOPE, "CVD Slope Bars", 10, 2, 200);
+		NQE_INT_INPUT(FI_VOLZ_LEN, "Volume Z-Score Length", 50, 10, 1000);
+		NQE_FLT_INPUT(FI_ABS_Z, "Absorption: Volume Z >=", 2.0, 0.5, 10.0);
+		NQE_FLT_INPUT(FI_ABS_RANGE, "Absorption: Max Range (ATR)", 0.6, 0.1, 3.0);
+		NQE_FLT_INPUT(FI_ABS_FRAC, "Absorption: Zone Fraction Of Range", 0.25, 0.05, 1.0);
+		NQE_INT_INPUT(FI_EXH_RUN, "Exhaustion: Run Bars", 3, 1, 50);
+		NQE_FLT_INPUT(FI_EXH_PCT, "Exhaustion: Extreme Volume % Of Bar Max", 15.0, 1.0, 100.0);
+		NQE_FLT_INPUT(FI_IMB_RATIO, "Imbalance: Diagonal Ratio %", 300.0, 150.0, 2000.0);
+		NQE_INT_INPUT(FI_IMB_MINVOL, "Imbalance: Min Volume Per Level", 10, 1, 100000);
+		NQE_INT_INPUT(FI_IMB_STACK, "Imbalance: Stacked Levels >=", 3, 2, 20);
+		NQE_FLT_INPUT(FI_LT_PCT, "Large Trade: Rolling Percentile", 99.0, 80.0, 99.99);
+		NQE_INT_INPUT(FI_LT_MIN, "Large Trade: Min Size", 20, 1, 100000);
+		NQE_INT_INPUT(FI_LT_LOOK, "Large Trade: Lookback Trades", 2000, 100, 50000);
+		NQE_INT_INPUT(FI_LT_MAX, "Large Trade: Max Bubbles Drawn", 100, 0, 500);
+		NQE_INT_INPUT(FI_TRAP_LOOK, "Trapped: Breakout Lookback Bars", 20, 3, 200);
+		NQE_INT_INPUT(FI_TRAP_K, "Trapped: Reversal Within K Bars", 3, 1, 20);
+		NQE_FLT_INPUT(FI_TRAP_DELTA, "Trapped: Min Breakout Delta %", 20.0, 0.0, 100.0);
+		NQE_FLT_INPUT(FI_DIV_ATR, "Divergence: Min Swing Distance (ATR)", 0.5, 0.0, 10.0);
+		NQE_INT_INPUT(FI_DECAY, "Event Decay Bars (feature half-life)", 8, 1, 100);
+		NQE_INT_INPUT(FI_MAX_ZONES, "Max Active Zones Drawn", 30, 1, 200);
+		NQE_YESNO_INPUT(FI_D_CVD, "Draw: CVD", 1);
+		NQE_YESNO_INPUT(FI_D_ABS, "Draw: Absorption Zones", 1);
+		NQE_YESNO_INPUT(FI_D_IMB, "Draw: Imbalance Zones", 1);
+		NQE_YESNO_INPUT(FI_D_BUBBLE, "Draw: Large Trade Bubbles", 1);
+		NQE_YESNO_INPUT(FI_D_DIV, "Draw: Divergence Markers", 1);
+		NQE_YESNO_INPUT(FI_D_TRAP, "Draw: Trapped Trader Markers", 1);
+		NQE_YESNO_INPUT(FI_D_EXH, "Draw: Exhaustion Markers", 1);
+		NQE_COLOR_INPUT(FI_C_CVD_UP, "Color: CVD Up", 0, 200, 120);
+		NQE_COLOR_INPUT(FI_C_CVD_DN, "Color: CVD Down", 220, 70, 70);
+		NQE_COLOR_INPUT(FI_C_ABS_BULL, "Color: Absorption (buyers absorbed selling)", 0, 180, 110);
+		NQE_COLOR_INPUT(FI_C_ABS_BEAR, "Color: Absorption (sellers absorbed buying)", 200, 60, 60);
+		NQE_COLOR_INPUT(FI_C_IMB_BUY, "Color: Stacked Buy Imbalance", 40, 200, 90);
+		NQE_COLOR_INPUT(FI_C_IMB_SELL, "Color: Stacked Sell Imbalance", 210, 50, 80);
+		NQE_COLOR_INPUT(FI_C_BUB_BUY, "Color: Large Buy Bubble", 60, 230, 120);
+		NQE_COLOR_INPUT(FI_C_BUB_SELL, "Color: Large Sell Bubble", 240, 80, 80);
+		NQE_COLOR_INPUT(FI_C_DIV, "Color: CVD Divergence", 255, 180, 0);
+		NQE_COLOR_INPUT(FI_C_TRAP, "Color: Trapped Traders", 255, 100, 255);
+		NQE_COLOR_INPUT(FI_C_EXH, "Color: Exhaustion", 200, 200, 90);
+		return;
+	}
+	if (sc.LastCallToFunction) { Release(sc, E_FLOW); return; }
+	std::lock_guard<std::recursive_mutex> lock(g_mutex);
+	ChartState& S = Acquire(sc);
+	S.studyPresent[E_FLOW] = true;
+	if (sc.MaintainVolumeAtPriceData == 0) { sc.MaintainVolumeAtPriceData = 1; sc.FlagToReloadChartData = 1; }
+	FlowParams fp{};
+	fp.cvdReset = sc.Input[FI_CVD_RESET].GetIndex(); fp.cvdSlopeBars = sc.Input[FI_CVD_SLOPE].GetInt(); fp.volZLength = sc.Input[FI_VOLZ_LEN].GetInt();
+	fp.absorbVolZ = sc.Input[FI_ABS_Z].GetFloat(); fp.absorbMaxRangeAtr = sc.Input[FI_ABS_RANGE].GetFloat(); fp.absorbZoneFrac = sc.Input[FI_ABS_FRAC].GetFloat();
+	fp.exhaustRunBars = sc.Input[FI_EXH_RUN].GetInt(); fp.exhaustExtremePct = sc.Input[FI_EXH_PCT].GetFloat();
+	fp.imbRatioPct = sc.Input[FI_IMB_RATIO].GetFloat(); fp.imbMinVolume = sc.Input[FI_IMB_MINVOL].GetInt(); fp.imbStackLevels = sc.Input[FI_IMB_STACK].GetInt();
+	fp.largePercentile = sc.Input[FI_LT_PCT].GetFloat(); fp.largeMinSize = sc.Input[FI_LT_MIN].GetInt(); fp.largeLookback = sc.Input[FI_LT_LOOK].GetInt(); fp.maxBubbles = sc.Input[FI_LT_MAX].GetInt();
+	fp.trapLookback = sc.Input[FI_TRAP_LOOK].GetInt(); fp.trapReversalBars = sc.Input[FI_TRAP_K].GetInt(); fp.trapMinDeltaPct = sc.Input[FI_TRAP_DELTA].GetFloat();
+	fp.divMinAtr = sc.Input[FI_DIV_ATR].GetFloat(); fp.eventDecayBars = sc.Input[FI_DECAY].GetInt(); fp.maxActiveZones = sc.Input[FI_MAX_ZONES].GetInt();
+	SetParams(S, E_FLOW, S.params.flow, fp);
+	CheckDataStamp(sc, S);
+	EnsureFlow(sc, S);
+
+	sc.Subgraph[FS_CVD].DrawStyle = sc.Input[FI_D_CVD].GetYesNo() ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE;
+	int& gen = sc.GetPersistentInt(1);
+	int start = sc.UpdateStartIndex;
+	if (gen != S.flow.generation) { start = 0; gen = S.flow.generation; }
+	const FlowState& F = S.flow;
+	const uint32_t cUp = sc.Input[FI_C_CVD_UP].GetColor(), cDn = sc.Input[FI_C_CVD_DN].GetColor();
+	for (int i = start; i < sc.ArraySize; ++i)
+	{
+		sc.Subgraph[FS_CVD][i] = F.cvd[i]; sc.Subgraph[FS_CVD].DataColor[i] = (i > 0 && F.cvd[i] < F.cvd[i - 1]) ? cDn : cUp;
+		sc.Subgraph[FS_DELTA][i] = F.delta[i]; sc.Subgraph[FS_DELTA_PCT][i] = F.deltaPct[i]; sc.Subgraph[FS_VOLZ][i] = F.volZ[i]; sc.Subgraph[FS_CVDZ][i] = F.cvdZ[i];
+		sc.Subgraph[FS_F_ABS][i] = F.fAbsorb[i]; sc.Subgraph[FS_F_EXH][i] = F.fExhaust[i]; sc.Subgraph[FS_F_IMB][i] = F.fImb[i]; sc.Subgraph[FS_F_TRAP][i] = F.fTrapped[i];
+		sc.Subgraph[FS_F_DIV][i] = F.fCvdDiv[i]; sc.Subgraph[FS_F_LARGE][i] = F.fLarge[i];
+	}
+}
+
+// --- 4. Regime + MTF ----------------------------------------------------------
+enum RegimeInput { RI_ER_LEN = 0, RI_ER_TREND, RI_ER_BAL, RI_ATR_FAST, RI_ATR_SLOW, RI_CHOP, RI_IB_DAYS, RI_INSIDE, RI_HYST, RI_MTF_EMA, RI_MTF_SWING, RI_SHADE, RI_C_UP, RI_C_DN, RI_C_BAL, RI_C_CHOP, RI_COUNT };
+enum RegimeSubgraph { RS_BG = 0, RS_REGIME, RS_ER, RS_ATR_RATIO, RS_TREND, RS_MTF1, RS_MTF5, RS_MTF15, RS_MTF60, RS_MTF_BIAS, RS_COUNT };
+
+SCSFExport scsf_NQEdge_Regime(SCStudyInterfaceRef sc)
+{
+	if (sc.SetDefaults)
+	{
+		sc.GraphName = "NQ Edge: Regime + MTF Bias";
+		sc.StudyDescription = "Classifies every closed bar as Trend Up / Trend Down / Balance / Volatile Chop (with hysteresis) and computes 1m/5m/15m/60m trend bias. Shades the chart background by regime.";
+		sc.GraphRegion = 0; sc.AutoLoop = 0; sc.CalculationPrecedence = LOW_PREC_LEVEL; sc.ValueFormat = 2; sc.ScaleRangeType = SCALE_INDEPENDENT; sc.DrawZeros = 0; sc.DrawStudyUnderneathMainPriceGraph = 1;
+		const char* names[RS_COUNT] = { "Regime Shade", "Regime", "Efficiency Ratio", "ATR Ratio", "f.regimeTrend", "MTF 1m", "MTF 5m", "MTF 15m", "MTF 60m", "f.mtfBias" };
+		for (int k = 0; k < RS_COUNT; ++k) { sc.Subgraph[k].Name = names[k]; sc.Subgraph[k].DrawStyle = DRAWSTYLE_IGNORE; sc.Subgraph[k].DrawZeros = 0; }
+		sc.Subgraph[RS_BG].DrawStyle = DRAWSTYLE_BACKGROUND; sc.Subgraph[RS_BG].PrimaryColor = RGB(20, 40, 20);
+		NQE_INT_INPUT(RI_ER_LEN, "Efficiency Ratio Length", 20, 5, 500);
+		NQE_FLT_INPUT(RI_ER_TREND, "ER Trend Threshold", 0.35, 0.05, 1.0);
+		NQE_FLT_INPUT(RI_ER_BAL, "ER Balance Threshold", 0.20, 0.0, 1.0);
+		NQE_INT_INPUT(RI_ATR_FAST, "ATR Fast Length", 7, 2, 100);
+		NQE_INT_INPUT(RI_ATR_SLOW, "ATR Slow Length", 50, 5, 1000);
+		NQE_FLT_INPUT(RI_CHOP, "Chop: ATR Expansion Ratio >=", 1.3, 1.0, 5.0);
+		NQE_INT_INPUT(RI_IB_DAYS, "IB Range Average Days", 20, 1, 100);
+		NQE_INT_INPUT(RI_INSIDE, "Inside-Value Lookback Bars", 30, 5, 500);
+		NQE_INT_INPUT(RI_HYST, "Hysteresis Bars", 3, 1, 50);
+		NQE_INT_INPUT(RI_MTF_EMA, "MTF EMA Length", 20, 2, 200);
+		NQE_INT_INPUT(RI_MTF_SWING, "MTF Swing Strength", 3, 1, 20);
+		NQE_YESNO_INPUT(RI_SHADE, "Shade Background By Regime", 1);
+		NQE_COLOR_INPUT(RI_C_UP, "Color: Trend Up Shade", 18, 40, 24);
+		NQE_COLOR_INPUT(RI_C_DN, "Color: Trend Down Shade", 44, 20, 22);
+		NQE_COLOR_INPUT(RI_C_BAL, "Color: Balance Shade", 26, 26, 34);
+		NQE_COLOR_INPUT(RI_C_CHOP, "Color: Chop Shade", 40, 34, 18);
+		return;
+	}
+	if (sc.LastCallToFunction) { Release(sc, E_REGIME); return; }
+	std::lock_guard<std::recursive_mutex> lock(g_mutex);
+	ChartState& S = Acquire(sc);
+	S.studyPresent[E_REGIME] = true;
+	RegimeParams rp{};
+	rp.erLength = sc.Input[RI_ER_LEN].GetInt(); rp.erTrend = sc.Input[RI_ER_TREND].GetFloat(); rp.erBalance = sc.Input[RI_ER_BAL].GetFloat();
+	rp.atrFast = sc.Input[RI_ATR_FAST].GetInt(); rp.atrSlow = sc.Input[RI_ATR_SLOW].GetInt(); rp.chopExpansion = sc.Input[RI_CHOP].GetFloat();
+	rp.ibAvgDays = sc.Input[RI_IB_DAYS].GetInt(); rp.insideValueBars = sc.Input[RI_INSIDE].GetInt(); rp.hysteresisBars = sc.Input[RI_HYST].GetInt();
+	rp.mtfEmaLength = sc.Input[RI_MTF_EMA].GetInt(); rp.mtfSwing = sc.Input[RI_MTF_SWING].GetInt();
+	SetParams(S, E_REGIME, S.params.regime, rp);
+	CheckDataStamp(sc, S);
+	EnsureRegime(sc, S);
+
+	const bool shade = sc.Input[RI_SHADE].GetYesNo() != 0;
+	sc.Subgraph[RS_BG].DrawStyle = shade ? DRAWSTYLE_BACKGROUND : DRAWSTYLE_IGNORE;
+	const uint32_t cols[5] = { 0, sc.Input[RI_C_UP].GetColor(), sc.Input[RI_C_DN].GetColor(), sc.Input[RI_C_BAL].GetColor(), sc.Input[RI_C_CHOP].GetColor() };
+	int& gen = sc.GetPersistentInt(1);
+	int start = sc.UpdateStartIndex;
+	if (gen != S.regime.generation) { start = 0; gen = S.regime.generation; }
+	const RegimeState& R = S.regime;
+	for (int i = start; i < sc.ArraySize; ++i)
+	{
+		const int r = Clamp(static_cast<int>(R.regime[i]), 0, 4);
+		sc.Subgraph[RS_BG][i] = (shade && r != 0) ? 1.0f : 0.0f; sc.Subgraph[RS_BG].DataColor[i] = cols[r];
+		sc.Subgraph[RS_REGIME][i] = static_cast<float>(r); sc.Subgraph[RS_ER][i] = R.er[i]; sc.Subgraph[RS_ATR_RATIO][i] = R.atrRatio[i]; sc.Subgraph[RS_TREND][i] = R.regimeTrend[i];
+		sc.Subgraph[RS_MTF1][i] = R.mtf1[i]; sc.Subgraph[RS_MTF5][i] = R.mtf5[i]; sc.Subgraph[RS_MTF15][i] = R.mtf15[i]; sc.Subgraph[RS_MTF60][i] = R.mtf60[i]; sc.Subgraph[RS_MTF_BIAS][i] = R.mtfBias[i];
+	}
+}
+
+// --- 5. Intermarket -----------------------------------------------------------
+enum InterInput { II_YM = 0, II_ES, II_RTY, II_TICK, II_MEGA1, II_MEGA2, II_MEGA3, II_MEGA4, II_MEGA5, II_MEGA6, II_RS_LOOK, II_RS_Z, II_TICK_EXT, II_TICK_STRONG, II_TICK_LOOK, II_TICK_EMA, II_MEGA_EMA, II_C_RS, II_C_BREADTH, II_COUNT };
+enum InterSubgraph { IS_RS_YM = 0, IS_RS_ES, IS_RS_RTY, IS_RS_INDEX, IS_SMT, IS_TICK_CUM, IS_TICK_EXT, IS_TICK_DIV, IS_MEGA, IS_COMPOSITE, IS_COUNT };
+
+SCSFExport scsf_NQEdge_Intermarket(SCStudyInterfaceRef sc)
+{
+	if (sc.SetDefaults)
+	{
+		sc.GraphName = "NQ Edge: Intermarket Engine";
+		sc.StudyDescription = "Relative strength vs YM/ES/RTY, SMT divergence, NYSE TICK (cumulative, extremes, divergence), mega-cap leadership breadth. Every chart number is optional (0 = off).";
+		sc.GraphRegion = 2; sc.AutoLoop = 0; sc.CalculationPrecedence = LOW_PREC_LEVEL; sc.ValueFormat = 2; sc.DrawZeros = 1;
+		const char* names[IS_COUNT] = { "RS vs YM", "RS vs ES", "RS vs RTY", "f.rsIndex", "f.smt", "f.tickCum", "f.tickExt", "f.tickDiv", "f.megaCap", "Intermarket Composite" };
+		for (int k = 0; k < IS_COUNT; ++k) { sc.Subgraph[k].Name = names[k]; sc.Subgraph[k].DrawStyle = DRAWSTYLE_IGNORE; sc.Subgraph[k].DrawZeros = 1; }
+		sc.Subgraph[IS_RS_INDEX].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[IS_RS_INDEX].PrimaryColor = RGB(120, 180, 255);
+		sc.Subgraph[IS_MEGA].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[IS_MEGA].PrimaryColor = RGB(255, 200, 80);
+		sc.Subgraph[IS_COMPOSITE].DrawStyle = DRAWSTYLE_BAR; sc.Subgraph[IS_COMPOSITE].PrimaryColor = RGB(90, 90, 90);
+		sc.Input[II_YM].Name = "Chart Number: YM (0 = off)"; sc.Input[II_YM].SetChartNumber(0);
+		sc.Input[II_ES].Name = "Chart Number: ES (0 = off)"; sc.Input[II_ES].SetChartNumber(0);
+		sc.Input[II_RTY].Name = "Chart Number: RTY (0 = off)"; sc.Input[II_RTY].SetChartNumber(0);
+		sc.Input[II_TICK].Name = "Chart Number: NYSE TICK (0 = off)"; sc.Input[II_TICK].SetChartNumber(0);
+		const char* mn[6] = { "Chart Number: Mega Cap 1 (e.g. AAPL)", "Chart Number: Mega Cap 2 (e.g. AMZN)", "Chart Number: Mega Cap 3 (e.g. NVDA)", "Chart Number: Mega Cap 4 (e.g. MSFT)", "Chart Number: Mega Cap 5 (e.g. META)", "Chart Number: Mega Cap 6 (e.g. GOOGL)" };
+		for (int k = 0; k < 6; ++k) { sc.Input[II_MEGA1 + k].Name = mn[k]; sc.Input[II_MEGA1 + k].SetChartNumber(0); }
+		NQE_INT_INPUT(II_RS_LOOK, "RS: Return Lookback Bars", 20, 2, 500);
+		NQE_INT_INPUT(II_RS_Z, "RS: Z-Score Length", 100, 10, 2000);
+		NQE_FLT_INPUT(II_TICK_EXT, "TICK: Extreme Level", 800.0, 100.0, 3000.0);
+		NQE_FLT_INPUT(II_TICK_STRONG, "TICK: Strong Extreme Level", 1000.0, 100.0, 3000.0);
+		NQE_INT_INPUT(II_TICK_LOOK, "TICK: Extremes Lookback Bars", 10, 1, 200);
+		NQE_INT_INPUT(II_TICK_EMA, "TICK: Trend EMA Length", 10, 2, 200);
+		NQE_INT_INPUT(II_MEGA_EMA, "Mega Cap: Trend EMA Length", 20, 2, 200);
+		NQE_COLOR_INPUT(II_C_RS, "Color: RS Line", 120, 180, 255);
+		NQE_COLOR_INPUT(II_C_BREADTH, "Color: Leadership Breadth", 255, 200, 80);
+		return;
+	}
+	if (sc.LastCallToFunction) { Release(sc, E_INTER); return; }
+	std::lock_guard<std::recursive_mutex> lock(g_mutex);
+	ChartState& S = Acquire(sc);
+	S.studyPresent[E_INTER] = true;
+	InterParams ip{};
+	ip.chartYM = sc.Input[II_YM].GetChartNumber(); ip.chartES = sc.Input[II_ES].GetChartNumber(); ip.chartRTY = sc.Input[II_RTY].GetChartNumber(); ip.chartTICK = sc.Input[II_TICK].GetChartNumber();
+	for (int k = 0; k < 6; ++k) ip.chartMega[k] = sc.Input[II_MEGA1 + k].GetChartNumber();
+	ip.rsLookback = sc.Input[II_RS_LOOK].GetInt(); ip.rsZLength = sc.Input[II_RS_Z].GetInt(); ip.tickExtreme = sc.Input[II_TICK_EXT].GetFloat(); ip.tickStrong = sc.Input[II_TICK_STRONG].GetFloat();
+	ip.tickLookback = sc.Input[II_TICK_LOOK].GetInt(); ip.tickEma = sc.Input[II_TICK_EMA].GetInt(); ip.megaEma = sc.Input[II_MEGA_EMA].GetInt();
+	SetParams(S, E_INTER, S.params.inter, ip);
+	CheckDataStamp(sc, S);
+	EnsureInter(sc, S);
+	sc.Subgraph[IS_RS_INDEX].PrimaryColor = sc.Input[II_C_RS].GetColor(); sc.Subgraph[IS_MEGA].PrimaryColor = sc.Input[II_C_BREADTH].GetColor();
+	int& gen = sc.GetPersistentInt(1);
+	int start = sc.UpdateStartIndex;
+	if (gen != S.inter.generation) { start = 0; gen = S.inter.generation; }
+	const InterState& I = S.inter;
+	for (int i = start; i < sc.ArraySize; ++i)
+	{
+		sc.Subgraph[IS_RS_YM][i] = I.rsYM[i]; sc.Subgraph[IS_RS_ES][i] = I.rsES[i]; sc.Subgraph[IS_RS_RTY][i] = I.rsRTY[i]; sc.Subgraph[IS_RS_INDEX][i] = I.rsIndex[i];
+		sc.Subgraph[IS_SMT][i] = I.smt[i]; sc.Subgraph[IS_TICK_CUM][i] = I.tickCum[i]; sc.Subgraph[IS_TICK_EXT][i] = I.tickExt[i]; sc.Subgraph[IS_TICK_DIV][i] = I.tickDiv[i];
+		sc.Subgraph[IS_MEGA][i] = I.megaCap[i]; sc.Subgraph[IS_COMPOSITE][i] = I.composite[i];
+	}
+}
+
+// --- 6. DCS -------------------------------------------------------------------
+enum DcsInput
+{
+	DI_FILE = 0, DI_RELOAD, DI_THR, DI_FADE, DI_SMOOTH, DI_STRONG, DI_WEAK, DI_S1, DI_S2, DI_S3, DI_S4, DI_S5, DI_MTF, DI_TOL, DI_STOPBUF, DI_MINRR, DI_MINTGT, DI_MAXSIG, DI_TGTBARS, DI_ALERTS, DI_SOUND,
+	DI_C_GREEN, DI_C_RED, DI_C_GRAY, DI_C_SMOOTH, DI_C_THR, DI_C_LONG, DI_C_SHORT, DI_C_ENTRY, DI_C_STOP, DI_C_TARGET, DI_C_LABEL, DI_COUNT
+};
+enum DcsSubgraph { DS_DCS = 0, DS_SMOOTH, DS_THR_UP, DS_THR_DN, DS_SIGNAL, DS_BIAS, DS_COUNT };
+
+SCSFExport scsf_NQEdge_DCS(SCStudyInterfaceRef sc)
+{
+	if (sc.SetDefaults)
+	{
+		sc.GraphName = "NQ Edge: Directional Conviction Score";
+		sc.StudyDescription = "Fuses all engine features into a regime-gated score (-100..+100), detects the five trade setups with structural stops and liquidity targets, draws and alerts them.";
+		sc.GraphRegion = 3; sc.AutoLoop = 0; sc.CalculationPrecedence = VERY_LOW_PREC_LEVEL; sc.ValueFormat = 0; sc.DrawZeros = 1;
+		const char* names[DS_COUNT] = { "DCS", "DCS Smoothed", "+Threshold", "-Threshold", "Signal", "Bias" };
+		for (int k = 0; k < DS_COUNT; ++k) { sc.Subgraph[k].Name = names[k]; sc.Subgraph[k].DrawZeros = 1; }
+		sc.Subgraph[DS_DCS].DrawStyle = DRAWSTYLE_BAR; sc.Subgraph[DS_DCS].PrimaryColor = RGB(128, 128, 128); sc.Subgraph[DS_DCS].LineWidth = 2;
+		sc.Subgraph[DS_SMOOTH].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[DS_SMOOTH].PrimaryColor = RGB(255, 255, 255); sc.Subgraph[DS_SMOOTH].LineWidth = 1;
+		sc.Subgraph[DS_THR_UP].DrawStyle = DRAWSTYLE_DASH; sc.Subgraph[DS_THR_UP].PrimaryColor = RGB(90, 90, 90);
+		sc.Subgraph[DS_THR_DN].DrawStyle = DRAWSTYLE_DASH; sc.Subgraph[DS_THR_DN].PrimaryColor = RGB(90, 90, 90);
+		sc.Subgraph[DS_SIGNAL].DrawStyle = DRAWSTYLE_IGNORE; sc.Subgraph[DS_BIAS].DrawStyle = DRAWSTYLE_IGNORE;
+		sc.Input[DI_FILE].Name = "Weights File Name (in Data folder)"; sc.Input[DI_FILE].SetString("NQEdge_weights.txt");
+		NQE_INT_INPUT(DI_RELOAD, "Weights Hot-Reload Check Seconds", 5, 1, 600);
+		NQE_FLT_INPUT(DI_THR, "Signal Threshold (|DCS| >=)", 40.0, 0.0, 100.0);
+		NQE_FLT_INPUT(DI_FADE, "Fade Threshold In Balance (|DCS| >=)", 20.0, 0.0, 100.0);
+		NQE_INT_INPUT(DI_SMOOTH, "Smoothing Length (EMA)", 5, 1, 50);
+		NQE_FLT_INPUT(DI_STRONG, "Bar State: Strong Threshold", 60.0, 0.0, 100.0);
+		NQE_FLT_INPUT(DI_WEAK, "Bar State: Weak Threshold", 25.0, 0.0, 100.0);
+		NQE_YESNO_INPUT(DI_S1, "Setup: Trend Pullback Continuation", 1);
+		NQE_YESNO_INPUT(DI_S2, "Setup: Value-Edge Rejection (Balance)", 1);
+		NQE_YESNO_INPUT(DI_S3, "Setup: Failed Breakout / Trapped Traders", 1);
+		NQE_YESNO_INPUT(DI_S4, "Setup: Break-and-Acceptance", 1);
+		NQE_YESNO_INPUT(DI_S5, "Setup: SMT/CVD Divergence At Liquidity", 1);
+		NQE_YESNO_INPUT(DI_MTF, "Require MTF Alignment For Trend Setups", 1);
+		NQE_FLT_INPUT(DI_TOL, "Location Tolerance (ATR)", 0.3, 0.05, 3.0);
+		NQE_FLT_INPUT(DI_STOPBUF, "Stop Buffer Beyond Structure (ATR)", 0.5, 0.0, 3.0);
+		NQE_FLT_INPUT(DI_MINRR, "Min Reward:Risk To T1", 1.0, 0.1, 10.0);
+		NQE_FLT_INPUT(DI_MINTGT, "Min Target Distance (ATR)", 0.5, 0.1, 10.0);
+		NQE_INT_INPUT(DI_MAXSIG, "Max Signals Drawn", 30, 1, 300);
+		NQE_INT_INPUT(DI_TGTBARS, "Entry/Stop/Target Line Length (bars)", 20, 2, 200);
+		NQE_YESNO_INPUT(DI_ALERTS, "Alerts Enabled", 1);
+		sc.Input[DI_SOUND].Name = "Alert Sound Number"; sc.Input[DI_SOUND].SetAlertSoundNumber(1);
+		NQE_COLOR_INPUT(DI_C_GREEN, "Color: Deep Green (DCS +100)", 0, 220, 110);
+		NQE_COLOR_INPUT(DI_C_RED, "Color: Deep Red (DCS -100)", 230, 60, 60);
+		NQE_COLOR_INPUT(DI_C_GRAY, "Color: Neutral Gray (DCS 0)", 110, 110, 110);
+		NQE_COLOR_INPUT(DI_C_SMOOTH, "Color: Smoothed Line", 255, 255, 255);
+		NQE_COLOR_INPUT(DI_C_THR, "Color: Threshold Lines", 90, 90, 90);
+		NQE_COLOR_INPUT(DI_C_LONG, "Color: Long Signal", 0, 230, 120);
+		NQE_COLOR_INPUT(DI_C_SHORT, "Color: Short Signal", 240, 70, 70);
+		NQE_COLOR_INPUT(DI_C_ENTRY, "Color: Entry Line", 255, 255, 255);
+		NQE_COLOR_INPUT(DI_C_STOP, "Color: Stop Line", 230, 60, 60);
+		NQE_COLOR_INPUT(DI_C_TARGET, "Color: Target Lines", 0, 200, 255);
+		NQE_COLOR_INPUT(DI_C_LABEL, "Color: Signal Label", 255, 255, 255);
+		return;
+	}
+	if (sc.LastCallToFunction) { Release(sc, E_DCS); return; }
+	std::lock_guard<std::recursive_mutex> lock(g_mutex);
+	ChartState& S = Acquire(sc);
+	S.studyPresent[E_DCS] = true;
+	DcsParams dp{};
+	strncpy_s(dp.weightsFile, sizeof(dp.weightsFile), sc.Input[DI_FILE].GetString(), _TRUNCATE);
+	dp.hotReloadSec = sc.Input[DI_RELOAD].GetInt(); dp.signalThr = sc.Input[DI_THR].GetFloat(); dp.fadeThr = sc.Input[DI_FADE].GetFloat(); dp.smoothLen = sc.Input[DI_SMOOTH].GetInt();
+	dp.strongThr = sc.Input[DI_STRONG].GetFloat(); dp.weakThr = sc.Input[DI_WEAK].GetFloat();
+	for (int k = 1; k < SETUP_COUNT; ++k) dp.setupOn[k] = sc.Input[DI_S1 + k - 1].GetYesNo();
+	dp.requireMtf = sc.Input[DI_MTF].GetYesNo(); dp.levelTolAtr = sc.Input[DI_TOL].GetFloat(); dp.stopBufferAtr = sc.Input[DI_STOPBUF].GetFloat(); dp.minRR = sc.Input[DI_MINRR].GetFloat();
+	dp.minTargetAtr = sc.Input[DI_MINTGT].GetFloat(); dp.maxSignalsDrawn = sc.Input[DI_MAXSIG].GetInt(); dp.targetLineBars = sc.Input[DI_TGTBARS].GetInt();
+	dp.alertsOn = sc.Input[DI_ALERTS].GetYesNo(); dp.alertSound = sc.Input[DI_SOUND].GetAlertSoundNumber();
+	SetParams(S, E_DCS, S.params.dcs, dp);
+	CheckDataStamp(sc, S);
+	EnsureDcs(sc, S);
+
+	sc.Subgraph[DS_SMOOTH].PrimaryColor = sc.Input[DI_C_SMOOTH].GetColor(); sc.Subgraph[DS_THR_UP].PrimaryColor = sc.Subgraph[DS_THR_DN].PrimaryColor = sc.Input[DI_C_THR].GetColor();
+	const uint32_t cG = sc.Input[DI_C_GREEN].GetColor(), cR = sc.Input[DI_C_RED].GetColor(), cN = sc.Input[DI_C_GRAY].GetColor();
+	int& gen = sc.GetPersistentInt(1);
+	int start = sc.UpdateStartIndex;
+	if (gen != S.dcs.generation) { start = 0; gen = S.dcs.generation; }
+	const DcsState& D = S.dcs;
+	for (int i = start; i < sc.ArraySize; ++i)
+	{
+		const float v = D.dcs[i];
+		sc.Subgraph[DS_DCS][i] = v; sc.Subgraph[DS_SMOOTH][i] = D.dcsSmooth[i];
+		sc.Subgraph[DS_THR_UP][i] = D.weights.thrSignal; sc.Subgraph[DS_THR_DN][i] = -D.weights.thrSignal;
+		const float t = Clamp(static_cast<float>(fabs(v)) / 100.0f, 0.0f, 1.0f);
+		uint32_t c = v >= 0 ? sc.RGBInterpolate(cN, cG, t) : sc.RGBInterpolate(cN, cR, t);
+		if (i == sc.ArraySize - 1) c = sc.RGBInterpolate(c, RGB(0, 0, 0), 0.5f);   // provisional (forming bar) drawn dim
+		sc.Subgraph[DS_DCS].DataColor[i] = c;
+		sc.Subgraph[DS_SIGNAL][i] = static_cast<float>(D.signalType[i]) * static_cast<float>(D.signalDir[i]);
+		sc.Subgraph[DS_BIAS][i] = static_cast<float>(D.barState[i]);
+	}
+}
+
+// --- 7. Validation ------------------------------------------------------------
+enum ValInput { VLI_SLIP = 0, VLI_MAXBARS, VLI_STOPFIRST, VLI_MINSAMPLE, VLI_C_CURVE, VLI_C_MARK, VLI_COUNT };
+enum ValSubgraph { VLS_CUMR = 0, VLS_RESULT, VLS_COUNT };
+
+SCSFExport scsf_NQEdge_Validation(SCStudyInterfaceRef sc)
+{
+	if (sc.SetDefaults)
+	{
+		sc.GraphName = "NQ Edge: Signal Validation";
+		sc.StudyDescription = "Replays every DCS signal forward on closed bars (1-tick slippage, stop-first) and reports per-setup count, win %, average R, profit factor, T2 %, MFE/MAE to the HUD.";
+		sc.GraphRegion = 4; sc.AutoLoop = 0; sc.CalculationPrecedence = VERY_LOW_PREC_LEVEL; sc.ValueFormat = 2; sc.DrawZeros = 1;
+		sc.Subgraph[VLS_CUMR].Name = "Cumulative R"; sc.Subgraph[VLS_CUMR].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[VLS_CUMR].PrimaryColor = RGB(0, 200, 255); sc.Subgraph[VLS_CUMR].LineWidth = 2;
+		sc.Subgraph[VLS_RESULT].Name = "Signal Result (R)"; sc.Subgraph[VLS_RESULT].DrawStyle = DRAWSTYLE_POINT; sc.Subgraph[VLS_RESULT].PrimaryColor = RGB(255, 255, 255); sc.Subgraph[VLS_RESULT].LineWidth = 4; sc.Subgraph[VLS_RESULT].DrawZeros = 0;
+		NQE_INT_INPUT(VLI_SLIP, "Slippage Ticks (entry and stop)", 1, 0, 20);
+		NQE_INT_INPUT(VLI_MAXBARS, "Max Bars To Resolution", 120, 5, 2000);
+		NQE_YESNO_INPUT(VLI_STOPFIRST, "Assume Stop First When Bar Hits Both", 1);
+		NQE_INT_INPUT(VLI_MINSAMPLE, "Min Sample Size (warn below)", 30, 1, 1000);
+		NQE_COLOR_INPUT(VLI_C_CURVE, "Color: Cumulative R", 0, 200, 255);
+		NQE_COLOR_INPUT(VLI_C_MARK, "Color: Result Marker", 255, 255, 255);
+		return;
+	}
+	if (sc.LastCallToFunction) { Release(sc, E_VAL); return; }
+	std::lock_guard<std::recursive_mutex> lock(g_mutex);
+	ChartState& S = Acquire(sc);
+	S.studyPresent[E_VAL] = true;
+	ValParams vp{}; vp.slippageTicks = sc.Input[VLI_SLIP].GetInt(); vp.maxBars = sc.Input[VLI_MAXBARS].GetInt(); vp.stopFirst = sc.Input[VLI_STOPFIRST].GetYesNo(); vp.minSample = sc.Input[VLI_MINSAMPLE].GetInt();
+	SetParams(S, E_VAL, S.params.val, vp);
+	CheckDataStamp(sc, S);
+	EnsureVal(sc, S);
+	sc.Subgraph[VLS_CUMR].PrimaryColor = sc.Input[VLI_C_CURVE].GetColor(); sc.Subgraph[VLS_RESULT].PrimaryColor = sc.Input[VLI_C_MARK].GetColor();
+	int& gen = sc.GetPersistentInt(1);
+	int start = sc.UpdateStartIndex;
+	if (gen != S.val.generation) { start = 0; gen = S.val.generation; }
+	for (int i = start; i < sc.ArraySize; ++i) { sc.Subgraph[VLS_CUMR][i] = S.val.cumR[i]; sc.Subgraph[VLS_RESULT][i] = 0; }
+	for (size_t k = 0; k < S.dcs.signals.size(); ++k)
+	{
+		const Signal& g = S.dcs.signals[k];
+		if (g.resolved != 0 && g.resIdx >= start && g.resIdx < sc.ArraySize) sc.Subgraph[VLS_RESULT][g.resIdx] = g.resultR;
+	}
+}
+
+// --- 8. Feature logger --------------------------------------------------------
+enum LogInput { LI_ENABLED = 0, LI_PREFIX, LI_REWRITE, LI_RTH, LI_COUNT };
+
+SCSFExport scsf_NQEdge_FeatureLogger(SCStudyInterfaceRef sc)
+{
+	if (sc.SetDefaults)
+	{
+		sc.GraphName = "NQ Edge: Feature Logger";
+		sc.StudyDescription = "Writes one CSV row per closed bar (OHLCV, every engine feature, DCS, regime, setup flags, forward returns at +5/+15/+30/+60 min, MFE/MAE) to the Data folder for the Python research loop.";
+		sc.GraphRegion = 0; sc.AutoLoop = 0; sc.CalculationPrecedence = VERY_LOW_PREC_LEVEL; sc.DrawZeros = 0;
+		sc.Subgraph[0].Name = "Rows Written"; sc.Subgraph[0].DrawStyle = DRAWSTYLE_IGNORE;
+		NQE_YESNO_INPUT(LI_ENABLED, "Logging Enabled", 1);
+		sc.Input[LI_PREFIX].Name = "File Name Prefix"; sc.Input[LI_PREFIX].SetString("NQEdge_features");
+		NQE_YESNO_INPUT(LI_REWRITE, "Rewrite File On Full Recalculation", 1);
+		NQE_YESNO_INPUT(LI_RTH, "Log RTH Bars Only", 0);
+		return;
+	}
+	if (sc.LastCallToFunction) { Release(sc, E_LOG); return; }
+	std::lock_guard<std::recursive_mutex> lock(g_mutex);
+	ChartState& S = Acquire(sc);
+	S.studyPresent[E_LOG] = true;
+	LogParams lp{}; lp.enabled = sc.Input[LI_ENABLED].GetYesNo(); strncpy_s(lp.prefix, sizeof(lp.prefix), sc.Input[LI_PREFIX].GetString(), _TRUNCATE);
+	lp.rewriteOnRecalc = sc.Input[LI_REWRITE].GetYesNo(); lp.rthOnly = sc.Input[LI_RTH].GetYesNo();
+	SetParams(S, E_LOG, S.params.log, lp);
+	CheckDataStamp(sc, S);
+	EnsureLog(sc, S);
+}
+
+// --- 9. HUD + Bar Painter -----------------------------------------------------
+SCSFExport scsf_NQEdge_HUD(SCStudyInterfaceRef sc)
+{
+	if (sc.SetDefaults)
+	{
+		sc.GraphName = "NQ Edge: HUD + Bar Painter";
+		sc.StudyDescription = "Heads-up panel (bias, DCS, regime, MTF strip, intermarket, order flow, nearest levels, plain-English state, live stats, warnings) and DCS bar painting.";
+		sc.GraphRegion = 0; sc.AutoLoop = 0; sc.CalculationPrecedence = VERY_LOW_PREC_LEVEL; sc.ValueFormat = VALUEFORMAT_INHERITED; sc.ScaleRangeType = SCALE_SAMEASREGION; sc.DrawZeros = 0;
+		sc.Subgraph[0].Name = "DCS Bar Paint"; sc.Subgraph[0].DrawStyle = DRAWSTYLE_COLOR_BAR; sc.Subgraph[0].PrimaryColor = RGB(128, 128, 128); sc.Subgraph[0].DrawZeros = 0;
+		sc.Input[HI_POSITION].Name = "HUD Position"; sc.Input[HI_POSITION].SetCustomInputStrings("Top Left;Top Right;Bottom Left;Bottom Right"); sc.Input[HI_POSITION].SetCustomInputIndex(0);
+		sc.Input[HI_PRESET].Name = "Preset"; sc.Input[HI_PRESET].SetCustomInputStrings("Minimal;Full"); sc.Input[HI_PRESET].SetCustomInputIndex(1);
+		NQE_INT_INPUT(HI_FONT, "Font Size (pt)", 11, 7, 24);
+		NQE_INT_INPUT(HI_WIDTH, "Panel Width (px)", 360, 200, 1200);
+		NQE_INT_INPUT(HI_OPACITY, "Panel Opacity %", 80, 0, 100);
+		NQE_YESNO_INPUT(HI_PAINT, "Paint Price Bars By DCS State", 1);
+		NQE_YESNO_INPUT(HI_SHOW_WARN, "Show Warnings", 1);
+		NQE_YESNO_INPUT(HI_SHOW_STATS, "Show Signal Stats", 1);
+		NQE_YESNO_INPUT(HI_SHOW_INTER, "Show Intermarket Row", 1);
+		NQE_YESNO_INPUT(HI_SHOW_FLOW, "Show Order Flow Row", 1);
+		NQE_YESNO_INPUT(HI_SHOW_LEVELS, "Show Nearest Levels Row", 1);
+		NQE_COLOR_INPUT(HI_C_BG, "Color: Panel Background", 12, 14, 18);
+		NQE_COLOR_INPUT(HI_C_TEXT, "Color: Text", 220, 220, 220);
+		NQE_COLOR_INPUT(HI_C_BULL, "Color: Bull", 0, 220, 110);
+		NQE_COLOR_INPUT(HI_C_BEAR, "Color: Bear", 240, 70, 70);
+		NQE_COLOR_INPUT(HI_C_NEUTRAL, "Color: Neutral", 150, 150, 150);
+		NQE_COLOR_INPUT(HI_C_LEVEL, "Color: Levels (cyan)", 0, 200, 255);
+		NQE_COLOR_INPUT(HI_C_VWAP, "Color: VWAP/State (gold)", 255, 215, 0);
+		NQE_COLOR_INPUT(HI_C_WARN, "Color: Warning", 255, 170, 0);
+		NQE_COLOR_INPUT(HI_C_STRONG_BULL, "Bar Color: Strong Bull", 0, 230, 120);
+		NQE_COLOR_INPUT(HI_C_WEAK_BULL, "Bar Color: Weak Bull", 0, 140, 80);
+		NQE_COLOR_INPUT(HI_C_NEUTRAL_BAR, "Bar Color: Neutral", 120, 120, 120);
+		NQE_COLOR_INPUT(HI_C_WEAK_BEAR, "Bar Color: Weak Bear", 150, 60, 60);
+		NQE_COLOR_INPUT(HI_C_STRONG_BEAR, "Bar Color: Strong Bear", 240, 60, 60);
+		return;
+	}
+	sc.p_GDIFunction = DrawHUD;   // set after SetDefaults so a reloaded DLL re-registers the pointer
+	if (sc.LastCallToFunction) { Release(sc, -1); return; }
+	std::lock_guard<std::recursive_mutex> lock(g_mutex);
+	ChartState& S = Acquire(sc);
+	CheckDataStamp(sc, S);
+	CheckWarnings(sc, S);
+	EnsureLog(sc, S);          // pulls the full chain
+	BuildHudSnapshot(sc, S);
+
+	const bool paint = sc.Input[HI_PAINT].GetYesNo() != 0;
+	sc.Subgraph[0].DrawStyle = paint ? DRAWSTYLE_COLOR_BAR : DRAWSTYLE_IGNORE;
+	const uint32_t cols[5] = { sc.Input[HI_C_STRONG_BEAR].GetColor(), sc.Input[HI_C_WEAK_BEAR].GetColor(), sc.Input[HI_C_NEUTRAL_BAR].GetColor(), sc.Input[HI_C_WEAK_BULL].GetColor(), sc.Input[HI_C_STRONG_BULL].GetColor() };
+	int& gen = sc.GetPersistentInt(1);
+	int start = sc.UpdateStartIndex;
+	if (gen != S.dcs.generation) { start = 0; gen = S.dcs.generation; }
+	for (int i = start; i < sc.ArraySize; ++i)
+	{
+		const int st = Clamp(static_cast<int>(S.dcs.barState[i]) + 2, 0, 4);
+		sc.Subgraph[0][i] = paint ? 1.0f : 0.0f;
+		uint32_t c = cols[st];
+		if (i == sc.ArraySize - 1) c = sc.RGBInterpolate(c, RGB(0, 0, 0), 0.45f);   // forming bar: provisional, drawn dim
+		sc.Subgraph[0].DataColor[i] = c;
+	}
+}

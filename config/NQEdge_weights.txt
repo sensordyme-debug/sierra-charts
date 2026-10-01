@@ -1,0 +1,57 @@
+# NQ Edge Suite composite weights. Copy to Sierra's Data folder (scripts\deploy.ps1 does it).
+# Format: key = value. '#' starts a comment. Unknown keys are ignored; missing keys keep built-in defaults.
+# The DCS study hot-reloads this file when its timestamp changes.
+version = 1
+
+# ---- feature weights (any real number; sign flips the feature) ----------------------
+w.vwapPos = 0.6
+w.vwapSlope = 0.8
+w.vwapAccept = 0.5
+w.structTrend = 0.9
+w.bos = 0.6
+w.vaPos = 0.5
+w.pocPos = 0.4
+w.ibPos = 0.3
+w.valueMig = 0.4
+w.openType = 0.4
+w.delta = 0.6
+w.cvdZ = 0.8
+w.cvdDiv = 0.7
+w.absorb = 0.8
+w.exhaust = 0.5
+w.imbalance = 0.7
+w.trapped = 0.8
+w.largeTrade = 0.5
+w.regimeTrend = 1.0
+w.mtfBias = 0.9
+w.rsIndex = 0.5
+w.smt = 0.7
+w.tickCum = 0.4
+w.tickExt = 0.4
+w.tickDiv = 0.5
+w.megaCap = 0.5
+
+# ---- regime gates: gate.<regime>.<group>, groups: trend flow reversal location intermarket context
+# trend regimes favour continuation and damp reversal/location; balance inverts location (fade the edges)
+gate.trend.trend = 1.2
+gate.trend.flow = 1.0
+gate.trend.reversal = 0.5
+gate.trend.location = 0.5
+gate.trend.intermarket = 1.0
+gate.trend.context = 1.0
+gate.balance.trend = 0.6
+gate.balance.flow = 1.0
+gate.balance.reversal = 1.3
+gate.balance.location = -0.8
+gate.balance.intermarket = 1.0
+gate.balance.context = 1.0
+gate.chop.trend = 0.5
+gate.chop.flow = 0.5
+gate.chop.reversal = 0.5
+gate.chop.location = 0.5
+gate.chop.intermarket = 0.5
+gate.chop.context = 0.5
+
+# ---- thresholds ------------------------------------------------------------------------
+thr.signal = 40
+thr.fade = 20
