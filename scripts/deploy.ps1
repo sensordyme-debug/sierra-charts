@@ -44,7 +44,7 @@ Get-ChildItem (Join-Path $root "src\sierra") -Filter "*.cpp" | ForEach-Object {
 $cb = Join-Path $root "sierra\chartbooks"
 if (Test-Path $cb) { Get-ChildItem $cb -Filter "*.Cht" | ForEach-Object { Copy-Item $_.FullName -Destination $data -Force; $copied += "Data\" + $_.Name } }
 $sc = Join-Path $root "sierra\studycollections"
-if (Test-Path $sc) { Get-ChildItem $sc -File | ForEach-Object { Copy-Item $_.FullName -Destination $data -Force; $copied += "Data\" + $_.Name } }
+if (Test-Path $sc) { Get-ChildItem $sc -File -Filter "*.StdyCollct" | ForEach-Object { Copy-Item $_.FullName -Destination $data -Force; $copied += "Data\" + $_.Name } }
 $w = Join-Path $root "config\NQEdge_weights.txt"
 if (Test-Path $w) {
     $dst = Join-Path $data "NQEdge_weights.txt"
