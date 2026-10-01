@@ -37,3 +37,7 @@
 ## Phase 7 — Validation + Feature Logger
 - Validation: every signal replayed forward on closed bars with configurable slippage (entry and stop), stop-first on ambiguous bars, T1 win / stop loss / timeout (mark-to-market) resolution, T2 tracking, MFE/MAE in R, bars to resolution; per-setup count/win %/avg R/PF/T2 %; cumulative-R curve subgraph; results feed the HUD with a small-sample warning.
 - Feature logger: one CSV row per closed bar written only once the +60 min window has closed (forward returns at +5/+15/+30/+60 in ATR, MFE/MAE), file per symbol in the Data folder, rewrite on full recalculation (input), RTH-only filter.
+
+## Phase 8 — Python research loop
+- `research/nqedge_research.py`: loads the feature logs, labels direction beyond an ATR threshold, walk-forward (rolling train/test by trading day, no shuffling) logistic regression + LightGBM (scikit-learn HistGradientBoosting fallback), hit rate / expectancy in R / profit factor / coverage per model, setup and regime, calibration tables, feature importances, and exports `NQEdge_weights.txt` (weights, regime gates from per-regime fits, hit-rate-derived threshold) with `--deploy` into Sierra's Data folder. `--synthetic N` smoke test.
+- `research/README.md`, `research/requirements.txt`.

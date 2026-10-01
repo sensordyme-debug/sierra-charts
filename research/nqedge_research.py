@@ -137,7 +137,7 @@ def walk_forward(df: pd.DataFrame, X: np.ndarray, y: np.ndarray, usable: np.ndar
         if tr.sum() >= min_train and te.sum() > 0:
             scaler = StandardScaler().fit(X[tr])
             Xtr, Xte = scaler.transform(X[tr]), scaler.transform(X[te])
-            lr = LogisticRegression(C=C, penalty="l2", class_weight="balanced", max_iter=500)
+            lr = LogisticRegression(C=C, class_weight="balanced", max_iter=500)   # L2 (default)
             lr.fit(Xtr, y[tr])
             p_lr = lr.predict_proba(Xte)[:, 1]
             scale = np.where(scaler.scale_ > 0, scaler.scale_, 1.0)
@@ -282,7 +282,7 @@ def main() -> None:
         if rmask.sum() < 1500:
             continue
         sc_ = StandardScaler().fit(Xf[rmask])
-        lr = LogisticRegression(C=args.C, penalty="l2", class_weight="balanced", max_iter=500).fit(sc_.transform(Xf[rmask]), y[rmask])
+        lr = LogisticRegression(C=args.C, class_weight="balanced", max_iter=500).fit(sc_.transform(Xf[rmask]), y[rmask])
         rc = lr.coef_[0] / np.where(sc_.scale_ > 0, sc_.scale_, 1.0)
         for g in GROUP_NAMES:
             idx = [i for i, f in enumerate(FEATURES) if GROUPS[f] == g]
