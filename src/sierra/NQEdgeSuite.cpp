@@ -3129,6 +3129,7 @@ namespace nqe
 		}
 
 		void DrawZones(Frame& F);
+		void DrawDepthHeatmap(Frame& F);
 		// ---------------- Backdrop: regime tint, session shade, separators, VWAP cloud -----------------
 		void DrawBackdrop(Frame& F)
 		{
@@ -3137,6 +3138,7 @@ namespace nqe
 			const BaseState& B = S.base; const RegimeState& R = S.regime; const VwapState& W = S.vwap;
 			const int half = F.spacing / 2 + 1;
 			F.Clip(F.left, F.top, F.right, F.bottom);
+			if (V.layer[L_DEPTH] && !S.warn.noDepth) DrawDepthHeatmap(F);
 			// regime tint + ETH shade per visible bar
 			if ((V.layer[L_TINT] || V.layer[L_SESSION]) && !R.regime.empty())
 			{
@@ -3690,6 +3692,124 @@ namespace nqe
 			F.Unclip();
 		}
 
+		// ---------------- Footprint Pro: bid x ask cells with delta heat, imbalances, POC, unfinished auctions ----------------
+		void DrawFootprint(Frame& F)
+		{
+			SCStudyInterfaceRef sc = F.sc; ChartState& S = F.S; const Theme& T = F.T; const VisualConfig& V = F.V; const FlowParams& P = S.params.flow;
+			if (sc.VolumeAtPriceForBars == nullptr || F.spacing < 8) return;
+			const int cellW = F.spacing - 2, half = cellW / 2;
+			const bool textMode = cellW >= 34;
+			F.Font(Max(7, V.fontPt - 2), false);
+			const int fh = F.fontH;
+			const double ratio = P.imbRatioPct / 100.0, minV = P.imbMinVolume;
+			char buf[32];
+			std::vector<const s_VolumeAtPriceV2*> lv; lv.reserve(64);
+			const int nVap = static_cast<int>(sc.VolumeAtPriceForBars->GetNumberOfBars());
+			for (int i = F.firstVis; i <= F.lastVis && i < nVap; ++i)
+			{
+				const int cnt = sc.VolumeAtPriceForBars->GetSizeAtBarIndex(i);
+				if (cnt <= 0) continue;
+				lv.clear();
+				for (int q = 0; q < cnt; ++q) { const s_VolumeAtPriceV2* p = nullptr; if (sc.VolumeAtPriceForBars->GetVAPElementAtIndex(i, q, &p) && p) lv.push_back(p); }
+				const int m = static_cast<int>(lv.size()); if (m == 0) continue;
+				double maxAbs = 1, maxVol = 0; int pocQ = 0;
+				for (int q = 0; q < m; ++q) { maxAbs = Max(maxAbs, fabs(lv[q]->AskVolume - lv[q]->BidVolume)); if (lv[q]->Volume > maxVol) { maxVol = lv[q]->Volume; pocQ = q; } }
+				const bool forming = (i == F.n - 1);
+				const int x = F.XOf(i);
+				// imbalance flags per level + stacks
+				std::vector<signed char> imb(m, 0); std::vector<unsigned char> stacked(m, 0);
+				for (int q = 0; q < m; ++q)
+				{
+					const bool adjBelow = q > 0 && lv[q]->PriceInTicks - lv[q - 1]->PriceInTicks == 1;
+					const bool adjAbove = q + 1 < m && lv[q + 1]->PriceInTicks - lv[q]->PriceInTicks == 1;
+					if (adjBelow && lv[q]->AskVolume >= minV && lv[q - 1]->BidVolume >= minV && lv[q]->AskVolume >= ratio * lv[q - 1]->BidVolume) imb[q] = 1;
+					if (adjAbove && lv[q]->BidVolume >= minV && lv[q + 1]->AskVolume >= minV && lv[q]->BidVolume >= ratio * lv[q + 1]->AskVolume) imb[q] = static_cast<signed char>(imb[q] == 1 ? 2 : -1);
+				}
+				for (int side = -1; side <= 1; side += 2)
+				{
+					int run = 0;
+					for (int q = 0; q <= m; ++q)
+					{
+						const bool on = q < m && (imb[q] == side || imb[q] == 2) && (q == 0 || lv[q]->PriceInTicks - lv[q - 1]->PriceInTicks == 1 || run == 0);
+						if (on) ++run; else { if (run >= P.imbStackLevels) for (int r = q - run; r < q; ++r) stacked[r] = 1; run = 0; }
+					}
+				}
+				for (int q = 0; q < m; ++q)
+				{
+					const float price = lv[q]->PriceInTicks * F.tick;
+					int y1 = F.YOf(price + 0.5f * F.tick), y2 = F.YOf(price - 0.5f * F.tick);
+					if (y2 < F.top || y1 > F.bottom) continue;
+					if (y2 - y1 < 2) y2 = y1 + 2;
+					const double d = lv[q]->AskVolume - lv[q]->BidVolume;
+					const float inten = static_cast<float>(0.12 + 0.70 * fabs(d) / maxAbs);
+					uint32_t c = Blend(T.bg, d >= 0 ? T.bull : T.bear, inten);
+					if (forming) c = Blend(c, T.bg, 0.35f);
+					F.Fill(x - half, y1, x + half, y2, c, 100);
+					if (textMode && (y2 - y1) >= fh)
+					{
+						sprintf_s(buf, sizeof(buf), "%.0fx%.0f", lv[q]->BidVolume, lv[q]->AskVolume);
+						F.TextCenter(x, y1 + (y2 - y1 - fh) / 2, buf, inten > 0.5f ? T.bg : T.text);
+					}
+					if (imb[q] != 0)
+					{
+						const uint32_t ic = imb[q] == 1 ? T.bull : (imb[q] == -1 ? T.bear : T.gold);
+						F.Box(x - half, y1, x + half, y2, stacked[q] ? Blend(ic, T.text, 0.3f) : ic, stacked[q] ? 2 : 1);
+					}
+					if (q == pocQ) F.Box(x - half - 1, y1 - 1, x + half + 1, y2 + 1, T.gold, 2);
+				}
+				// unfinished auctions: both sides traded at the extreme
+				if (lv[m - 1]->BidVolume > 0 && lv[m - 1]->AskVolume > 0) { F.Font(Max(7, V.fontPt - 2), true); F.Text(x + half + 2, F.YOf(lv[m - 1]->PriceInTicks * F.tick + 0.5f * F.tick) - fh, "u", T.gold); F.Font(Max(7, V.fontPt - 2), false); }
+				if (lv[0]->BidVolume > 0 && lv[0]->AskVolume > 0) { F.Font(Max(7, V.fontPt - 2), true); F.Text(x + half + 2, F.YOf(lv[0]->PriceInTicks * F.tick - 0.5f * F.tick) + 1, "u", T.gold); F.Font(Max(7, V.fontPt - 2), false); }
+				// delta above, volume below
+				if (F.spacing >= 20 && i < static_cast<int>(S.flow.delta.size()))
+				{
+					const float dl = S.flow.delta[i];
+					Abbrev(dl, buf, sizeof(buf)); if (dl > 0) { char t[24]; sprintf_s(t, sizeof(t), "+%s", buf); strcpy_s(buf, sizeof(buf), t); }
+					F.TextCenter(x, F.YOf(sc.High[i]) - fh - 3, buf, dl >= 0 ? T.bull : T.bear);
+					Abbrev(sc.Volume[i], buf, sizeof(buf));
+					F.TextCenter(x, F.YOf(sc.Low[i]) + 3, buf, T.dim);
+				}
+			}
+			F.Font(V.fontPt, false);
+		}
+
+		// ---------------- Historical market-depth heatmap (backdrop; only when depth data exists) ----------------
+		void DrawDepthHeatmap(Frame& F)
+		{
+			SCStudyInterfaceRef sc = F.sc; const Theme& T = F.T;
+			if (sc.GetMarketDepthBars == nullptr) return;
+			c_ACSILDepthBars* db = sc.GetMarketDepthBars();
+			if (db == nullptr || db->NumBars() <= 0) return;
+			const int half = F.spacing / 2 + 1;
+			// rolling maximum over the visible bars for intensity scaling
+			int mx = 1;
+			for (int i = F.firstVis; i <= F.lastVis && i < db->NumBars(); ++i)
+			{
+				if (!db->DepthDataExistsAt(i)) continue;
+				int t = db->GetBarLowestPriceTickIndex(i); const int hi = db->GetBarHighestPriceTickIndex(i);
+				for (int guard = 0; t <= hi && guard < 400; ++guard) { mx = Max(mx, db->GetMaxQuantity(i, t)); if (!db->GetNextHigherPriceTickIndex(i, t)) break; }
+			}
+			for (int i = F.firstVis; i <= F.lastVis && i < db->NumBars(); ++i)
+			{
+				if (!db->DepthDataExistsAt(i)) continue;
+				const int x = F.XOf(i);
+				int t = db->GetBarLowestPriceTickIndex(i); const int hi = db->GetBarHighestPriceTickIndex(i);
+				for (int guard = 0; t <= hi && guard < 400; ++guard)
+				{
+					const int q = db->GetMaxQuantity(i, t);
+					if (q > 0)
+					{
+						const float price = db->TickIndexToPrice(t);
+						const int y1 = F.YOf(price + 0.5f * F.tick), y2 = F.YOf(price - 0.5f * F.tick);
+						const float inten = Clamp(static_cast<float>(q) / mx, 0.0f, 1.0f);
+						const uint32_t c = db->GetMaxDominantSide(i, t) == BSE_BUY ? T.bull : T.bear;
+						F.Fill(x - half, y1, x + half + 1, Max(y2, y1 + 1), c, 6 + static_cast<int>(44 * inten));
+					}
+					if (!db->GetNextHigherPriceTickIndex(i, t)) break;
+				}
+			}
+		}
+
 		// ---------------- HUD glass panel (top-right of the future space) ----------------
 		struct HudLayout { int l, t, r, b, pad, lineH; bool compact; };
 
@@ -4038,6 +4158,7 @@ namespace nqe
 		if (sc.Graphics.SetTextAlign) sc.Graphics.SetTextAlign(TA_LEFT | TA_TOP | TA_NOUPDATECP);
 		F.Clip(F.left, F.top, F.right, F.bottom);
 		// layers are added by later phases; order = back to front
+		if (V.layer[L_FOOTPRINT]) render::DrawFootprint(F);
 		if (V.layer[L_PROFILE]) render::DrawProfile(F);
 		if (V.layer[L_LEVELS]) render::DrawLevels(F);
 		if (V.layer[L_CHANNEL]) render::DrawChannel(F);
@@ -4810,6 +4931,7 @@ SCSFExport scsf_NQEdge_Backdrop(SCStudyInterfaceRef sc)
 	CheckDataStamp(sc, S);
 	EnsureVwap(sc, S);          // cloud + separators need VWAP/auction/base; regime tint needs the regime engine
 	EnsureRegime(sc, S);
+	if (S.vis.layer[L_DEPTH] && !S.warn.noDepth && sc.MaintainHistoricalMarketDepthData == 0) sc.MaintainHistoricalMarketDepthData = 1;   // takes effect after a chart reload
 }
 
 // --- 11. Order-Flow Tape (bottom strip) ---------------------------------------
