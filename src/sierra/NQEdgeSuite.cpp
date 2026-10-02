@@ -318,7 +318,7 @@ namespace nqe
 		int finalizedSession = -1, rthOpenSession = -1;
 		float onH = -FLT_MAX, onL = FLT_MAX;
 		float rthHigh = -FLT_MAX, rthLow = FLT_MAX;
-		float ibH = -FLT_MAX, ibL = FLT_MAX; bool ibClosed = false; int ibCloseIdx = -1;
+		float ibH = -FLT_MAX, ibL = FLT_MAX; bool ibClosed = false; int ibCloseIdx = -1; int ibBreakDir = 0;
 		float prevDayHigh = 0, prevDayLow = 0, prevPoc = 0, prevVah = 0, prevVal = 0;
 		float rthOpen = 0; int rthOpenIdx = -1;
 		float o30High = -FLT_MAX, o30Low = FLT_MAX; int o30HighIdx = -1, o30LowIdx = -1;
@@ -506,6 +506,7 @@ namespace nqe
 	struct ValState : EngineCommon
 	{
 		SetupStats stats[SETUP_COUNT];
+		SetupStats stats3[SETUP_COUNT][5][3];      // setup x regime x grade
 		std::vector<float> cumR, addR;
 		int nextSignal = 0;      // first signal index not yet fully resolved
 		double totalR = 0;
@@ -604,6 +605,9 @@ namespace nqe
 	struct PerfStats { double backdropMs = 0, overlayMs = 0, tapeMs = 0; int paints = 0; };
 
 
+	struct Event { int idx; int kind; int dir; float price; char time[8]; char text[72]; };
+	enum EventKind { EV_ABSORB = 1, EV_IMB, EV_TRAP, EV_EXHAUST, EV_DIV, EV_BOS, EV_CHOCH, EV_IBBREAK, EV_SMT, EV_SIGNAL, EV_ACCEPT, EV_REJECT };
+
 	struct DataStamp { int arraySize = 0; double t0 = 0, tMid = 0, tLast = 0; int midIdx = -1, lastIdx = -1; bool valid = false; };
 
 	struct ChartState
@@ -622,6 +626,7 @@ namespace nqe
 		int hudUpdates = 0;
 		VisualConfig vis;
 		PerfStats perf;
+		std::vector<Event> events;
 
 		EngineCommon& Engine(int e)
 		{
@@ -633,6 +638,15 @@ namespace nqe
 			}
 		}
 	};
+
+	inline void PushEvent(SCStudyInterfaceRef sc, ChartState& S, int idx, int kind, int dir, float price, const char* text)
+	{
+		Event e; e.idx = idx; e.kind = kind; e.dir = dir; e.price = price;
+		int hh = 0, mm = 0, ss = 0; sc.BaseDateTimeIn[idx].GetTimeHMS(hh, mm, ss); sprintf_s(e.time, sizeof(e.time), "%02d:%02d", hh, mm);
+		strncpy_s(e.text, sizeof(e.text), text, _TRUNCATE);
+		S.events.push_back(e);
+		if (S.events.size() > 400) S.events.erase(S.events.begin(), S.events.begin() + 100);
+	}
 
 	static std::recursive_mutex g_mutex;
 	static std::map<int, ChartState*> g_charts;
@@ -692,7 +706,7 @@ namespace nqe
 			S.auction.devPoc = S.auction.devVah = S.auction.devVal = 0;
 			S.auction.curDay = 0; S.auction.finalizedSession = -1; S.auction.rthOpenSession = -1;
 			S.auction.onH = -FLT_MAX; S.auction.onL = FLT_MAX; S.auction.rthHigh = -FLT_MAX; S.auction.rthLow = FLT_MAX;
-			S.auction.ibH = -FLT_MAX; S.auction.ibL = FLT_MAX; S.auction.ibClosed = false; S.auction.ibCloseIdx = -1;
+			S.auction.ibH = -FLT_MAX; S.auction.ibL = FLT_MAX; S.auction.ibClosed = false; S.auction.ibCloseIdx = -1; S.auction.ibBreakDir = 0;
 			S.auction.prevDayHigh = S.auction.prevDayLow = S.auction.prevPoc = S.auction.prevVah = S.auction.prevVal = 0;
 			S.auction.rthOpen = 0; S.auction.rthOpenIdx = -1; S.auction.o30High = -FLT_MAX; S.auction.o30Low = FLT_MAX; S.auction.o30HighIdx = S.auction.o30LowIdx = -1;
 			S.auction.todayOpenType = OT_NONE; S.auction.openTypeDone = false; S.auction.openTypeDirValue = 0;
@@ -733,8 +747,9 @@ namespace nqe
 			RefChart* refs[10] = { &S.inter.ym, &S.inter.es, &S.inter.rty, &S.inter.tick, &S.inter.mega[0], &S.inter.mega[1], &S.inter.mega[2], &S.inter.mega[3], &S.inter.mega[4], &S.inter.mega[5] };
 			for (int k = 0; k < 10; ++k) { refs[k]->cumThrough = -1; refs[k]->emaThrough = -1; refs[k]->cumPV.clear(); refs[k]->cumV.clear(); refs[k]->ema.clear(); refs[k]->vwap.clear(); refs[k]->sessStart.clear(); refs[k]->lastRefSize = 0; refs[k]->symbol.Clear(); }
 		}
+		if (engine <= E_AUCTION) S.events.clear();
 		if (engine <= E_DCS) { S.dcs.signals.clear(); S.dcs.lastAlertIdx = -1; S.dcs.lastSignalCheckedIdx = -1; }
-		if (engine <= E_VAL) { for (int k = 0; k < SETUP_COUNT; ++k) S.val.stats[k] = SetupStats(); S.val.nextSignal = 0; S.val.totalR = 0; S.val.addR.clear(); S.val.cumR.clear(); }
+		if (engine <= E_VAL) { for (int k = 0; k < SETUP_COUNT; ++k) { S.val.stats[k] = SetupStats(); for (int r = 0; r < 5; ++r) for (int g = 0; g < 3; ++g) S.val.stats3[k][r][g] = SetupStats(); } S.val.nextSignal = 0; S.val.totalR = 0; S.val.addR.clear(); S.val.cumR.clear(); }
 		if (engine <= E_LOG) { S.log.pending.clear(); S.log.lastQueuedIdx = -1; S.log.headerWritten = false; }
 		++S.resetCount;
 	}
@@ -1193,7 +1208,7 @@ namespace nqe
 				A.rthOpenSession = B.rthSession[i]; A.rthOpen = sc.Open[i]; A.rthOpenIdx = i; A.todayOpenType = OT_NONE; A.openTypeDone = false;
 				A.o30High = -FLT_MAX; A.o30Low = FLT_MAX; A.o30HighIdx = A.o30LowIdx = -1;
 				A.profVol.clear(); A.profTotal = 0; A.tpoMap.clear(); A.periodLevels.clear(); A.lastTpoPeriod = -1;
-				A.rthHigh = -FLT_MAX; A.rthLow = FLT_MAX; A.ibH = -FLT_MAX; A.ibL = FLT_MAX; A.ibClosed = false; A.ibCloseIdx = -1;
+				A.rthHigh = -FLT_MAX; A.rthLow = FLT_MAX; A.ibH = -FLT_MAX; A.ibL = FLT_MAX; A.ibClosed = false; A.ibCloseIdx = -1; A.ibBreakDir = 0;
 			}
 
 			// ---- provisional copies of the committed accumulators for this bar ----
@@ -1315,14 +1330,20 @@ namespace nqe
 				if (A.lastSwingHigh >= 0 && !A.lastHighBroken && A.swings[A.lastSwingHigh].idx < i && c > A.swings[A.lastSwingHigh].price)
 				{
 					A.lastHighBroken = true;
-					if (prevTrend < 0) { A.chochMark[i] = 1; A.lastChochDir = 1; A.lastChochIdx = i; } else { A.bosMark[i] = 1; }
+					if (prevTrend < 0) { A.chochMark[i] = 1; A.lastChochDir = 1; A.lastChochIdx = i; PushEvent(sc, S, i, EV_CHOCH, 1, c, "CHoCH up: swing high broken"); } else { A.bosMark[i] = 1; PushEvent(sc, S, i, EV_BOS, 1, c, "BOS up"); }
 					A.lastBosDir = 1; A.lastBosIdx = i;
 				}
 				if (A.lastSwingLow >= 0 && !A.lastLowBroken && A.swings[A.lastSwingLow].idx < i && c < A.swings[A.lastSwingLow].price)
 				{
 					A.lastLowBroken = true;
-					if (prevTrend > 0) { A.chochMark[i] = -1; A.lastChochDir = -1; A.lastChochIdx = i; } else { A.bosMark[i] = -1; }
+					if (prevTrend > 0) { A.chochMark[i] = -1; A.lastChochDir = -1; A.lastChochIdx = i; PushEvent(sc, S, i, EV_CHOCH, -1, c, "CHoCH down: swing low broken"); } else { A.bosMark[i] = -1; PushEvent(sc, S, i, EV_BOS, -1, c, "BOS down"); }
 					A.lastBosDir = -1; A.lastBosIdx = i;
+				}
+				// first close beyond the initial balance
+				if (rth && ibClosed && ibH > ibL && A.ibBreakDir == 0 && (c > ibH || c < ibL))
+				{
+					A.ibBreakDir = c > ibH ? 1 : -1; char t[64]; sprintf_s(t, sizeof(t), "IB break %s @ %s", c > ibH ? "up" : "down", sc.FormatGraphValue(c, sc.BaseGraphValueFormat).GetChars());
+					PushEvent(sc, S, i, EV_IBBREAK, A.ibBreakDir, c, t);
 				}
 				// liquidity pools die when a close goes through them
 				for (size_t z = 0; z < A.liquidity.size(); ++z)
@@ -1564,6 +1585,11 @@ namespace nqe
 		{
 			if (idx >= F.lastEventIdx) { F.lastEventIdx = idx; F.lastEventPrice = price; strncpy_s(F.lastEventText, sizeof(F.lastEventText), text, _TRUNCATE); }
 		}
+		inline void Note(SCStudyInterfaceRef sc, ChartState& S, int idx, int kind, int dir, float price, const char* text)
+		{
+			char buf[72]; sprintf_s(buf, sizeof(buf), "%s @ %s", text, sc.FormatGraphValue(price, sc.BaseGraphValueFormat).GetChars());
+			PushEvent(sc, S, idx, kind, dir, price, buf);
+		}
 
 		inline void PushMarker(FlowState& F, int idx, int dir, int kind, float price)
 		{
@@ -1683,12 +1709,12 @@ namespace nqe
 					if (F.deltaPct[i] <= -0.10f && (c - l) >= 0.4f * range && l <= prevLow)
 					{
 						Zone z; z.bornIdx = i; z.bottom = l; z.top = l + P.absorbZoneFrac * range; z.dir = 1; z.kind = LVL_ABSORB; z.active = true;
-						F.absorbZones.push_back(z); F.absorbMark[i] = 1; F.lastAbsIdx = i; F.lastAbsDir = 1; SetEvent(F, i, l, "Absorption (buyers)");
+						F.absorbZones.push_back(z); F.absorbMark[i] = 1; F.lastAbsIdx = i; F.lastAbsDir = 1; SetEvent(F, i, l, "Absorption (buyers)"); Note(sc, S, i, EV_ABSORB, 1, l, "absorption: passive buyers");
 					}
 					else if (F.deltaPct[i] >= 0.10f && (h - c) >= 0.4f * range && h >= prevHigh)
 					{
 						Zone z; z.bornIdx = i; z.top = h; z.bottom = h - P.absorbZoneFrac * range; z.dir = -1; z.kind = LVL_ABSORB; z.active = true;
-						F.absorbZones.push_back(z); F.absorbMark[i] = -1; F.lastAbsIdx = i; F.lastAbsDir = -1; SetEvent(F, i, h, "Absorption (sellers)");
+						F.absorbZones.push_back(z); F.absorbMark[i] = -1; F.lastAbsIdx = i; F.lastAbsDir = -1; SetEvent(F, i, h, "Absorption (sellers)"); Note(sc, S, i, EV_ABSORB, -1, h, "absorption: passive sellers");
 					}
 					while (static_cast<int>(F.absorbZones.size()) > Max(5, P.maxActiveZones) * 2) { if (F.absorbZones[0].lineNumber) F.deadLines.push_back(F.absorbZones[0].lineNumber); F.absorbZones.erase(F.absorbZones.begin()); }
 				}
@@ -1712,8 +1738,8 @@ namespace nqe
 								bool upRun = c > sc.Close[i - run], downRun = c < sc.Close[i - run];
 								for (int q = 1; q <= run && q <= i; ++q) { if (sc.High[i - q + 1] < sc.High[i - q]) upRun = false; if (sc.Low[i - q + 1] > sc.Low[i - q]) downRun = false; }
 								const double thin = P.exhaustExtremePct / 100.0 * maxLevelVol;
-								if (upRun && lv[m - 1]->Volume <= thin && (m < 3 || lv[m - 2]->Volume <= thin * 1.5)) { F.exhaustMark[i] = -1; F.lastExhIdx = i; F.lastExhDir = -1; SetEvent(F, i, h, "Exhaustion top"); PushMarker(F, i, -1, 3, h); }
-								else if (downRun && lv[0]->Volume <= thin && (m < 3 || lv[1]->Volume <= thin * 1.5)) { F.exhaustMark[i] = 1; F.lastExhIdx = i; F.lastExhDir = 1; SetEvent(F, i, l, "Exhaustion bottom"); PushMarker(F, i, 1, 3, l); }
+								if (upRun && lv[m - 1]->Volume <= thin && (m < 3 || lv[m - 2]->Volume <= thin * 1.5)) { F.exhaustMark[i] = -1; F.lastExhIdx = i; F.lastExhDir = -1; SetEvent(F, i, h, "Exhaustion top"); PushMarker(F, i, -1, 3, h); Note(sc, S, i, EV_EXHAUST, -1, h, "exhaustion: thin top"); }
+								else if (downRun && lv[0]->Volume <= thin && (m < 3 || lv[1]->Volume <= thin * 1.5)) { F.exhaustMark[i] = 1; F.lastExhIdx = i; F.lastExhDir = 1; SetEvent(F, i, l, "Exhaustion bottom"); PushMarker(F, i, 1, 3, l); Note(sc, S, i, EV_EXHAUST, 1, l, "exhaustion: thin bottom"); }
 							}
 
 							// stacked diagonal imbalances (Sierra Numbers Bars definition)
@@ -1730,13 +1756,13 @@ namespace nqe
 								if (buyRun >= P.imbStackLevels && (q + 1 >= m || !(q + 1 < m && lv[q + 1]->PriceInTicks - lv[q]->PriceInTicks == 1 && lv[q + 1]->AskVolume >= minV && lv[q]->BidVolume >= minV && lv[q + 1]->AskVolume >= ratio * lv[q]->BidVolume)))
 								{
 									Zone z; z.bornIdx = i; z.bottom = (lv[buyStart]->PriceInTicks - 0.5f) * tick; z.top = (lv[q]->PriceInTicks + 0.5f) * tick; z.dir = 1; z.kind = LVL_IMB; z.active = true;
-									F.imbZones.push_back(z); F.imbMark[i] = static_cast<signed char>(F.imbMark[i] == -1 ? 2 : 1); F.lastImbIdx = i; F.lastImbDir = 1; SetEvent(F, i, z.bottom, "Stacked buy imbalance");
+									F.imbZones.push_back(z); F.imbMark[i] = static_cast<signed char>(F.imbMark[i] == -1 ? 2 : 1); F.lastImbIdx = i; F.lastImbDir = 1; SetEvent(F, i, z.bottom, "Stacked buy imbalance"); Note(sc, S, i, EV_IMB, 1, z.bottom, "stacked buy imbalance");
 									buyRun = 0;
 								}
 								if (sellRun >= P.imbStackLevels && (q + 1 >= m || !(q + 2 < m && lv[q + 2]->PriceInTicks - lv[q + 1]->PriceInTicks == 1 && lv[q + 1]->BidVolume >= minV && lv[q + 2]->AskVolume >= minV && lv[q + 1]->BidVolume >= ratio * lv[q + 2]->AskVolume)))
 								{
 									Zone z; z.bornIdx = i; z.bottom = (lv[sellStart]->PriceInTicks - 0.5f) * tick; z.top = (lv[q]->PriceInTicks + 0.5f) * tick; z.dir = -1; z.kind = LVL_IMB; z.active = true;
-									F.imbZones.push_back(z); F.imbMark[i] = static_cast<signed char>(F.imbMark[i] == 1 ? 2 : -1); F.lastImbIdx = i; F.lastImbDir = -1; SetEvent(F, i, z.top, "Stacked sell imbalance");
+									F.imbZones.push_back(z); F.imbMark[i] = static_cast<signed char>(F.imbMark[i] == 1 ? 2 : -1); F.lastImbIdx = i; F.lastImbDir = -1; SetEvent(F, i, z.top, "Stacked sell imbalance"); Note(sc, S, i, EV_IMB, -1, z.top, "stacked sell imbalance");
 									sellRun = 0;
 								}
 							}
@@ -1784,13 +1810,13 @@ namespace nqe
 						if (i - bo.idx > P.trapReversalBars) done = true;
 						else if (bo.dir > 0 && c < bo.extreme)
 						{
-							F.trapMark[i] = -1; F.lastTrapIdx = i; F.lastTrapDir = -1; SetEvent(F, i, bo.extreme, "Trapped longs"); PushMarker(F, i, -1, 2, h); done = true;
+							F.trapMark[i] = -1; F.lastTrapIdx = i; F.lastTrapDir = -1; SetEvent(F, i, bo.extreme, "Trapped longs"); PushMarker(F, i, -1, 2, h); done = true; Note(sc, S, i, EV_TRAP, -1, bo.extreme, "trapped longs");
 							float hh = -FLT_MAX; for (int q = bo.idx; q <= i; ++q) hh = Max(hh, sc.High[q]);
 							Zone z; z.bornIdx = i; z.top = hh; z.bottom = Max(bo.extreme, hh - 0.35f * atr); z.dir = -1; z.kind = LVL_FAILED; z.active = true; F.failedZones.push_back(z);
 						}
 						else if (bo.dir < 0 && c > bo.extreme)
 						{
-							F.trapMark[i] = 1; F.lastTrapIdx = i; F.lastTrapDir = 1; SetEvent(F, i, bo.extreme, "Trapped shorts"); PushMarker(F, i, 1, 2, l); done = true;
+							F.trapMark[i] = 1; F.lastTrapIdx = i; F.lastTrapDir = 1; SetEvent(F, i, bo.extreme, "Trapped shorts"); PushMarker(F, i, 1, 2, l); done = true; Note(sc, S, i, EV_TRAP, 1, bo.extreme, "trapped shorts");
 							float ll = FLT_MAX; for (int q = bo.idx; q <= i; ++q) ll = Min(ll, sc.Low[q]);
 							Zone z; z.bornIdx = i; z.bottom = ll; z.top = Min(bo.extreme, ll + 0.35f * atr); z.dir = 1; z.kind = LVL_FAILED; z.active = true; F.failedZones.push_back(z);
 						}
@@ -1818,8 +1844,8 @@ namespace nqe
 						if (fabs(ns.price - ps.price) >= P.divMinAtr * atr && ns.idx < n && ps.idx < n)
 						{
 							const float cvdNew = F.cvd[ns.idx], cvdOld = F.cvd[ps.idx];
-							if (ns.high && ns.price > ps.price && cvdNew <= cvdOld) { F.divMark[i] = -1; F.lastDivIdx = i; F.lastDivDir = -1; F.lastDivPrice = ns.price; PushMarker(F, ns.idx, -1, 1, ns.price); }
-							else if (!ns.high && ns.price < ps.price && cvdNew >= cvdOld) { F.divMark[i] = 1; F.lastDivIdx = i; F.lastDivDir = 1; F.lastDivPrice = ns.price; PushMarker(F, ns.idx, 1, 1, ns.price); }
+							if (ns.high && ns.price > ps.price && cvdNew <= cvdOld) { F.divMark[i] = -1; F.lastDivIdx = i; F.lastDivDir = -1; F.lastDivPrice = ns.price; PushMarker(F, ns.idx, -1, 1, ns.price); Note(sc, S, ns.idx, EV_DIV, -1, ns.price, "CVD divergence: HH, weaker delta"); }
+							else if (!ns.high && ns.price < ps.price && cvdNew >= cvdOld) { F.divMark[i] = 1; F.lastDivIdx = i; F.lastDivDir = 1; F.lastDivPrice = ns.price; PushMarker(F, ns.idx, 1, 1, ns.price); Note(sc, S, ns.idx, EV_DIV, 1, ns.price, "CVD divergence: LL, stronger delta"); }
 						}
 					}
 				}
@@ -2226,6 +2252,7 @@ namespace nqe
 					{
 						smtNow = (ns.high ? -1.0f : 1.0f) * static_cast<float>(diverging) / checked;
 						I.smtMark[i] = ns.high ? -1 : 1; I.lastSmtIdx = i; I.lastSmtVal = smtNow; I.lastSmtPrice = ns.price;
+						{ char t[72]; sprintf_s(t, sizeof(t), "SMT: %s %s, index no %s", sc.Symbol.GetChars(), ns.high ? "HH" : "LL", ns.high ? "HH" : "LL"); PushEvent(sc, S, ns.idx, EV_SMT, ns.high ? -1 : 1, ns.price, t); }
 					}
 				}
 			}
@@ -2448,7 +2475,39 @@ namespace nqe
 			return true;
 		}
 
-		struct Candidate { int type; int dir; float stop; float refLevel; int refKind; int score; };
+		struct Candidate { int type; int dir; float stop; float refLevel; int refKind; int score; float trigger; };
+
+		// Confluence grade: bias + location quality + trigger strength + intermarket agreement + regime fit -> A/B/C
+		int GradeSignal(ChartState& S, int i, const Candidate& cd, float dcs, float thr)
+		{
+			const InterState& I = S.inter; const RegimeState& R = S.regime;
+			float score = 0;
+			const float ad = static_cast<float>(fabs(dcs));
+			score += ad >= thr ? 1.0f : (ad >= 0.5f * thr ? 0.5f : 0.0f);
+			switch (cd.refKind)
+			{
+			case LVL_VWAP: case LVL_POC: case LVL_VAH: case LVL_VAL: case LVL_PDH: case LVL_PDL: case LVL_IBH: case LVL_IBL: case LVL_NAKED_POC: case LVL_LIQ_EQH: case LVL_LIQ_EQL: case LVL_ABSORB: score += 1.0f; break;
+			default: score += 0.5f; break;
+			}
+			score += Min(1.5f, cd.trigger);
+			{
+				float s = 0; int n = 0;
+				const float parts[3] = { I.rsIndex[i], I.megaCap[i], I.tickCum[i] };
+				for (int k = 0; k < 3; ++k) if (!IsNan(parts[k])) { s += parts[k]; ++n; }
+				if (n == 0) score += 0.5f; else { const float m = s / n; score += (m * cd.dir > 0.1f) ? 1.0f : (m * cd.dir < -0.1f ? -0.5f : 0.25f); }
+			}
+			const int reg = R.regime[i];
+			switch (cd.type)
+			{
+			case SETUP_TREND_PULLBACK: score += (reg == RG_TREND_UP || reg == RG_TREND_DOWN) ? 1.0f : 0.25f; break;
+			case SETUP_VALUE_EDGE: score += reg == RG_BALANCE ? 1.0f : 0.25f; break;
+			case SETUP_FAILED_BREAKOUT: score += 0.75f; break;
+			case SETUP_BREAK_ACCEPT: score += (reg == RG_TREND_UP || reg == RG_TREND_DOWN) ? 1.0f : 0.6f; break;
+			case SETUP_DIVERGENCE: score += reg == RG_BALANCE ? 1.0f : 0.5f; break;
+			default: break;
+			}
+			return score >= 4.0f ? 1 : (score >= 3.0f ? 2 : 3);
+		}
 
 		bool BuildSignal(SCStudyInterfaceRef sc, ChartState& S, int i, const Candidate& cd, const std::vector<Lv>& lv, Signal& out)
 		{
@@ -2534,9 +2593,9 @@ namespace nqe
 				static const int kinds[] = { LVL_VWAP, LVL_VWAP_B1D, LVL_VWAP_B1U, LVL_POC, LVL_ABSORB, -1 };
 				float lp; int lk;
 				if (reg == RG_TREND_UP && dcs >= thr && (!P.requireMtf || mtf > 0.1f) && NearLevel(lv, l, tol, kinds, lp, lk) && c > lp && (F.absorbMark[i] == 1 || deltaFlipUp || imbBuy))
-					cands.push_back({ SETUP_TREND_PULLBACK, 1, Min(l, lp) - buf, lp, lk, 3 });
+					cands.push_back({ SETUP_TREND_PULLBACK, 1, Min(l, lp) - buf, lp, lk, 3, (F.absorbMark[i] == 1 ? 1.0f : 0.0f) + (imbBuy ? 1.0f : 0.0f) + (deltaFlipUp ? 0.5f : 0.0f) });
 				if (reg == RG_TREND_DOWN && dcs <= -thr && (!P.requireMtf || mtf < -0.1f) && NearLevel(lv, h, tol, kinds, lp, lk) && c < lp && (F.absorbMark[i] == -1 || deltaFlipDn || imbSell))
-					cands.push_back({ SETUP_TREND_PULLBACK, -1, Max(h, lp) + buf, lp, lk, 3 });
+					cands.push_back({ SETUP_TREND_PULLBACK, -1, Max(h, lp) + buf, lp, lk, 3, (F.absorbMark[i] == -1 ? 1.0f : 0.0f) + (imbSell ? 1.0f : 0.0f) + (deltaFlipDn ? 0.5f : 0.0f) });
 			}
 			// 2. Value-edge rejection in balance
 			if (P.setupOn[SETUP_VALUE_EDGE] && reg == RG_BALANCE)
@@ -2545,9 +2604,9 @@ namespace nqe
 				static const int loKinds[] = { LVL_VAL, LVL_PD_VAL, LVL_IBL, LVL_VWAP_B2D, -1 };
 				float lp; int lk;
 				if (dcs <= -fadeThr * 0.5f && NearLevel(lv, h, tol, hiKinds, lp, lk) && c < lp && (F.absorbMark[i] == -1 || F.exhaustMark[i] == -1 || F.trapMark[i] == -1 || (dPct <= -0.15f && h >= lp)))
-					cands.push_back({ SETUP_VALUE_EDGE, -1, Max(h, lp) + buf, lp, lk, 2 });
+					cands.push_back({ SETUP_VALUE_EDGE, -1, Max(h, lp) + buf, lp, lk, 2, (F.absorbMark[i] == -1 ? 1.0f : 0.0f) + (F.exhaustMark[i] == -1 ? 0.75f : 0.0f) + (F.trapMark[i] == -1 ? 1.0f : 0.0f) + (dPct <= -0.15f ? 0.5f : 0.0f) });
 				if (dcs >= fadeThr * 0.5f && NearLevel(lv, l, tol, loKinds, lp, lk) && c > lp && (F.absorbMark[i] == 1 || F.exhaustMark[i] == 1 || F.trapMark[i] == 1 || (dPct >= 0.15f && l <= lp)))
-					cands.push_back({ SETUP_VALUE_EDGE, 1, Min(l, lp) - buf, lp, lk, 2 });
+					cands.push_back({ SETUP_VALUE_EDGE, 1, Min(l, lp) - buf, lp, lk, 2, (F.absorbMark[i] == 1 ? 1.0f : 0.0f) + (F.exhaustMark[i] == 1 ? 0.75f : 0.0f) + (F.trapMark[i] == 1 ? 1.0f : 0.0f) + (dPct >= 0.15f ? 0.5f : 0.0f) });
 			}
 			// 3. Failed breakout / trapped traders
 			if (P.setupOn[SETUP_FAILED_BREAKOUT] && F.trapMark[i] != 0)
@@ -2558,8 +2617,8 @@ namespace nqe
 				float ext = F.trapMark[i] < 0 ? -FLT_MAX : FLT_MAX;
 				for (int q = Max(0, i - K); q <= i; ++q) ext = F.trapMark[i] < 0 ? Max(ext, sc.High[q]) : Min(ext, sc.Low[q]);
 				float lp; int lk;
-				if (F.trapMark[i] < 0 && dcs < thr && NearLevel(lv, ext, tol * 1.5f, hiKinds, lp, lk)) cands.push_back({ SETUP_FAILED_BREAKOUT, -1, ext + buf, lp, lk, 4 });
-				if (F.trapMark[i] > 0 && dcs > -thr && NearLevel(lv, ext, tol * 1.5f, loKinds, lp, lk)) cands.push_back({ SETUP_FAILED_BREAKOUT, 1, ext - buf, lp, lk, 4 });
+				if (F.trapMark[i] < 0 && dcs < thr && NearLevel(lv, ext, tol * 1.5f, hiKinds, lp, lk)) cands.push_back({ SETUP_FAILED_BREAKOUT, -1, ext + buf, lp, lk, 4, 1.0f + (F.absorbMark[i] == -1 ? 0.5f : 0.0f) + (dPct <= -0.15f ? 0.5f : 0.0f) });
+				if (F.trapMark[i] > 0 && dcs > -thr && NearLevel(lv, ext, tol * 1.5f, loKinds, lp, lk)) cands.push_back({ SETUP_FAILED_BREAKOUT, 1, ext - buf, lp, lk, 4, 1.0f + (F.absorbMark[i] == 1 ? 0.5f : 0.0f) + (dPct >= 0.15f ? 0.5f : 0.0f) });
 			}
 			// 4. Break-and-acceptance
 			if (P.setupOn[SETUP_BREAK_ACCEPT] && i >= 2 && (reg == RG_TREND_UP || reg == RG_TREND_DOWN || reg == RG_BALANCE))
@@ -2574,9 +2633,9 @@ namespace nqe
 					for (int q = 0; hiKinds[q] >= 0; ++q) if (lv[k].kind == hiKinds[q]) hi = true;
 					for (int q = 0; loKinds[q] >= 0; ++q) if (lv[k].kind == loKinds[q]) lo = true;
 					if (hi && dcs >= thr && dPct > 0 && flowUp && c > L && sc.Close[i - 1] > L && sc.Close[i - 2] <= L && c - L <= 2.0f * atr)
-					{ cands.push_back({ SETUP_BREAK_ACCEPT, 1, L - buf, L, lv[k].kind, 2 }); break; }
+					{ cands.push_back({ SETUP_BREAK_ACCEPT, 1, L - buf, L, lv[k].kind, 2, (imbBuy ? 1.0f : 0.5f) + (F.cvdZ[i] > 1.0f ? 0.5f : 0.0f) }); break; }
 					if (lo && dcs <= -thr && dPct < 0 && flowDn && c < L && sc.Close[i - 1] < L && sc.Close[i - 2] >= L && L - c <= 2.0f * atr)
-					{ cands.push_back({ SETUP_BREAK_ACCEPT, -1, L + buf, L, lv[k].kind, 2 }); break; }
+					{ cands.push_back({ SETUP_BREAK_ACCEPT, -1, L + buf, L, lv[k].kind, 2, (imbSell ? 1.0f : 0.5f) + (F.cvdZ[i] < -1.0f ? 0.5f : 0.0f) }); break; }
 				}
 			}
 			// 5. SMT / CVD divergence reversal at liquidity
@@ -2589,8 +2648,8 @@ namespace nqe
 				float pivot = dir > 0 ? FLT_MAX : -FLT_MAX;
 				for (int k = static_cast<int>(A.swings.size()) - 1; k >= 0; --k) { if (A.swings[k].confirmIdx == i) { pivot = A.swings[k].price; break; } if (A.swings[k].confirmIdx < i) break; }
 				float lp; int lk;
-				if (dir > 0 && pivot < FLT_MAX && dcs > -thr && NearLevel(lv, pivot, tol * 1.5f, loKinds, lp, lk)) cands.push_back({ SETUP_DIVERGENCE, 1, pivot - buf, lp, lk, 3 });
-				if (dir < 0 && pivot > -FLT_MAX && dcs < thr && NearLevel(lv, pivot, tol * 1.5f, hiKinds, lp, lk)) cands.push_back({ SETUP_DIVERGENCE, -1, pivot + buf, lp, lk, 3 });
+				if (dir > 0 && pivot < FLT_MAX && dcs > -thr && NearLevel(lv, pivot, tol * 1.5f, loKinds, lp, lk)) cands.push_back({ SETUP_DIVERGENCE, 1, pivot - buf, lp, lk, 3, (F.divMark[i] != 0 ? 1.0f : 0.0f) + (I.smtMark[i] != 0 ? 1.0f : 0.0f) + (F.absorbMark[i] == 1 ? 0.5f : 0.0f) });
+				if (dir < 0 && pivot > -FLT_MAX && dcs < thr && NearLevel(lv, pivot, tol * 1.5f, hiKinds, lp, lk)) cands.push_back({ SETUP_DIVERGENCE, -1, pivot + buf, lp, lk, 3, (F.divMark[i] != 0 ? 1.0f : 0.0f) + (I.smtMark[i] != 0 ? 1.0f : 0.0f) + (F.absorbMark[i] == -1 ? 0.5f : 0.0f) });
 			}
 
 			// choose the strongest candidate that yields a valid trade plan
@@ -2601,7 +2660,7 @@ namespace nqe
 				Signal tmp;
 				if (!BuildSignal(sc, S, i, cands[k], lv, tmp)) continue;
 				const int score = cands[k].score * 100 + static_cast<int>(tmp.rr * 10);
-				if (score > bestScore) { bestScore = score; best = static_cast<int>(k); sig = tmp; }
+				if (score > bestScore) { bestScore = score; best = static_cast<int>(k); sig = tmp; sig.grade = GradeSignal(S, i, cands[k], dcs, thr); }
 			}
 			if (best >= 0)
 			{
@@ -2614,6 +2673,7 @@ namespace nqe
 					if (D.signals.size() > 5000) D.signals.erase(D.signals.begin(), D.signals.begin() + 1000);
 					D.signalType[i] = static_cast<signed char>(sig.type); D.signalDir[i] = static_cast<signed char>(sig.dir);
 					D.newSignals = true;
+					{ char t[72]; sprintf_s(t, sizeof(t), "%s %s %c", sig.dir > 0 ? "LONG" : "SHORT", kSetupNames[sig.type], sig.grade == 1 ? 'A' : (sig.grade == 2 ? 'B' : 'C')); PushEvent(sc, S, i, EV_SIGNAL, sig.dir, sig.entry, t); }
 				}
 			}
 		}
@@ -2676,11 +2736,16 @@ namespace nqe
 				g.resolved = res; g.resultR = resultR; g.resIdx = resIdx; g.barsToRes = resIdx - g.idx; g.mfeR = mfe; g.maeR = mae;
 			}
 			if (g.resIdx >= 0 && g.resIdx < n) { V.addR[g.resIdx] += g.resultR; earliestRes = Min(earliestRes, g.resIdx); }
-			SetupStats& st = V.stats[Clamp(g.type, 0, SETUP_COUNT - 1)];
-			++st.count; st.sumR += g.resultR; st.sumMfe += g.mfeR; st.sumMae += g.maeR; st.sumBars += g.barsToRes;
-			if (g.resolved == 1) { ++st.wins; st.sumWinR += g.resultR; if (g.hitT2) ++st.t2; }
-			else if (g.resolved == -1) { ++st.losses; st.sumLossR += g.resultR; }
-			else { ++st.timeouts; if (g.resultR >= 0) st.sumWinR += g.resultR; else st.sumLossR += g.resultR; }
+			const int regAt = (g.idx < static_cast<int>(S.regime.regime.size())) ? Clamp(static_cast<int>(S.regime.regime[g.idx]), 0, 4) : 0;
+			SetupStats* targets[2] = { &V.stats[Clamp(g.type, 0, SETUP_COUNT - 1)], &V.stats3[Clamp(g.type, 0, SETUP_COUNT - 1)][regAt][Clamp(g.grade, 1, 3) - 1] };
+			for (int q = 0; q < 2; ++q)
+			{
+				SetupStats& st = *targets[q];
+				++st.count; st.sumR += g.resultR; st.sumMfe += g.mfeR; st.sumMae += g.maeR; st.sumBars += g.barsToRes;
+				if (g.resolved == 1) { ++st.wins; st.sumWinR += g.resultR; if (g.hitT2) ++st.t2; }
+				else if (g.resolved == -1) { ++st.losses; st.sumLossR += g.resultR; }
+				else { ++st.timeouts; if (g.resultR >= 0) st.sumWinR += g.resultR; else st.sumLossR += g.resultR; }
+			}
 			V.totalR += g.resultR;
 		}
 		while (V.nextSignal < static_cast<int>(D.signals.size()) && D.signals[V.nextSignal].resolved != 0) ++V.nextSignal;
@@ -3470,6 +3535,102 @@ namespace nqe
 			}
 		}
 
+		// ---------------- Signal cards + risk/reward boxes ----------------
+		void DrawCards(Frame& F)
+		{
+			SCStudyInterfaceRef sc = F.sc; ChartState& S = F.S; const Theme& T = F.T; const VisualConfig& V = F.V;
+			const DcsState& D = S.dcs;
+			if (D.signals.empty()) return;
+			const int xEnd = F.fillVisible ? F.fillLeft + Max(10, F.spacing * 6) : F.right;
+			int drawn = 0;
+			for (int k = static_cast<int>(D.signals.size()) - 1; k >= 0 && drawn < 40; --k)
+			{
+				const Signal& g = D.signals[k];
+				if (g.grade > V.minGrade) continue;
+				const int endIdx = g.resolved != 0 ? g.resIdx : -1;
+				if (g.idx > F.lastVis) continue;
+				if (endIdx >= 0 && endIdx < F.firstVis) continue;
+				if (endIdx < 0 && g.idx < F.firstVis - 600) continue;
+				++drawn;
+				const int x1 = F.XOf(Max(g.idx, F.firstVis));
+				const int x2 = endIdx >= 0 ? F.XOf(Min(endIdx, F.lastVis)) + F.spacing / 2 : xEnd;
+				const int yE = F.YOf(g.entry), yS = F.YOf(g.stop), yT1 = F.YOf(g.t1), yT2 = F.YOf(g.t2);
+				const bool live = endIdx < 0;
+				const int aProfit = live ? 14 : 8, aRisk = live ? 16 : 8;
+				// reward box entry..T2, risk box entry..stop
+				F.Fill(x1, Min(yE, yT2), x2, Max(yE, yT2), T.bull, aProfit);
+				F.Fill(x1, Min(yE, yS), x2, Max(yE, yS), T.bear, aRisk);
+				F.Line(x1, yE, x2, yE, T.text, 1);
+				F.Line(x1, yT1, x2, yT1, T.bull, 1, 2);
+				F.Line(x1, yT2, x2, yT2, Blend(T.bull, T.bg, 0.4f), 1, 2);
+				F.Line(x1, yS, x2, yS, T.bear, 1, 1);
+				// arrow at the signal bar
+				const int ax = F.XOf(g.idx);
+				if (F.Visible(g.idx))
+				{
+					const int ay = g.dir > 0 ? F.YOf(sc.Low[g.idx]) + 4 : F.YOf(sc.High[g.idx]) - 4;
+					F.Arrow(ax, ay + (g.dir > 0 ? 14 : -14), ax, ay, g.dir > 0 ? T.bull : T.bear, 2, 0);
+				}
+				// label card
+				char card[160];
+				const char grade = g.grade == 1 ? 'A' : (g.grade == 2 ? 'B' : 'C');
+				if (g.resolved == 0)
+				{
+					const SetupStats& st = S.val.stats[Clamp(g.type, 0, SETUP_COUNT - 1)];
+					if (st.count > 0) sprintf_s(card, sizeof(card), "%s \xB7 %c \xB7 hist %.0f%% n=%d", g.label, grade, 100.0 * st.wins / Max(1, st.wins + st.losses), st.count);
+					else sprintf_s(card, sizeof(card), "%s \xB7 %c", g.label, grade);
+				}
+				else sprintf_s(card, sizeof(card), "%s %s %+.1fR \xB7 %c", g.resolved == 1 ? "WIN" : (g.resolved == -1 ? "LOSS" : "TIMEOUT"), g.resolved == 1 ? "\xFB" : (g.resolved == -1 ? "x" : "~"), g.resultR, grade);
+				F.Font(V.fontPt - 1, true);
+				const int cw = F.TextW(card) + 8, ch = F.fontH + 4;
+				const int cx = Max(F.left, Min(x1, F.right - cw)), cy = g.dir > 0 ? yS + 2 : yS - ch - 2;
+				const uint32_t cc = g.resolved == 0 ? (g.dir > 0 ? T.bull : T.bear) : (g.resolved == 1 ? T.bull : (g.resolved == -1 ? T.bear : T.neutral));
+				F.Fill(cx, cy, cx + cw, cy + ch, T.panel, 90);
+				F.Box(cx, cy, cx + cw, cy + ch, cc, 1);
+				F.Text(cx + 4, cy + 2, card, g.resolved == 0 ? T.text : cc);
+				F.Font(V.fontPt, false);
+			}
+		}
+
+		// ---------------- Event annotations (timestamped notes, stacked to avoid overlap) ----------------
+		void DrawNotes(Frame& F)
+		{
+			SCStudyInterfaceRef sc = F.sc; ChartState& S = F.S; const Theme& T = F.T; const VisualConfig& V = F.V;
+			if (S.events.empty() || V.maxNotes <= 0) return;
+			F.Font(V.fontPt - 2, false);
+			const int h = F.fontH + 2;
+			struct Placed { int l, t, r, b; };
+			std::vector<Placed> placed; placed.reserve(V.maxNotes);
+			int shown = 0;
+			for (int k = static_cast<int>(S.events.size()) - 1; k >= 0 && shown < V.maxNotes; --k)
+			{
+				const Event& e = S.events[k];
+				if (!F.Visible(e.idx)) continue;
+				const float age = Clamp(static_cast<float>(F.lastClosed - e.idx) / 120.0f, 0.0f, 1.0f);
+				const uint32_t base = e.dir > 0 ? T.bull : (e.dir < 0 ? T.bear : T.cyan);
+				const uint32_t c = Blend(base, T.dim, 0.25f + 0.6f * age);
+				char txt[96]; sprintf_s(txt, sizeof(txt), "%s %s", e.time, e.text);
+				const int w = F.TextW(txt) + 6;
+				const int x = F.XOf(e.idx);
+				int l = x + 6, t = (e.dir > 0 ? F.YOf(e.price) + 6 : F.YOf(e.price) - h - 6);
+				if (l + w > F.right - 4) l = x - w - 6;
+				// push away from already placed notes
+				for (int tries = 0; tries < 12; ++tries)
+				{
+					bool hit = false;
+					for (size_t q = 0; q < placed.size(); ++q) if (l < placed[q].r && l + w > placed[q].l && t < placed[q].b && t + h > placed[q].t) { hit = true; t = e.dir > 0 ? placed[q].b + 1 : placed[q].t - h - 1; break; }
+					if (!hit) break;
+				}
+				if (t < F.top || t + h > F.bottom) continue;
+				Placed pl; pl.l = l; pl.t = t; pl.r = l + w; pl.b = t + h; placed.push_back(pl);
+				F.Line(x, F.YOf(e.price), l, t + h / 2, Blend(c, T.bg, 0.3f), 1, 2);
+				F.Fill(l, t, l + w, t + h, T.panel, 80);
+				F.Text(l + 3, t + 1, txt, c);
+				++shown;
+			}
+			F.Font(V.fontPt, false);
+		}
+
 		// ---------------- HUD glass panel (top-right of the future space) ----------------
 		struct HudLayout { int l, t, r, b, pad, lineH; bool compact; };
 
@@ -3823,6 +3984,8 @@ namespace nqe
 		if (V.layer[L_CHANNEL]) render::DrawChannel(F);
 		if (V.layer[L_SWINGS]) render::DrawSwings(F);
 		if (V.layer[L_BUBBLES]) render::DrawBubbles(F);
+		if (V.layer[L_CARDS]) render::DrawCards(F);
+		if (V.layer[L_NOTES]) render::DrawNotes(F);
 		if (V.layer[L_RIBBON]) render::DrawRibbon(F);
 		F.Unclip();
 		if (V.layer[L_HUD])
