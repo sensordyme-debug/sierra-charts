@@ -50,7 +50,14 @@ projection, footprint/depth, signal-power features) are implemented — see CHAN
 built and run in Sierra by the user; v2 is syntax-checked only. `docs/DECISIONS.md` 26–34 list the
 v2 API details to confirm on the first Remote Build. `docs/VISUAL_GUIDE.md` explains every visual.
 
-## v2 rendering rules
+## v3 (current): one study
+`scsf_NQEdge_Terminal` is the only study the trader adds. It sets every engine's parameters from its
+own inputs (`S.terminalPresent` makes the engine studies passive), draws CLEAN by default with
+Sierra drawing objects managed by line number (`term::Slot*` helpers, `TermState` slots flushed each
+update), and uses GDI only for the opt-in profile/tape layers. The v2 GDI overlay/backdrop/tape
+studies were removed; `render::Frame`, `DrawProfile` and `DrawTape` remain for those layers.
+
+## v2 rendering rules (apply to the remaining GDI layers)
 * Draw only `firstVis..lastVis`; anything beyond the last bar is positioned by `Frame::XOf` extrapolation.
 * Opacity helper `Frame::Fill(..., alpha)` takes opacity %; never call the raw transparent fill directly.
 * New layer: add to `enum Layer`, `kLayerNames`, the three `kPresetLayers` rows, a `render::Draw*`

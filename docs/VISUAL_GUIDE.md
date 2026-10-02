@@ -1,56 +1,67 @@
-# NQ Edge Suite v2 — Visual guide
+# NQ Edge Terminal — Visual guide (v3, CLEAN by default)
 
-What every colour, shape and label on the terminal means. Palette: bull `#00C896` green,
-bear `#FF4D5E` red, neutral `#8A93A6` gray, VWAP gold `#FFC857`, levels cyan `#3EC6FF`,
-naked POC magenta `#D65DFF`, text `#E6EAF2`, dim `#5C6577`, background `#0B0E14`.
+Palette: bull `#00C896` green, bear `#FF4D5E` red, neutral `#6E7686` gray, VWAP gold `#FFC857`,
+levels cyan `#3EC6FF`, text `#E6EAF2`, dim `#788091`.
 
-## Price region (85 % of the height)
+## What CLEAN looks like (screenshot description)
 
-| Element | Meaning |
+Picture a dark chart, candles in the middle, about a third of the width empty on the right
+(the fill space). Reading left to right:
+
+- **Candles** are painted in exactly three colours: green when the Directional Conviction Score of
+  that closed bar is at or above the candle-bias threshold (+25 by default), red at or below −25,
+  gray in between. A run of green candles means the model has leaned long for that stretch; a
+  gray patch means no conviction. The bar that is still forming is **hollow** in its provisional
+  colour, so you can tell at a glance it is not final.
+- A **2 px gold line** winds through the candles: the session VWAP. Around it a faint gold haze,
+  the ±1σ band, lets you see when price is stretched away from fair value. Nothing else is filled.
+- **Four thin cyan lines** cross the recent bars: the two nearest levels above price and the two
+  below (POC, VAH/VAL, prior-day levels, IB, ON high/low, naked POC, swings, liquidity, open).
+  Each starts where the level was born and runs a couple of bars into the fill space, ending in a
+  short cyan tag such as `VAH 7741.25`. When price is testing a level, its line turns solid and
+  its tag white and bold; otherwise lines are dotted. Equal prices share a tag (`PDH/ONH`).
+- When a grade A or B setup fires on a closed bar, a **green arrow** sits under the bar (or a red
+  one above). From that bar a thin **red box** (entry → stop) and a thin **green box**
+  (entry → T2) extend to the right, both ≥ 80 % transparent, with a dotted green T1 line. At the
+  right end of the boxes one line of text: `LONG B · Trend Pullback · DCS +62 · R:R 2.3 ·
+  stop 7718.00 T1 7741.25`. After the trade resolves the box ends at the resolution bar and the
+  label reads `WIN +2.3R · Trend Pullback B` (or `LOSS -1.0R`). Only the three most recent
+  signals near price are kept.
+- In the empty space to the right of the last bar, top-aligned, six lines of text, the **HUD**:
+  1. A coloured **pill** — green `LONG`, red `SHORT` or gray `NEUTRAL` — followed by `DCS +62 ^`
+     (the glyph shows whether the score rose, fell or held over the last five bars).
+  2. `TREND UP · Open-Drive Up · value higher · Trend day` (regime, open type, value migration,
+     day type), coloured by regime.
+  3. The **plan line** in gold: `Trend up (bias long). Wait for pullback to VWAP 7725.25 with
+     absorption or delta flip. Invalid below 7718.00.` — location, trigger and invalidation.
+  4. `MTF  1m+ 5m+ 15m- 60m+   leg R2 0.71` (+ bullish, − bearish, = flat, . unavailable) and an
+     `SMT+/-` flag when the index failed to confirm the last swing.
+  5. `R VAH 7741.25 +12t · S VWAP 7725.25 -8t · range 64% ADR` — nearest resistance and
+     support with tick distances and today's range as a share of the average daily range.
+  6. `VAP on · depth off · mkt 4/4 · 0.8 ms` — data health (or, in gold, the first configuration
+     warning such as "Storage unit must be 1 TICK").
+
+That is all. No zigzags, ribbons, backdrops, profiles or notes unless you switch a layer on.
+
+## Layers (Terminal inputs, all off by default)
+
+| Layer | What appears |
 |---|---|
-| **Candle body colour** | Directional Conviction Score state of that closed bar: strong bull (bright green), weak bull (dark green), neutral (gray), weak bear (dark red), strong bear (bright red). Wicks are neutral gray. The forming bar is hollow (provisional). |
-| **DCS ribbon** (6 px strip at the bottom edge) | DCS per bar on a deep red → gray → deep green gradient; the last cell is dimmed (forming bar). |
-| **Background tint** | Regime of each bar: green = Trend Up, red = Trend Down, cyan = Balance, gold = Volatile Chop. Darker shade = ETH (outside 09:30–16:00). |
-| **Vertical separators** | Gold solid = RTH open; cyan dotted = IB end; dim dotted = RTH close. |
-| **VWAP cloud** | Gold line = session VWAP. Filled bands: ±1σ (brighter) and ±2σ (lighter), tinted green/red when the VWAP slope is up/down. Dotted thin lines = ±3σ. |
-| **Thin horizontal rays with right-edge pills** | Levels. Pill text = name + price. Gold = POC/VWAP/IB; cyan = VAH/VAL/liquidity; magenta = naked POC; white = PDH/PDL/PDC; gray-cyan = prior-day value; dim gold = IB extensions / VWAP bands. A level **fades** when it is more than 4 ATR away; it **pulses** (solid pill, bold) when price is within 0.3 ATR. Identical prices merge into one pill (`VAH/PDH`); overlapping pills stack and a short connector points to the real price. |
-| **Translucent rectangles with a corner letter** | Zones extending right until mitigated: **A** absorption (green = buyers absorbed selling, red = sellers absorbed buying), **I** stacked imbalance (green buy / red sell), **L** liquidity pool (equal highs/lows, cyan), **P** single prints (gold-gray), **F** failed auction supply/demand (left behind by trapped traders). Mitigated zones become a dashed outline and fade over ~40 bars. |
-| **Circles** | Large aggressive trades: green = buyer, red = seller, size = volume percentile, number inside = prints clustered at that price. Hollow = still forming. |
-| **Zigzag + big numbers** | Swing legs. The bold number at each swing is the cumulative delta of the leg (green positive, red negative); the small line is leg volume and length in ticks. `!` in gold = divergence leg (new extreme with weaker delta). The dashed leg is the active leg with a provisional delta. |
-| **Three thin parallel lines** | Regression channel on the active leg (middle = fit, outer = ±2σ), green/red by slope, extended dashed into the future space. Leg R² is in the HUD. |
-| **Green/red boxes with an arrow** | Signal: green box = entry → T2 reward, red box = entry → structural stop risk, dotted line inside = T1, white line = entry. Live boxes extend right; resolved boxes end at the resolution bar. Card text: `LONG · Trend Pullback · DCS +72 · R:R 2.4 · T1 VAH · B · hist 58% n=41`; after resolution `WIN √ +2.4R · B` or `LOSS x -1.0R`. Only grades A and B are drawn by default. |
-| **Small timestamped notes** | Event annotations: `09:47 absorption: passive buyers @ 7726.50`, `10:12 IB break up`, `10:31 SMT: MES HH, index no HH`, `trapped longs`, `acceptance above value`, `CHoCH up`. Newest are bright, older ones fade; they stack to avoid overlap. |
-| **Dashed arrow into the future space** | Projection: the most likely path (pullback target, then continuation target) with a label `P(T1 first) 61% · n=88` from the validation history of this setup × regime (× grade when a signal is live). `low confidence` and a dimmed arrow when n < 30. The thin red dotted line is the invalidation level. |
-| **Docked histogram in the future space** | Developing RTH volume profile: left part of each row = bid (aggressive selling, red), right part = ask (aggressive buying, green); value-area rows are brighter; gold line + pill = POC; cyan dotted = VAH/VAL. The faint gray silhouette behind it is the prior session (ghost); the faint cyan one is the N-day composite (off by default). |
-| **Footprint cells** (FOOTPRINT preset) | Each cell = `bid x ask` at that price; cell shade = delta heat (green = ask-dominant, red = bid-dominant). Green/red border = diagonal imbalance ≥ 300 %; thick bright border = stacked (≥ 3). Gold box = bar POC. `u` = unfinished auction at that extreme. Number above the bar = delta, below = volume. When bars are too narrow, cells become heat-coloured blocks without text; narrower still, standard candles. |
-| **Depth heatmap** (only with market-depth data) | Resting liquidity behind price from historical depth: green = bid side, red = ask side, intensity = size percentile. Hidden automatically without depth; HUD shows `depth off`. |
+| **Volume Profile (docked)** | The developing RTH profile drawn horizontally in the fill space: red part = bid (aggressive selling), green part = ask, value-area rows brighter, gold POC line and pill; a faint gray ghost of the prior session behind it. |
+| **Zones** | Up to 8 active zones within 2 ATR of price as faint rectangles extending right, letter in the corner: **A** absorption, **I** stacked imbalance, **L** liquidity pool, **F** failed-auction supply/demand. Green = support-type, red = resistance-type. |
+| **Order-Flow Bubbles** | Dots at large aggressive prints (last 90 bars, within 2 ATR): green buyer, red seller, size = volume percentile. |
+| **Swing Delta** | A small bold number at each recent swing point: cumulative delta of the leg ending there (green/red); `!` marks a divergence leg (new extreme with weaker delta). No connecting lines. |
+| **Annotations** | Up to 12 short timestamped notes near recent events within 2 ATR (`09:47 absorption: passive buyers @ 7726.50`, `10:12 IB break up`, `10:31 SMT: MES HH, index no HH`, `trapped longs`, `acceptance above value`), placed above/below the bar and stacked so they never sit on a candle. Also adds a scoreboard line and a last-event line to the HUD. |
+| **Projection** | Two dashed segments from the last closed bar into the fill space: expected pullback target then continuation target (or rotation to POC then the opposite edge in balance), labelled with the empirical `P(T1) 61% n=88` from the validation history of this setup × regime; `(low conf.)` under 30 samples. |
+| **Tape Strip** | A colour-scaled table in the bottom 12 % of the price region: Delta, Volume, Delta %, CVD change, Imbalances, DCS per visible bar. |
+| **VWAP + 1 Sigma Band / 4 Nearest Levels / Signal Arrows + Boxes / HUD / Bias Candles** | The CLEAN layers; each can be switched off individually. |
 
-## Order-Flow Tape (bottom strip)
+## Hierarchy rules the renderer enforces
 
-One column per visible bar, rows **Dlt** (delta), **Vol** (volume), **Dl%** (delta %), **CVD**
-(CVD change over the slope window), **Imb** (stacked imbalance count, + buy / − sell), **DCS**.
-Cell colour intensity = magnitude within the visible window (green/red diverging, cyan for volume).
-Values are abbreviated (`1.2k`). Rows that do not fit are dropped from the bottom.
-
-## HUD glass panel (top-right, future space)
-
-1. **BIAS badge** LONG/SHORT/NEUTRAL + `DCS ±nn` and trend glyph (`^` rising, `v` falling, `=` flat over 5 bars); regime chip on the right.
-2. **Gauge** −100…+100 with the needle at the current DCS and tick marks at ±signal threshold.
-3. **Sparkline** of the last 30 closed-bar DCS values.
-4. **Open type · value migration · day type** (IB forming / Normal / Normal var. / Trend day / Balance day).
-5. **MTF strip** 1m/5m/15m/60m (green/red/gray, dark = unavailable for this bar period) and **leg R²**.
-6. **MKT row** YM, TICK, mega caps as dots with `^`/`v`; `SMT+/-` pill or `YM leads 2b ^` lead/lag note.
-7. **CVD row** CVD trend, z-score, last order-flow event with price and age.
-8. **Levels row** nearest resistance/support with distance in ticks and ATR; **clock row** time to RTH open / IB end / close, bar countdown, today's range as % of ADR.
-9. **Plan line** (gold, bold): location, trigger and invalidation in plain English.
-10. **Scoreboard** per setup: win %, average R, profit factor, n (`*` = fewer than 30 samples).
-11. **Health row** VAP, depth, time zone, intermarket charts connected, draw/calc milliseconds, `DELAY!` when data lags, and a reminder when the fill space is too small.
-12. **Warnings** (gold) for wrong settings or missing studies.
-
-## Presets
-
-* **COMMAND** (default): everything above except footprint cells, depth heatmap and composite profile.
-* **FOOTPRINT**: footprint cells + depth heatmap (when available) + profile, levels, zones, tape; bubbles, swing labels, channel and cloud off to keep the cells readable.
-* **CLEAN**: conviction candles, DCS ribbon, levels + pills, signal cards, projection, HUD only.
-
-Every layer can be forced On/Off on the Terminal Overlay study regardless of the preset.
+- At most three line colours on screen: gold (VWAP), cyan (levels), green/red (signals).
+- Every line is 1 px except the VWAP (2 px). Every fill is at least 80 % transparent.
+- Labels sit in the fill space or offset above/below the bar, never on a candle.
+- Nothing is drawn more than 2 ATR from price except the four nearest levels.
+- All drawings are managed by line number: redrawn in place each update, deleted when stale, all
+  removed when the study is removed. Decisions, statistics and colours use closed bars only; the
+  forming bar is hollow.

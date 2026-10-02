@@ -30,9 +30,11 @@ cockpit for NQ/MNQ (developed on MESZ26-CME as the trial proxy).
 | 6 | NQ Edge: Directional Conviction Score | `scsf_NQEdge_DCS` | own (histogram) | VERY LOW |
 | 7 | NQ Edge: Signal Validation | `scsf_NQEdge_Validation` | own (cum. R) | VERY LOW |
 | 8 | NQ Edge: Feature Logger | `scsf_NQEdge_FeatureLogger` | 0 (hidden) | VERY LOW |
-| 9 | NQ Edge: Terminal Overlay (was HUD + Bar Painter) | `scsf_NQEdge_HUD` | 0 (GDI above candles) | VERY LOW |
-| 10 | NQ Edge: Terminal Backdrop | `scsf_NQEdge_Backdrop` | 0 (GDI under candles) | VERY LOW |
-| 11 | NQ Edge: Order-Flow Tape | `scsf_NQEdge_Tape` | 1 (bottom strip, ~13 %) | VERY LOW |
+| 9 | **NQ Edge Terminal** (v3: the only study a trader needs) | `scsf_NQEdge_Terminal` | 0 | VERY LOW |
+
+v3: the Terminal runs all engines itself, publishes hidden `h.*` subgraphs, and draws CLEAN with
+line-number-managed drawing objects (`TermState` slots). Studies 1–8 are optional diagnostics and
+yield parameter ownership while the Terminal is present (`ChartState::terminalPresent`).
 
 v2 layout: every engine lives in region 0; the diagnostic plots (CVD, intermarket, DCS histogram,
 cumulative R) only get their own regions when the Overlay's *Show Diagnostic Regions* is on.

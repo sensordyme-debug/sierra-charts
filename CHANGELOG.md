@@ -89,3 +89,11 @@
 ## v2 Phase 11 — Performance + docs
 - Renderer draws visible bars only, merges backdrop runs, caches fonts/text sizes per frame, bounds every list; frame times in the HUD health row.
 - `docs/SETUP.md` rewritten (Graphics Settings palette, fill space, two-chart chartbook with linking, chart numbers, presets), new `docs/VISUAL_GUIDE.md`, decisions 26–33.
+
+## v3 — One study, CLEAN by default
+- New master study **NQ Edge Terminal** (`scsf_NQEdge_Terminal`): runs every engine itself (hidden `h.*` helper subgraphs), draws only in the price region, exposes the essential inputs (session, value area, swings, imbalance, intermarket chart numbers, model thresholds, setups, alerts, layers, colours). Adding this one study gives the whole system; the engine studies remain as optional diagnostics and stop fighting over parameters when the Terminal is present.
+- CLEAN default: 3-shade bias candles (hollow forming bar), gold VWAP (2 px) + one translucent ±1σ band (`TRANSPARENT_FILL_TOP/BOTTOM`, study transparency 82 %), the 4 nearest levels (2 above / 2 below, equal prices merged) as 1 px lines with short right-edge tags that go solid/bold when price is within tolerance, A/B signal arrows with compact risk/reward boxes (≥ 80 % transparent) and a one-line label at the box end, text HUD (6 lines) in the space right of the last bar.
+- Every drawing is a Sierra drawing object managed by line number: adjusted in place each update, deleted when no longer used, all deleted when the study is removed. No GDI for the default view.
+- Removed: zigzag connecting lines, the DCS ribbon, regime/session backdrop, cloud, docked pills, the Overlay/Backdrop/Tape studies and all extra regions. Swing delta is now a small label at the swing point only.
+- Layer inputs (all off by default): Volume Profile (docked, GDI), Zones (A/I/L/F rectangles within 2 ATR), Order-Flow Bubbles (markers within 2 ATR, last 90 bars), Swing Delta (last 24 legs), Annotations (last 12 events within 2 ATR, stacked), Projection (dashed path + empirical odds), Tape Strip (GDI, bottom 12 % of the price region).
+- Hierarchy rules: lines 1 px except VWAP 2 px; line colours limited to VWAP gold, level cyan and signal green/red; nothing except the 4 nearest levels is drawn more than 2 ATR from price; fills ≥ 80 % transparent.

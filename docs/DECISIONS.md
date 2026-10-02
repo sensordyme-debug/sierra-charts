@@ -123,3 +123,23 @@ Ambiguities resolved while building, and anything not verifiable without a Sierr
     to setup totals under 10 samples); "low confidence" below the sample-size input. No modelled probabilities.
 34. **Session clock** uses `sc.GetCurrentDateTime()` (chart time zone, replay-aware) and
     `sc.GetLatestBarCountdownAsInteger()` for the bar countdown.
+
+## v3 (one study) decisions
+
+35. **The Terminal study owns parameters.** It sets `ChartState::terminalPresent`; the engine studies
+    skip `SetParams` while it is set, so the two can coexist without reset ping-pong. Unexposed engine
+    parameters keep their compiled defaults (the engine studies remain available for tuning/diagnostics).
+36. **HUD = text drawing objects** with `UseRelativeVerticalValues = 1` (vertical % of the region) and
+    `BeginDateTime = -(fill bars - 2)` (bars from the right edge, Sierra's fill-space convention used by
+    its own `AddAndManageSingleTextDrawingForStudy` helper). The bias pill is a text drawing with an
+    opaque `FontBackColor`; all other HUD lines have transparent backgrounds. When the fill space is
+    below the input's minimum the HUD anchors 3 bars from the right edge and the health line says so.
+37. **Right-edge tags and box labels use `BeginIndex` beyond the last bar** (fill space). If Sierra
+    clamps such drawings to the last bar, lower *Fill Space Needed* and the tags will sit on the last bar.
+38. **VWAP band translucency** comes from the study-level transparency (`SetChartStudyTransparencyLevel`
+    82 %, applied once) with `DRAWSTYLE_TRANSPARENT_FILL_TOP/BOTTOM`; it can also be changed in the
+    study's own settings.
+39. **Candles use `DRAWSTYLE_COLOR_BAR`** (whole bar) for closed bars so the bias is unmistakable,
+    with `DRAWSTYLE_COLOR_BAR_HOLLOW` for the forming bar.
+40. **Opt-in GDI layers** (profile, tape) call `SetBackgroundMode(TRANSPARENT)` first; all other layers
+    are native objects so nothing can leave stale pixels behind.
