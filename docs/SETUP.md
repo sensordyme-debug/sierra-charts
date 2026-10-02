@@ -13,6 +13,7 @@
 ## 2. Build
 
 1. `scripts\deploy.ps1` (copies `NQEdgeSuite.cpp` into `C:\SierraChart\ACS_Source` and the weights file into `Data`).
+   If PowerShell refuses to run scripts: `powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1`.
 2. Sierra Chart: **Analysis >> Build Custom Studies DLL >> Remote Build – Release**, select `NQEdgeSuite.cpp`, **Build**.
 
 ## 3. Add ONE study
