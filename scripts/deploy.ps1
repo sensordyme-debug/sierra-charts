@@ -62,5 +62,5 @@ Write-Host "       select  NQEdgeSuite.cpp  >> Build. Wait for 'Build successful
 Write-Host "  2. On the price chart: Analysis >> Studies >> Add Custom Study >> NQ Edge Suite >> 'NQ Edge Terminal'"
 Write-Host "       (one study is the whole system; remove older NQ Edge studies; after an upgrade build remove and re-add the Terminal)"
 Write-Host "  3. In the Terminal inputs set Chart Number: YM / NYSE TICK / Mega Cap 1-2 from the other charts' title bars."
-Write-Host "  4. Chart >> Chart Settings: Fill Space 40-60 bars, bar spacing >= 12 px. File >> Save Chartbook."
+Write-Host "  4. Chart >> Chart Settings: Fill Space 40-60 bars (the HUD tells you if it needs more), bar spacing >= 12 px (>= 36 for bid x ask text). File >> Save Chartbook."
 Write-Host "  5. See docs\SETUP.md for settings checks (1-tick storage, NY time zone) and docs\VISUAL_GUIDE.md for what you see."

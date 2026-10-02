@@ -644,7 +644,7 @@ namespace nqe
 	struct Event { int idx; int kind; int dir; float price; char time[8]; char text[72]; };
 	enum EventKind { EV_ABSORB = 1, EV_IMB, EV_TRAP, EV_EXHAUST, EV_DIV, EV_BOS, EV_CHOCH, EV_IBBREAK, EV_SMT, EV_SIGNAL, EV_ACCEPT, EV_REJECT };
 
-	struct DataStamp { int arraySize = 0; double t0 = 0, tMid = 0, tLast = 0; int midIdx = -1, lastIdx = -1; bool valid = false; };
+	struct DataStamp { int arraySize = 0; double t0 = 0, tMid = 0, tLast = 0; int midIdx = -1, lastIdx = -1; bool valid = false; int vIdx = -1; double vLast = 0, cMid = 0; };
 
 	struct ChartState
 	{
@@ -804,6 +804,8 @@ namespace nqe
 			if (sc.BaseDateTimeIn[0].GetAsDouble() != st.t0) ok = false;
 			else if (st.midIdx >= 0 && sc.BaseDateTimeIn[st.midIdx].GetAsDouble() != st.tMid) ok = false;
 			else if (sc.BaseDateTimeIn[st.lastIdx].GetAsDouble() != st.tLast) ok = false;
+			else if (st.vIdx >= 0 && st.vIdx < n && sc.Volume[st.vIdx] != st.vLast) ok = false;      // same bar time, different content = back-fill
+			else if (st.midIdx >= 0 && sc.Close[st.midIdx] != st.cMid) ok = false;
 		}
 		else if (ok && st.lastIdx < 0 && st.arraySize > 0 && n > 0)
 		{
@@ -830,6 +832,8 @@ namespace nqe
 			st.tLast = sc.BaseDateTimeIn[st.lastIdx].GetAsDouble();
 			st.midIdx = st.lastIdx / 2;
 			st.tMid = sc.BaseDateTimeIn[st.midIdx].GetAsDouble();
+			st.vIdx = Max(0, st.lastIdx - 1);   // a closed bar: its volume only changes when the data is replaced
+			st.vLast = sc.Volume[st.vIdx]; st.cMid = sc.Close[st.midIdx];
 		}
 		st.t0 = n > 0 ? sc.BaseDateTimeIn[0].GetAsDouble() : 0;
 		st.valid = n > 0;
@@ -3344,6 +3348,108 @@ namespace nqe
 
 	namespace render
 	{
+		// ---------------- Footprint: bid x ask cells with delta/volume heat, imbalances, POC, unfinished auctions ----------------
+		// Bar spacing >= 36 px: "bid x ask" in every cell plus delta above / volume below; >= 20 px: the level delta; narrower:
+		// heat only. Under 12 px the layer draws nothing (the bias candles remain). A 1 px frame in the bar's conviction
+		// colour keeps the bias readable under the cells.
+		void DrawFootprint(Frame& F)
+		{
+			SCStudyInterfaceRef sc = F.sc; ChartState& S = F.S; const Theme& T = F.T; const VisualConfig& V = F.V; const FlowParams& P = S.params.flow;
+			if (sc.VolumeAtPriceForBars == nullptr || F.spacing < 12) return;
+			const int n = sc.ArraySize;
+			const int cellW = Max(6, F.spacing - 2), half = cellW / 2;
+			const int mode = cellW >= 34 ? 2 : (cellW >= 18 ? 1 : 0);
+			F.Font(Max(7, V.fontPt - 2), false);
+			const int fh = F.fontH;
+			const double ratio = P.imbRatioPct / 100.0, minV = P.imbMinVolume;
+			const float weak = S.params.dcs.weakThr;
+			char buf[32];
+			std::vector<const s_VolumeAtPriceV2*> lv; lv.reserve(64);
+			std::vector<signed char> imb; std::vector<unsigned char> stacked;
+			const int nVap = static_cast<int>(sc.VolumeAtPriceForBars->GetNumberOfBars());
+			for (int i = Max(0, F.firstVis); i <= F.lastVis && i < nVap && i < n; ++i)
+			{
+				const int cnt = sc.VolumeAtPriceForBars->GetSizeAtBarIndex(i);
+				if (cnt <= 0) continue;
+				lv.clear();
+				for (int q = 0; q < cnt; ++q) { const s_VolumeAtPriceV2* pp = nullptr; if (sc.VolumeAtPriceForBars->GetVAPElementAtIndex(i, q, &pp) && pp) lv.push_back(pp); }
+				const int m = static_cast<int>(lv.size()); if (m == 0) continue;
+				double maxAbs = 1, maxVol = 1; int pocQ = 0;
+				for (int q = 0; q < m; ++q)
+				{
+					maxAbs = Max(maxAbs, fabs(static_cast<double>(lv[q]->AskVolume) - static_cast<double>(lv[q]->BidVolume)));
+					if (static_cast<double>(lv[q]->Volume) > maxVol) { maxVol = static_cast<double>(lv[q]->Volume); pocQ = q; }
+				}
+				const bool forming = (i == n - 1);
+				const int x = F.XOf(i);
+				imb.assign(static_cast<size_t>(m), 0); stacked.assign(static_cast<size_t>(m), 0);
+				for (int q = 0; q < m; ++q)
+				{
+					const bool adjBelow = q > 0 && lv[q]->PriceInTicks - lv[q - 1]->PriceInTicks == 1;
+					const bool adjAbove = q + 1 < m && lv[q + 1]->PriceInTicks - lv[q]->PriceInTicks == 1;
+					if (adjBelow && lv[q]->AskVolume >= minV && lv[q - 1]->BidVolume >= minV && lv[q]->AskVolume >= ratio * lv[q - 1]->BidVolume) imb[q] = 1;
+					if (adjAbove && lv[q]->BidVolume >= minV && lv[q + 1]->AskVolume >= minV && lv[q]->BidVolume >= ratio * lv[q + 1]->AskVolume) imb[q] = static_cast<signed char>(imb[q] == 1 ? 2 : -1);
+				}
+				for (int side = -1; side <= 1; side += 2)
+				{
+					int run = 0;
+					for (int q = 0; q <= m; ++q)
+					{
+						const bool onq = q < m && (imb[q] == side || imb[q] == 2) && (run == 0 || (q > 0 && lv[q]->PriceInTicks - lv[q - 1]->PriceInTicks == 1));
+						if (onq) ++run; else { if (run >= P.imbStackLevels) for (int r = q - run; r < q; ++r) stacked[r] = 1; run = 0; }
+					}
+				}
+				int yTop = INT_MAX, yBot = INT_MIN;
+				for (int q = 0; q < m; ++q)
+				{
+					const float price = lv[q]->PriceInTicks * F.tick;
+					int y1 = F.YOf(price + 0.5f * F.tick), y2 = F.YOf(price - 0.5f * F.tick);
+					if (y2 < F.top || y1 > F.bottom) continue;
+					if (y2 - y1 < 2) y2 = y1 + 2;
+					yTop = Min(yTop, y1); yBot = Max(yBot, y2);
+					const double d = static_cast<double>(lv[q]->AskVolume) - static_cast<double>(lv[q]->BidVolume);
+					const float inten = static_cast<float>(0.10 + 0.45 * fabs(d) / maxAbs + 0.30 * static_cast<double>(lv[q]->Volume) / maxVol);
+					uint32_t c = Blend(T.bg, d >= 0 ? T.bull : T.bear, Min(0.85f, inten));
+					if (forming) c = Blend(c, T.bg, 0.35f);
+					F.Fill(x - half, y1, x + half, y2, c, 100);
+					if ((y2 - y1) >= fh && mode >= 1)
+					{
+						if (mode == 2) sprintf_s(buf, sizeof(buf), "%.0fx%.0f", static_cast<double>(lv[q]->BidVolume), static_cast<double>(lv[q]->AskVolume));
+						else sprintf_s(buf, sizeof(buf), "%+.0f", d);
+						F.TextCenter(x, y1 + (y2 - y1 - fh) / 2, buf, inten > 0.55f ? T.bg : T.text);
+					}
+					if (imb[q] != 0)
+					{
+						const uint32_t ic = imb[q] == 1 ? T.bull : (imb[q] == -1 ? T.bear : T.gold);
+						F.Box(x - half, y1, x + half, y2, stacked[q] ? Blend(ic, T.text, 0.35f) : ic, stacked[q] ? 2 : 1);
+					}
+					if (q == pocQ) F.Box(x - half - 1, y1 - 1, x + half + 1, y2 + 1, T.gold, mode == 0 ? 1 : 2);
+				}
+				if (yTop < yBot && i < static_cast<int>(S.dcs.dcs.size()))
+				{
+					const float v = S.dcs.dcs[i];
+					const uint32_t bc = v >= weak ? T.bull : (v <= -weak ? T.bear : T.neutral);
+					F.Box(x - half - 1, yTop - 1, x + half + 1, yBot + 1, forming ? Blend(bc, T.bg, 0.4f) : bc, 1);
+				}
+				if (mode >= 1)
+				{
+					// unfinished auctions: both sides traded at the extreme
+					if (lv[m - 1]->BidVolume > 0 && lv[m - 1]->AskVolume > 0) { F.Font(Max(7, V.fontPt - 2), true); F.Text(x + half + 2, F.YOf(lv[m - 1]->PriceInTicks * F.tick + 0.5f * F.tick) - fh, "u", T.gold); F.Font(Max(7, V.fontPt - 2), false); }
+					if (lv[0]->BidVolume > 0 && lv[0]->AskVolume > 0) { F.Font(Max(7, V.fontPt - 2), true); F.Text(x + half + 2, F.YOf(lv[0]->PriceInTicks * F.tick - 0.5f * F.tick) + 1, "u", T.gold); F.Font(Max(7, V.fontPt - 2), false); }
+				}
+				if (mode == 2 && i < static_cast<int>(S.flow.delta.size()))
+				{
+					// delta above, volume below
+					const float dl = S.flow.delta[i];
+					char t[24]; Abbrev(dl, t, sizeof(t)); if (dl > 0) sprintf_s(buf, sizeof(buf), "+%s", t); else strcpy_s(buf, sizeof(buf), t);
+					F.TextCenter(x, F.YOf(sc.High[i]) - fh - 3, buf, dl >= 0 ? T.bull : T.bear);
+					Abbrev(sc.Volume[i], buf, sizeof(buf));
+					F.TextCenter(x, F.YOf(sc.Low[i]) + 3, buf, T.dim);
+				}
+			}
+			F.Font(V.fontPt, false);
+		}
+
 		// ---------------- Docked volume profile (session, ghost prior, composite) ----------------
 		void DrawProfile(Frame& F)
 		{
@@ -4111,12 +4217,12 @@ SCSFExport scsf_NQEdge_FeatureLogger(SCStudyInterfaceRef sc)
 // --- 9. NQ Edge Terminal: the one study ---------------------------------------
 // Draws only in the price region with Sierra-native objects managed by line number (deleted and
 // re-adjusted on every update). The docked profile and the calculated-values strip use GDI.
-enum TermLayer { TL_CANDLES = 0, TL_BAND, TL_LEVELS, TL_SIGNALS, TL_HUD, TL_PROFILE, TL_ZONES, TL_BUBBLES, TL_SWING, TL_NOTES, TL_PROJ, TL_TAPE, TL_FIB, TL_NUMBERS, TL_CHANNEL, TL_COUNT };
-static const char* kTermLayerNames[TL_COUNT] = { "Bias Candles", "VWAP + 1 Sigma Band", "Nearest Levels (pills)", "Signal Arrows + Boxes", "HUD", "Volume Profile (docked right)", "Zones", "Order-Flow Bubbles", "Swing Delta Numbers", "Event Log + Markers", "Projection Arrow", "Calculated-Values Strip", "Fib Levels (last leg)", "Delta Per Bar", "Regression Channel" };
+enum TermLayer { TL_CANDLES = 0, TL_BAND, TL_LEVELS, TL_SIGNALS, TL_HUD, TL_PROFILE, TL_ZONES, TL_BUBBLES, TL_SWING, TL_NOTES, TL_PROJ, TL_TAPE, TL_FIB, TL_NUMBERS, TL_CHANNEL, TL_FOOTPRINT, TL_COUNT };
+static const char* kTermLayerNames[TL_COUNT] = { "Bias Candles", "VWAP + 1 Sigma Band", "Nearest Levels (pills)", "Signal Arrows + Boxes", "HUD", "Volume Profile (docked right)", "Zones", "Order-Flow Bubbles", "Swing Delta Numbers", "Event Log + Markers", "Projection Arrow", "Calculated-Values Strip", "Fib Levels (last leg)", "Delta Per Bar", "Regression Channel", "Footprint Cells (bid x ask)" };
 static const unsigned char kTermPreset[2][TL_COUNT] =
 {
-	{ 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },   // CLEAN
-	{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 },   // PRO
+	{ 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },   // CLEAN
+	{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 },   // PRO
 };
 static const char* kOpenShort[8] = { "--", "Open-Drive up", "Open-Drive down", "Test-Drive up", "Test-Drive down", "Reject-Reverse up", "Reject-Reverse down", "Open-Auction" };
 enum TermInput
@@ -4127,7 +4233,7 @@ enum TermInput
 	TI_RISK, TI_ETH, TI_MIN_STOP, TI_MAX_STOP, TI_MIN_RR,
 	TI_LAYER0,                                   // TL_COUNT tri-state inputs follow
 	TI_FONT = TI_LAYER0 + TL_COUNT, TI_NUM_BARS, TI_PROFILE_W, TI_BAND_STYLE, TI_BAND_ALPHA,
-	TI_COL_BULL, TI_COL_BEAR, TI_COL_NEUTRAL, TI_COL_VWAP, TI_COL_LEVEL, TI_COL_LONG, TI_COL_SHORT, TI_COL_TEXT, TI_COL_PANEL, TI_COL_DIM, TI_COUNT
+	TI_COL_BULL, TI_COL_BEAR, TI_COL_NEUTRAL, TI_COL_NEUTRAL_UP, TI_COL_VWAP, TI_COL_LEVEL, TI_COL_LONG, TI_COL_SHORT, TI_COL_TEXT, TI_COL_PANEL, TI_COL_DIM, TI_COUNT
 };
 enum TermSubgraph
 {
@@ -4213,11 +4319,12 @@ namespace term
 		ChartState& S = *Sp; const VisualConfig& V = S.vis;
 		render::Frame F(sc, S, sc.GraphRegion);
 		S.term.regionH = Max(0, F.bottom - F.top); S.term.regionW = Max(0, F.right - F.left);
-		if (!V.layer[L_PROFILE] && !V.layer[L_TAPE]) return;
+		if (!V.layer[L_PROFILE] && !V.layer[L_TAPE] && !V.layer[L_FOOTPRINT]) return;
 		const double t0 = render_entry::NowMs();
 		if (sc.Graphics.SetBackgroundMode) sc.Graphics.SetBackgroundMode(TRANSPARENT);
 		if (sc.Graphics.SetTextAlign) sc.Graphics.SetTextAlign(TA_LEFT | TA_TOP | TA_NOUPDATECP);
 		F.Clip(F.left, F.top, F.right, F.bottom);
+		if (V.layer[L_FOOTPRINT]) render::DrawFootprint(F);
 		if (V.layer[L_PROFILE]) render::DrawProfile(F);
 		if (V.layer[L_TAPE])
 		{
@@ -4298,7 +4405,8 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 		NQE_INT_INPUT(TI_BAND_ALPHA, "VWAP Band Fill Transparency %", 90, 50, 98);
 		NQE_COLOR_INPUT(TI_COL_BULL, "Color: Bull", 0, 200, 150);
 		NQE_COLOR_INPUT(TI_COL_BEAR, "Color: Bear", 255, 77, 94);
-		NQE_COLOR_INPUT(TI_COL_NEUTRAL, "Color: Neutral", 110, 118, 134);
+		NQE_COLOR_INPUT(TI_COL_NEUTRAL, "Color: Neutral (down bar)", 110, 118, 134);
+		NQE_COLOR_INPUT(TI_COL_NEUTRAL_UP, "Color: Neutral (up bar)", 158, 166, 184);
 		NQE_COLOR_INPUT(TI_COL_VWAP, "Color: VWAP", 255, 200, 87);
 		NQE_COLOR_INPUT(TI_COL_LEVEL, "Color: Levels", 62, 198, 255);
 		NQE_COLOR_INPUT(TI_COL_LONG, "Color: Long Signal", 0, 200, 150);
@@ -4350,12 +4458,13 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 	for (int k = 0; k < L_COUNT; ++k) V.layer[k] = false;
 	V.layer[L_CANDLES] = on[TL_CANDLES]; V.layer[L_LEVELS] = on[TL_LEVELS]; V.layer[L_CARDS] = on[TL_SIGNALS]; V.layer[L_HUD] = on[TL_HUD];
 	V.layer[L_PROFILE] = on[TL_PROFILE]; V.layer[L_GHOST] = on[TL_PROFILE]; V.layer[L_ZONES] = on[TL_ZONES]; V.layer[L_BUBBLES] = on[TL_BUBBLES];
-	V.layer[L_SWINGS] = on[TL_SWING]; V.layer[L_NOTES] = on[TL_NOTES]; V.layer[L_PROJECTION] = on[TL_PROJ]; V.layer[L_TAPE] = on[TL_TAPE]; V.layer[L_CHANNEL] = on[TL_CHANNEL];
+	V.layer[L_SWINGS] = on[TL_SWING]; V.layer[L_NOTES] = on[TL_NOTES]; V.layer[L_PROJECTION] = on[TL_PROJ]; V.layer[L_TAPE] = on[TL_TAPE]; V.layer[L_CHANNEL] = on[TL_CHANNEL]; V.layer[L_FOOTPRINT] = on[TL_FOOTPRINT];
 	V.profileWidthPct = sc.Input[TI_PROFILE_W].GetInt(); V.profileDockRight = true;
 	Theme& TH = V.theme;
 	TH.bull = sc.Input[TI_COL_BULL].GetColor(); TH.bear = sc.Input[TI_COL_BEAR].GetColor(); TH.neutral = sc.Input[TI_COL_NEUTRAL].GetColor(); TH.gold = sc.Input[TI_COL_VWAP].GetColor(); TH.cyan = sc.Input[TI_COL_LEVEL].GetColor();
 	TH.text = sc.Input[TI_COL_TEXT].GetColor(); TH.panel = sc.Input[TI_COL_PANEL].GetColor(); TH.bg = sc.Input[TI_COL_PANEL].GetColor(); TH.dim = sc.Input[TI_COL_DIM].GetColor();
 
+	if (sc.IsFullRecalculation && sc.UpdateStartIndex == 0) ResetFrom(S, E_BASE);   // reload / back-fill / setting change: rebuild every engine from bar 0
 	CheckDataStamp(sc, S);
 	CheckWarnings(sc, S);
 	{
@@ -4370,6 +4479,7 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 	const int lastClosed = n - 2;
 	const HudSnapshot& H = S.hud; const DcsState& D = S.dcs; const VwapState& W = S.vwap; const AuctionState& A = S.auction; const FlowState& FL = S.flow;
 	const float atr = AtrAt(S, Max(0, lastClosed)); const float close = sc.Close[n - 1]; const float tick = S.tickSize;
+	const uint32_t cNeuUp = sc.Input[TI_COL_NEUTRAL_UP].GetColor();
 	const uint32_t cBull = TH.bull, cBear = TH.bear, cNeu = TH.neutral, cVwap = TH.gold, cLevel = TH.cyan, cLong = sc.Input[TI_COL_LONG].GetColor(), cShort = sc.Input[TI_COL_SHORT].GetColor(), cText = TH.text, cPanel = TH.panel, cDim = TH.dim;
 	const int fontPt = V.fontPt;
 	char buf[256];
@@ -4398,7 +4508,7 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 	for (int i = Max(0, start - 1); i < n; ++i)
 	{
 		const float v = D.dcs[i];
-		const uint32_t cc = v >= weak ? cBull : (v <= -weak ? cBear : cNeu);
+		const uint32_t cc = v >= weak ? cBull : (v <= -weak ? cBear : (sc.Close[i] >= sc.Open[i] ? cNeuUp : cNeu));
 		const bool forming = (i == n - 1);
 		sc.Subgraph[TS_CANDLE][i] = (candles && !forming) ? 1.0f : 0.0f; sc.Subgraph[TS_CANDLE].DataColor[i] = cc;
 		sc.Subgraph[TS_CANDLE_FORMING][i] = (candles && forming) ? 1.0f : 0.0f; sc.Subgraph[TS_CANDLE_FORMING].DataColor[i] = cc;
@@ -4420,17 +4530,30 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 	// ---- managed drawings (delete + redraw by line number every update) ----
 	TermState& T = S.term;
 	const int fillBars = static_cast<int>(sc.NumFillSpaceBars);
-	const int profBars = on[TL_PROFILE] ? Max(4, fillBars * V.profileWidthPct / 100) : 0;
 	// pixel geometry: bar spacing and the region height (from the GDI pass) size the pills and the HUD rows
 	const int barPx = sc.ChartBarSpacing > 0 ? static_cast<int>(sc.ChartBarSpacing) : 8;
 	const float charPx = 0.62f * 1.33f * static_cast<float>(fontPt);
+	// fill-space budget: HUD text, pills and the docked profile sit side by side. Shrink the HUD font one point, then the
+	// profile (down to 12 %), and tell the user how many fill-space bars the layout needs.
+	int hudPt = fontPt; int profPct = on[TL_PROFILE] ? Clamp(sc.Input[TI_PROFILE_W].GetInt(), 10, 60) : 0; int fillNeeded = 0;
+	{
+		const float fillPx = static_cast<float>(Max(1, fillBars) * barPx);
+		const float pillPx = 13.0f * charPx + 2.0f * barPx;
+		float hudPx = on[TL_HUD] ? 48.0f * 0.62f * 1.33f * static_cast<float>(hudPt) + 2.0f * barPx : 0.0f;
+		float profPx = fillPx * static_cast<float>(profPct) / 100.0f;
+		if (on[TL_HUD] && hudPx + pillPx + profPx > fillPx && hudPt > 8) { hudPt = Max(8, fontPt - 1); hudPx = 48.0f * 0.62f * 1.33f * static_cast<float>(hudPt) + 2.0f * barPx; }
+		if (on[TL_PROFILE] && hudPx + pillPx + profPx > fillPx) { profPct = Max(12, static_cast<int>(100.0f * Max(0.0f, fillPx - hudPx - pillPx) / fillPx)); profPx = fillPx * static_cast<float>(profPct) / 100.0f; }
+		fillNeeded = static_cast<int>((hudPx + pillPx + profPx) / static_cast<float>(barPx)) + 1;
+	}
+	if (on[TL_PROFILE]) V.profileWidthPct = profPct;
+	const int profBars = on[TL_PROFILE] ? Max(4, fillBars * profPct / 100) : 0;
 	const int pillEnd = n - 1 + Max(4, fillBars - profBars - 1);                                          // pills are right-aligned here (left of the profile)
 	const int pillCol1 = pillEnd - Max(6, static_cast<int>(charPx * 13.0f / barPx) + 1);                  // second column when two pills would overlap
 	const int lineEnd = Max(n, pillCol1 - 2);
 	double visHi = 0, visLo = 0; if (sc.GetGraphVisibleHighAndLow != nullptr) sc.GetGraphVisibleHighAndLow(visHi, visLo);
 	const double visRange = visHi > visLo ? visHi - visLo : 0.0;
 	const float pillH = visRange > 0 ? static_cast<float>(T.regionH > 0 ? (1.33 * 1.5 * fontPt) * visRange / T.regionH : 0.024 * visRange) : 0.0f;   // pill height in price units
-	const float pitch = T.regionH > 0 ? Clamp(100.0f * (1.33f * 1.45f * fontPt) / static_cast<float>(T.regionH), 1.2f, 4.0f) : 3.2f;              // HUD row pitch in % of the region
+	const float pitch = T.regionH > 0 ? Clamp(100.0f * (1.33f * 1.35f * static_cast<float>(hudPt)) / static_cast<float>(T.regionH), 1.2f, 4.0f) : 3.2f;   // HUD row pitch in % of the region
 	const double relX = -2.0;                                                                              // HUD / log anchor: 2 bars right of the last bar
 	// heavy per-bar layers are redrawn when a bar closes, the layer set changes or the engines were rebuilt
 	int& lastN = sc.GetPersistentInt(2); int& lastMask = sc.GetPersistentInt(3);
@@ -4482,21 +4605,39 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 		}
 	}
 
-	// HUD geometry: the text block goes to whichever end (top / bottom) holds fewer level pills; ties go away from price
+	// HUD geometry: candidate block tops = region top, lowest allowed, just below / above every pill (level pills and fib tags);
+	// the candidate covering the fewest pills wins, ties prefer the ends and then the half away from price
 	const int nl = pro ? 12 : 7;
 	const float pillPitch = pitch * 1.7f;
 	const float hudTotal = pillPitch + pitch * static_cast<float>(nl - 1);
 	const float hudBase = on[TL_TAPE] ? 14.0f : 3.0f;
-	int topHits = 0, botHits = 0;
-	for (size_t q = 0; q < pillPrices.size() && visRange > 0; ++q)
-	{
-		const float y = static_cast<float>(100.0 * (pillPrices[q] - visLo) / visRange);
-		if (y >= 96.0f - hudTotal) ++topHits;
-		if (y <= hudBase + hudTotal + 1.0f) ++botHits;
-	}
 	const float priceY = visRange > 0 ? static_cast<float>(100.0 * (close - visLo) / visRange) : 50.0f;
-	const bool hudTop = on[TL_HUD] ? (topHits != botHits ? topHits < botHits : priceY <= 55.0f) : true;
-	const float hudY0 = hudTop ? 97.0f : Min(97.0f, hudBase + hudTotal);
+	std::vector<float> pillY;
+	if (visRange > 0) for (size_t q = 0; q < pillPrices.size(); ++q) pillY.push_back(static_cast<float>(100.0 * (pillPrices[q] - visLo) / visRange));
+	if (visRange > 0 && on[TL_FIB] && !FL.legs.empty())
+	{
+		const FlowState::Leg& L2 = FL.legs.back(); static const float rr[4] = { 0.382f, 0.5f, 0.618f, 0.786f };
+		for (int k = 0; k < 4; ++k) pillY.push_back(static_cast<float>(100.0 * (L2.toPrice - (L2.toPrice - L2.fromPrice) * rr[k] - visLo) / visRange));
+	}
+	const float halfPill = visRange > 0 ? static_cast<float>(50.0 * pillH / visRange) + 0.6f : 1.5f;
+	const float lowest = Min(97.0f, hudBase + hudTotal);
+	float hudY0 = 97.0f;
+	if (on[TL_HUD])
+	{
+		std::vector<float> cands; cands.push_back(97.0f); cands.push_back(lowest);
+		for (size_t q = 0; q < pillY.size(); ++q) { cands.push_back(Clamp(pillY[q] - halfPill - 0.4f, lowest, 97.0f)); cands.push_back(Clamp(pillY[q] + halfPill + hudTotal + 0.4f, lowest, 97.0f)); }
+		int bestScore = INT_MAX;
+		for (size_t c = 0; c < cands.size(); ++c)
+		{
+			const float top = cands[c], bot = top - hudTotal; int hits = 0;
+			for (size_t q = 0; q < pillY.size(); ++q) if (pillY[q] + halfPill >= bot && pillY[q] - halfPill <= top) ++hits;
+			const int atEnd = (top >= 96.9f || top <= lowest + 0.1f) ? 0 : 1;
+			const int nearPrice = ((0.5f * (top + bot) > 50.0f) == (priceY > 50.0f)) ? 1 : 0;
+			const int score = hits * 100 + atEnd * 10 + nearPrice;
+			if (score < bestScore) { bestScore = score; hudY0 = top; }
+		}
+	}
+	const bool hudTop = (hudY0 - 0.5f * hudTotal) > 50.0f;
 	const float hudPLo = visRange > 0 ? static_cast<float>(visLo + visRange * (hudY0 - hudTotal) / 100.0) : 0.0f, hudPHi = visRange > 0 ? static_cast<float>(visLo + visRange * hudY0 / 100.0) : 0.0f;
 
 	// fib retracements of the last completed leg; a tag is skipped where a level pill or the HUD already sits
@@ -4557,17 +4698,20 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 			SlotText(sc, T.swing[slot++], L2.toIdx, 0, L2.up ? L2.toPrice + (0.2f + numOff) * atr : L2.toPrice - (0.2f + numOff) * atr, false, buf, L2.delta >= 0 ? cBull : cBear, fontPt + 1, true, 0, false, DT_CENTER | (L2.up ? DT_BOTTOM : DT_TOP));
 		}
 	}
-	// per-bar delta numbers (volume lives in the strip); only when bars are wide enough to read them
-	if (on[TL_NUMBERS] && barPx >= 12 && lastClosed >= 0 && !heavy) SlotKeep(T.num, TermState::NUM_SLOTS);
-	else if (on[TL_NUMBERS] && barPx >= 12 && lastClosed >= 0)
+	// per-bar delta numbers (volume lives in the strip); only when bars are wide enough, staggered on narrow bars,
+	// and not when the footprint already prints delta/volume in text mode
+	const bool numbersOn = on[TL_NUMBERS] && barPx >= 12 && lastClosed >= 0 && !(on[TL_FOOTPRINT] && barPx >= 36);
+	if (numbersOn && !heavy) SlotKeep(T.num, TermState::NUM_SLOTS);
+	else if (numbersOn)
 	{
 		const int N = Min(TermState::NUM_SLOTS, sc.Input[TI_NUM_BARS].GetInt());
+		const float stag = (barPx < 26 && pillH > 0) ? 0.7f * pillH : 0.0f;
 		int slot = 0;
 		for (int i = Max(0, lastClosed - N + 1); i <= lastClosed && slot < TermState::NUM_SLOTS; ++i)
 		{
 			const float dl = FL.delta[i]; char d[16]; render::Abbrev(dl, d, sizeof(d));
 			sprintf_s(buf, sizeof(buf), "%s%s", dl > 0 ? "+" : "", d);
-			SlotText(sc, T.num[slot++], i, 0, sc.High[i] + 0.08f * atr, false, buf, dl >= 0 ? cBull : cBear, Max(6, fontPt - 2), false, 0, false, DT_CENTER | DT_BOTTOM);
+			SlotText(sc, T.num[slot++], i, 0, sc.High[i] + 0.08f * atr + ((i & 1) ? stag : 0.0f), false, buf, dl >= 0 ? cBull : cBear, Max(6, fontPt - 2), false, 0, false, DT_CENTER | DT_BOTTOM);
 		}
 	}
 	// regression channel of the active leg
@@ -4664,10 +4808,10 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 	{
 		struct HudLine { char text[160]; uint32_t color; bool bold; bool pill; uint32_t back; int pt; };
 		HudLine lines[TermState::HUD_SLOTS]; int nl2 = 0;
-		HudLine L; L.pill = false; L.bold = false; L.pt = fontPt; L.back = 0; L.color = cText; L.text[0] = 0;
-		#define HUD_PUSH() { if (nl2 < TermState::HUD_SLOTS) lines[nl2++] = L; L.pill = false; L.bold = false; L.pt = fontPt; L.back = 0; L.color = cText; }
+		HudLine L; L.pill = false; L.bold = false; L.pt = hudPt; L.back = 0; L.color = cText; L.text[0] = 0;
+		#define HUD_PUSH() { if (nl2 < TermState::HUD_SLOTS) lines[nl2++] = L; L.pill = false; L.bold = false; L.pt = hudPt; L.back = 0; L.color = cText; }
 		// 1 bias pill + score trend
-		L.pill = true; L.bold = true; L.pt = fontPt + 3; L.color = cPanel; L.back = H.bias > 0 ? cBull : (H.bias < 0 ? cBear : cNeu);
+		L.pill = true; L.bold = true; L.pt = hudPt + 3; L.color = cPanel; L.back = H.bias > 0 ? cBull : (H.bias < 0 ? cBear : cNeu);
 		sprintf_s(L.text, sizeof(L.text), " %s  DCS %+.0f %s ", H.bias > 0 ? "LONG" : (H.bias < 0 ? "SHORT" : "NEUTRAL"), H.dcs, H.dcsTrend > 5 ? "^" : (H.dcsTrend < -5 ? "v" : "=")); HUD_PUSH();
 		// 2 regime | open type | value migration
 		L.color = H.regime == RG_TREND_UP ? cBull : (H.regime == RG_TREND_DOWN ? cBear : cText);
@@ -4728,7 +4872,11 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 		}
 		// 12 health or the first warning
 		if (S.warn.text[0]) { const char* e = strchr(S.warn.text, '\n'); size_t len = static_cast<size_t>((e ? e : S.warn.text + strlen(S.warn.text)) - S.warn.text); if (len > 52) len = 52; strncpy_s(L.text, sizeof(L.text), S.warn.text, len); L.color = cVwap; }
-		else { sprintf_s(L.text, sizeof(L.text), "%s | %s | mkt %d/%d | %.1f ms%s", S.warn.vapOff ? "VAP off" : "VAP on", S.warn.noDepth ? "depth off" : "depth on", H.interConnected, H.interConfigured, H.updateMs, fillBars >= 40 ? "" : " | Fill Space >= 40"); L.color = cDim; L.pt = Max(7, fontPt - 1); }
+		else
+		{
+			char fs[40] = ""; if (fillBars < fillNeeded) sprintf_s(fs, sizeof(fs), " | Fill Space >= %d", fillNeeded);
+			sprintf_s(L.text, sizeof(L.text), "%s | %s | mkt %d/%d | %.1f ms%s", S.warn.vapOff ? "VAP off" : "VAP on", S.warn.noDepth ? "depth off" : "depth on", H.interConnected, H.interConfigured, H.updateMs, fs); L.color = cDim; L.pt = Max(7, hudPt - 1);
+		}
 		HUD_PUSH();
 		#undef HUD_PUSH
 		for (int k = 0; k < nl2; ++k)

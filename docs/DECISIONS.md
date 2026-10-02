@@ -206,3 +206,21 @@ cover the profile, which is harmless); `ChartBarSpacing` being in pixels.
     suggestion for the configured $ risk, not an order.
 58. **ADR line outside RTH** uses the last completed RTH range (`prev RTH …`) because `rthHigh/Low` reset at the
     session roll.
+
+## v4.2 decisions
+
+59. **Footprint cells are GDI, drawn over the candles** (as in v2, decision 30), visible bars only, three detail modes by bar
+    spacing (36 / 20 / 12 px). Cell colour = bg blended toward bull/bear by 0.10 + 0.45·|delta|/max|delta| + 0.30·vol/maxVol,
+    capped at 0.85; text switches to the background colour on bright cells. The bias frame (1 px box in the DCS colour) is
+    what keeps "bias candles" readable with the layer on.
+60. **Back-fill detection by content.** The stamp stores the volume of a closed bar (`lastIdx − 1`) and the close of the mid
+    bar; a change with unchanged times means Sierra replaced the data (delayed-feed back-fill) and every engine is rebuilt.
+    The Terminal also calls `ResetFrom(E_BASE)` on `IsFullRecalculation` with `UpdateStartIndex == 0`; with one study on the
+    chart the nine-fold recompute the v1 design avoided no longer exists.
+61. **Fill-space budget** = 48 chars × 0.62 × 1.33 × pt (HUD) + 13 chars (pill) + profile %. Order of concessions: HUD font
+    −1 pt (floor 8), profile down to 12 %, then the hint. The number in the hint is the bars needed at the current spacing.
+62. **HUD position search**: candidates are the region top, the lowest allowed top (base + block height), and the edges of
+    every pill (level pills and fib tags, half a pill plus 0.4 % of margin). Score = pills covered × 100 + 10 if not at an
+    end + 1 if on price's half. The event log keeps taking the end opposite the HUD's centre.
+63. **Neutral candles** use two shades (up / down bar) so an evening session with a flat score still reads as price action;
+    both are colour inputs. The conviction colours are unchanged.

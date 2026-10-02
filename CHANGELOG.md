@@ -140,3 +140,20 @@
 - HUD range line falls back to the prior RTH range outside RTH (`prev RTH 118% ADR`) instead of `0%`.
 - Ghost profile drawn brighter when there is no developing session profile (pre-open / after the close).
 - Docs: VISUAL_GUIDE, SETUP, DECISIONS 49–58, CLAUDE.md.
+
+## v4.2 — footprint cells, back-fill-proof engines, pill-aware HUD
+- **Footprint Cells (bid x ask)** layer (PRO default, GDI): one cell per traded price inside every visible bar, filled by delta/volume
+  heat; `bid x ask` text plus delta above / volume below at ≥ 36 px bar spacing, the level delta at 20–35 px, heat only below;
+  gold POC box, imbalance outlines (thicker when stacked), `u` for unfinished auctions, a 1 px frame in the bar's conviction colour.
+  Nothing is drawn under 12 px spacing. Unsigned VAP volumes are converted to double before subtracting (the v2 renderer
+  wrapped around when bid > ask).
+- **Back-fill detection**: the data stamp now also compares a closed bar's volume and the mid bar's close, and the Terminal
+  resets every engine on a full recalculation. The flat VWAP + jump seen on the delayed feed (bars re-filled with the same
+  times) cannot recur.
+- **Fill-space budget**: HUD text (48 chars), pills and the docked profile must fit side by side; the HUD font drops one point,
+  then the profile narrows to 12 %, and the health line says `Fill Space >= N` with the computed number.
+- **HUD placement** searches candidate positions (top, bottom, just below / above each level pill and fib tag) and takes the one
+  covering the fewest pills; ties prefer the ends, then the half away from price.
+- Per-bar delta numbers are staggered (odd bars one text height higher) under 26 px spacing and suppressed when the footprint
+  prints them; neutral candles are shaded lighter for up bars and darker for down bars (two colour inputs).
+- Docs: VISUAL_GUIDE, SETUP, DECISIONS 59–63.

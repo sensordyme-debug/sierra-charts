@@ -1,4 +1,4 @@
-# Setup (Sierra Chart) — v4.1: one study, PRO preset
+# Setup (Sierra Chart) — v4.2: one study, PRO preset
 
 ## 1. Settings the suite needs (the HUD's last line warns when they are wrong)
 
@@ -7,8 +7,8 @@
 | Intraday Data Storage Time Unit | Global Settings >> Data/Trade Service Settings | **1 Tick** (then *Edit >> Delete All Data and Download* once per chart) |
 | Time zone | Global Settings >> General Settings >> Time Zone | **New York** |
 | Session times | Chart >> Chart Settings >> Session Times | Day 09:30–16:00, evening session on |
-| **Fill Space** | Chart >> Chart Settings (or the Chart >> Fill Space control) | **40–60 bars** — HUD, event log, level pills, fibs and the docked profile live there |
-| Bar spacing | Chart >> Chart Settings or the zoom buttons | **≥ 12 px** so the per-bar delta numbers show (they hide automatically when narrower) |
+| **Fill Space** | Chart >> Chart Settings (or the Chart >> Fill Space control) | **40–60 bars** — HUD, event log, level pills, fibs and the docked profile live there; the HUD's last line says `Fill Space >= N` when it needs more at your zoom |
+| Bar spacing | Chart >> Chart Settings or the zoom buttons | **≥ 12 px** for footprint heat and delta numbers, **≥ 20 px** for per-level delta, **≥ 36 px** for `bid x ask` text in every cell |
 | Chart colours (optional) | Chart >> Graphics Settings | background `#0B0E14`, grid `#161B26`, candle outlines/wicks `#6E7686` |
 
 ## 2. Build
@@ -41,8 +41,8 @@ Everything else works at its defaults. File >> Save Chartbook.
 
 ## 4. What you see (PRO)
 
-Bias candles, delta numbers per bar, swing-delta numbers, regression channel, gold VWAP with dotted
-±1σ lines, fib retracements of the last leg, six nearest levels with right-edge pills, zones, bubbles, a
+Footprint cells (bid × ask heat, POC, imbalances) inside bias-framed candles, delta numbers per bar,
+swing-delta numbers, regression channel, gold VWAP with dotted ±1σ lines, fib retracements of the last leg, six nearest levels with right-edge pills, zones, bubbles, a
 six-line event log with dash markers, A/B signal arrows with risk/reward boxes and contract size,
 projection arrow with odds, a volume profile docked at the right edge, a calculated-values strip along
 the bottom, and a twelve-line HUD. `docs/VISUAL_GUIDE.md` describes every element and the CLEAN preset.
@@ -50,7 +50,8 @@ the bottom, and a twelve-line HUD. `docs/VISUAL_GUIDE.md` describes every elemen
 ## 5. Presets and layers
 
 *Preset* = PRO or CLEAN. Each *Layer:* input is *Preset default / On / Off*. A clean way to work: start
-in PRO, switch off what you do not read (typically *Delta Per Bar* or *Calculated-Values Strip*), or
+in PRO, switch off what you do not read (typically *Delta Per Bar*, *Calculated-Values Strip* or
+*Footprint Cells* on small timeframes), or
 start in CLEAN and add *Volume Profile* and *Swing Delta Numbers*. *Profile Width* (% of the fill
 space), *VWAP Band Style* and *VWAP Band Fill Transparency* are inputs.
 

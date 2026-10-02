@@ -1,4 +1,4 @@
-# NQ Edge Terminal — Visual guide (v4.1, PRO by default)
+# NQ Edge Terminal — Visual guide (v4.2, PRO by default)
 
 Palette: bull `#00C896` green, bear `#FF4D5E` red, neutral `#6E7686` gray, VWAP/fib gold `#FFC857`,
 levels cyan `#3EC6FF`, text `#E6EAF2`, dim `#788091`. Every colour is an input.
@@ -12,9 +12,18 @@ add one layer to CLEAN without losing the preset.
 A dark chart, candles in the left two thirds, the right third empty (the fill space, 40–60 bars).
 Reading from the candles outward:
 
-- **Candles** in exactly three colours: green when the Directional Conviction Score of that closed bar
-  is at or above +25, red at or below −25, gray between. The forming bar is **hollow** in its
-  provisional colour.
+- **Candles** in three conviction colours: green when the Directional Conviction Score of that closed
+  bar is at or above +25, red at or below −25, gray between (a lighter gray for up bars, darker for
+  down bars, so a flat-score session still reads as price action). The forming bar is **hollow** in
+  its provisional colour.
+- **Footprint cells** inside every bar once bars are at least 12 px wide: one cell per traded price,
+  filled by delta heat — green when more volume traded at the ask (aggressive buying), red at the bid,
+  brighter for larger delta and volume. At 36 px or more each cell prints `bid x ask` and the bar gets
+  its delta above and volume below; at 20–35 px each cell prints the level delta; narrower, heat only.
+  The level with the most volume carries a gold box (the bar's POC), diagonal imbalances get a green
+  or red outline (thicker when three or more stack), `u` marks an unfinished auction at an extreme, and
+  a 1 px frame in the bar's conviction colour surrounds the column so the bias stays readable.
+  (Layer *Footprint Cells (bid x ask)*.)
 - Above each of the last 30 bars a small green or red number: the bar's **delta** (`+1.2k`, `-640`).
   Volume is not repeated on the chart (it is a row of the strip). The numbers appear only when the
   bar spacing is 12 px or more, so zooming out removes them. (Layer *Delta Per Bar*.)
@@ -61,8 +70,10 @@ Reading from the candles outward:
 - Along the **bottom 11 %** of the price region a colour-scaled table, one column per visible bar:
   Delta, Volume, Delta %, CVD change, Imbalances, DCS (the Sierra "calculated values" strip).
   (Layer *Calculated-Values Strip*.)
-- In the fill space, at whichever end (top or bottom) holds fewer level pills, twelve compact lines
-  (≈ 48 characters, row height sized from the real region height), the **HUD**:
+- In the fill space, wherever it covers the fewest pills (top, bottom, or between two pills), twelve
+  compact lines (≈ 48 characters, row height sized from the real region height), the **HUD**. When the
+  fill space is too narrow for HUD + pills + profile, the HUD font drops one point, the profile
+  narrows, and the last line says `Fill Space >= N` with the number of bars that would fit everything:
   1. A coloured **pill** `LONG` / `SHORT` / `NEUTRAL` + `DCS +62 ^` (score trend over five bars).
   2. `TREND UP | Open-Drive up | value higher`, coloured by regime.
   3. `Normal day | 5/6 groups agree | range 64% ADR` — day type, how many feature groups (trend,
@@ -89,8 +100,9 @@ and a seven-line HUD (lines 1, 2, 4, 5, 6, 8 and 12 above). Nothing else.
 - Three line colours: gold (VWAP, fibs), cyan (levels), green/red (signals, channel, swing numbers).
 - Every line is 1 px except the VWAP (2 px). Every fill is at least 80 % transparent.
 - Labels sit in the fill space or offset above/below the bar, never on a candle; per-bar numbers are
-  dropped when bars are narrower than 12 px; fib tags yield to level pills and to the HUD; the HUD and
-  the event log take opposite ends of the chart, and the HUD stays above the strip.
+  staggered on narrow bars and dropped under 12 px; fib tags yield to level pills and to the HUD; the
+  HUD takes the position covering the fewest pills, the event log the opposite end, and both stay
+  above the strip.
 - Nothing is drawn more than 2 ATR from price except levels, fibs and the channel.
 - Heavy layers (numbers, swing numbers, zones, bubbles, event log, fibs, channel) are redrawn when a
   bar closes; the HUD, pills and signal boxes every update. All drawings are managed by line number:
