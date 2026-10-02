@@ -115,6 +115,8 @@ namespace nqe
 		int equalTolTicks = 2;
 		int bosDecayBars = 10;
 		float ibExtA = 0.5f, ibExtB = 1.0f, ibExtC = 2.0f;
+		int compositeDays = 5;
+		int adrDays = 10;
 	};
 
 	struct VwapParams
@@ -197,6 +199,7 @@ namespace nqe
 		int targetLineBars = 20;
 		int alertsOn = 1;
 		int alertSound = 1;
+		int alertMinGrade = 2;      // 1 = A, 2 = A+B, 3 = all
 	};
 
 	struct ValParams
@@ -466,7 +469,7 @@ namespace nqe
 	struct Signal
 	{
 		int idx = 0; int type = SETUP_NONE; int dir = 0; float entry = 0, stop = 0, t1 = 0, t2 = 0;
-		float dcs = 0; float rr = 0; char label[96] = "";
+		float dcs = 0; float rr = 0; char label[96] = ""; int grade = 2;
 		int lineArrow = 0, lineEntry = 0, lineStop = 0, lineT1 = 0, lineT2 = 0, lineText = 0;
 		// validation (filled by the validation engine)
 		int resolved = 0;          // 0 pending, 1 win (T1), -1 loss, 2 timeout
@@ -535,7 +538,59 @@ namespace nqe
 		char vwapText[64] = "";
 		int signalsTotal = 0;
 		double updateMs = 0, maxUpdateMs = 0; int fullCalcMs = 0; int bars = 0;
+		char dayType[24] = ""; char leadLag[32] = ""; int lastEventIdx = -1; float adrPct = 0; int interConnected = 0, interConfigured = 0;
 	};
+
+	// ==== 14 Terminal renderer (GDI) ============================================
+	// One immediate-mode renderer draws every visual layer for the visible bars only. The Backdrop
+	// study calls DrawBackdrop (under the candles), the Overlay study DrawOverlay (above), the Tape
+	// study DrawTape (its own strip). Geometry is computed once per paint in a Frame.
+
+	enum Preset { PRESET_COMMAND = 0, PRESET_FOOTPRINT = 1, PRESET_CLEAN = 2 };
+	enum Layer
+	{
+		L_CANDLES = 0, L_RIBBON, L_LEVELS, L_PROFILE, L_GHOST, L_COMPOSITE, L_ZONES, L_BUBBLES, L_SWINGS, L_CHANNEL,
+		L_CARDS, L_PROJECTION, L_NOTES, L_HUD, L_FOOTPRINT, L_DEPTH, L_TINT, L_SESSION, L_SEPARATORS, L_CLOUD, L_TAPE, L_COUNT
+	};
+	static const char* kLayerNames[L_COUNT] =
+	{
+		"Conviction Candles", "DCS Ribbon", "Levels + Right-Edge Pills", "Docked Volume Profile", "Ghost Prior Profile", "Composite Profile",
+		"Zones", "Large-Trade Bubbles", "Swing Delta Labels", "Regression Channel", "Signal Cards + R/R Boxes", "Projection Arrow",
+		"Event Annotations", "HUD Panel", "Footprint Cells", "Depth Heatmap", "Regime Tint", "Session Shade", "Session Separators", "VWAP Cloud", "Order-Flow Tape"
+	};
+	// preset defaults: 1 = on, 0 = off
+	static const unsigned char kPresetLayers[3][L_COUNT] =
+	{
+		{ 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1 },   // COMMAND
+		{ 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1 },   // FOOTPRINT
+		{ 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0 },   // CLEAN
+	};
+
+	struct Theme
+	{
+		uint32_t bg = RGB(11, 14, 20), grid = RGB(22, 27, 38), bull = RGB(0, 200, 150), bear = RGB(255, 77, 94), neutral = RGB(138, 147, 166);
+		uint32_t gold = RGB(255, 200, 87), cyan = RGB(62, 198, 255), magenta = RGB(214, 93, 255), text = RGB(230, 234, 242), dim = RGB(92, 101, 119);
+		uint32_t panel = RGB(14, 18, 26), tintUp = RGB(0, 200, 150), tintDown = RGB(255, 77, 94), tintBalance = RGB(62, 198, 255), tintChop = RGB(255, 200, 87);
+	};
+
+	// Published by the Overlay study; read by every study (regions, visibility) and renderer.
+	struct VisualConfig
+	{
+		int preset = PRESET_COMMAND;
+		bool layer[L_COUNT];
+		bool diagnostics = false;
+		Theme theme;
+		int fontPt = 10;
+		int profileWidthPct = 45;        // of the fill space
+		int hudOpacity = 82;
+		int maxNotes = 8;
+		int minGrade = 2;                // 1 = A only, 2 = A+B, 3 = all
+		int tapeRows = 6;
+		VisualConfig() { for (int k = 0; k < L_COUNT; ++k) layer[k] = kPresetLayers[0][k] != 0; }
+	};
+
+	struct PerfStats { double backdropMs = 0, overlayMs = 0, tapeMs = 0; int paints = 0; };
+
 
 	struct DataStamp { int arraySize = 0; double t0 = 0, tMid = 0, tLast = 0; int midIdx = -1, lastIdx = -1; bool valid = false; };
 
@@ -553,6 +608,8 @@ namespace nqe
 		float tickSize = 0.25f;
 		int resetCount = 0;
 		int hudUpdates = 0;
+		VisualConfig vis;
+		PerfStats perf;
 
 		EngineCommon& Engine(int e)
 		{
@@ -2648,7 +2705,7 @@ namespace nqe
 		L.Stamp(sc);
 	}
 
-	// ==== 14 HUD snapshot + GDI =================================================
+	// ==== 14 HUD snapshot, warnings, renderer ===================================
 
 	void CheckWarnings(SCStudyInterfaceRef sc, ChartState& S)
 	{
@@ -2727,7 +2784,14 @@ namespace nqe
 				++H.megaCount;
 			}
 			H.smt = (I.lastSmtIdx >= 0 && i - I.lastSmtIdx <= 12) ? (I.lastSmtVal > 0 ? 1 : -1) : 0;
+			const InterParams& IP = S.params.inter;
+			H.interConfigured = (IP.chartYM > 0) + (IP.chartES > 0) + (IP.chartRTY > 0) + (IP.chartTICK > 0);
+			for (int k = 0; k < 6; ++k) H.interConfigured += (IP.chartMega[k] > 0);
+			H.interConnected = 0; for (int b = 0; b < 10; ++b) H.interConnected += (I.available >> b) & 1;
+			H.leadLag[0] = 0;
 		}
+		H.lastEventIdx = S.flow.lastEventIdx;
+		H.dayType[0] = 0; H.adrPct = 0;
 		H.signalsTotal = static_cast<int>(S.dcs.signals.size());
 		if (i < static_cast<int>(S.vwap.vwap.size()) && S.vwap.vwap[i] > 0)
 			sprintf_s(H.vwapText, sizeof(H.vwapText), "VWAP %s", sc.FormatGraphValue(S.vwap.vwap[i], sc.BaseGraphValueFormat).GetChars());
@@ -2768,218 +2832,564 @@ namespace nqe
 			sprintf_s(H.stateLine, sizeof(H.stateLine), "Warming up (need swings, value area and session data)");
 	}
 
-	inline n_ACSIL::s_GraphicsColor GColor(uint32_t c) { n_ACSIL::s_GraphicsColor g; g.SetColorValue(c); return g; }
-
-	struct HudPainter
+	namespace render
 	{
-		SCStudyInterfaceRef sc; int x, y, w, lineH, fontPt; uint32_t textColor;
-		HudPainter(SCStudyInterfaceRef s, int px, int py, int pw, int lh, int fp, uint32_t tc) : sc(s), x(px), y(py), w(pw), lineH(lh), fontPt(fp), textColor(tc) {}
-		void Font(int pt, bool bold)
+		inline uint32_t Blend(uint32_t a, uint32_t b, float t)
 		{
-			n_ACSIL::s_GraphicsFont f; f.m_FaceName = "Consolas"; f.m_Height = pt; f.m_Weight = bold ? FW_BOLD : FW_NORMAL;
-			sc.Graphics.SetTextFont(f);
+			t = Clamp(t, 0.0f, 1.0f);
+			return RGB(static_cast<int>(GetRValue(a) * (1 - t) + GetRValue(b) * t + 0.5f), static_cast<int>(GetGValue(a) * (1 - t) + GetGValue(b) * t + 0.5f), static_cast<int>(GetBValue(a) * (1 - t) + GetBValue(b) * t + 0.5f));
 		}
-		void Text(const char* s, uint32_t color, int dx = 0) { sc.Graphics.SetTextColor(GColor(color)); sc.Graphics.DrawTextAt(SCString(s), x + 8 + dx, y); }
-		void Line(const char* s, uint32_t color) { Text(s, color); y += lineH; }
-		int TextWidth(const char* s) { n_ACSIL::s_GraphicsSize sz; sc.Graphics.GetTextSize(SCString(s), sz); return sz.Width; }
-		void Dot(int cx, int cy, int r, uint32_t color)
-		{
-			n_ACSIL::s_GraphicsBrush b; b.m_BrushType = n_ACSIL::s_GraphicsBrush::BRUSH_TYPE_SOLID; b.m_BrushColor.SetColorValue(color);
-			n_ACSIL::s_GraphicsPen p; p.m_PenColor.SetColorValue(color); p.m_Width = 1; sc.Graphics.SetPen(p);
-			sc.Graphics.FillEllipse(cx - r, cy - r, cx + r, cy + r, b);
-		}
-		void Box(int left, int top, int right, int bottom, uint32_t color)
-		{
-			n_ACSIL::s_GraphicsBrush b; b.m_BrushType = n_ACSIL::s_GraphicsBrush::BRUSH_TYPE_SOLID; b.m_BrushColor.SetColorValue(color);
-			n_ACSIL::s_GraphicsRectangle r; r.Left = left; r.Top = top; r.Right = right; r.Bottom = bottom;
-			sc.Graphics.FillRectangle(r, b);
-		}
-	};
+		inline n_ACSIL::s_GraphicsColor GC(uint32_t c) { n_ACSIL::s_GraphicsColor g; g.SetColorValue(c); return g; }
 
-	// HUD input indices (shared by the study function and the GDI callback)
-	enum HudInput
+		// Formats 1234 -> "1.2k", 1500000 -> "1.5M"
+		inline void Abbrev(double v, char* out, size_t n)
+		{
+			const double a = fabs(v);
+			if (a >= 1e6) sprintf_s(out, n, "%.1fM", v / 1e6);
+			else if (a >= 1e4) sprintf_s(out, n, "%.0fk", v / 1e3);
+			else if (a >= 1e3) sprintf_s(out, n, "%.1fk", v / 1e3);
+			else sprintf_s(out, n, "%.0f", v);
+		}
+
+		struct Frame
+		{
+			SCStudyInterfaceRef sc; ChartState& S; const VisualConfig& V; const Theme& T;
+			int n, lastClosed, firstVis, lastVis, left, top, right, bottom, region;
+			int xLast, spacing, fillLeft, fillRight, fillW;
+			bool fillVisible, hasTransparent;
+			float tick, atr;
+			int curFontPt; bool curBold; int fontH;
+			Frame(SCStudyInterfaceRef s, ChartState& st, int reg)
+				: sc(s), S(st), V(st.vis), T(st.vis.theme), n(s.ArraySize), lastClosed(s.ArraySize - 2), firstVis(Max(0, s.IndexOfFirstVisibleBar)), lastVis(Min(s.ArraySize - 1, s.IndexOfLastVisibleBar)),
+				left(s.StudyRegionLeftCoordinate), top(s.StudyRegionTopCoordinate), right(s.StudyRegionRightCoordinate), bottom(s.StudyRegionBottomCoordinate), region(reg),
+				xLast(0), spacing(0), fillLeft(0), fillRight(0), fillW(0), fillVisible(false), hasTransparent(false), tick(st.tickSize), atr(0), curFontPt(-1), curBold(false), fontH(12)
+			{
+				if (n <= 0) return;
+				hasTransparent = sc.Graphics.FillRectangleWithColorTransparent != nullptr;
+				xLast = sc.BarIndexToXPixelCoordinate(lastVis);
+				const int xPrev = lastVis > 0 ? sc.BarIndexToXPixelCoordinate(lastVis - 1) : xLast - 8;
+				spacing = Max(1, xLast - xPrev);
+				if (spacing <= 1 && sc.ChartBarSpacing > 0) spacing = sc.ChartBarSpacing;
+				fillVisible = (lastVis >= n - 1);
+				fillLeft = fillVisible ? xLast + spacing : right;
+				fillRight = right - 2;
+				fillW = Max(0, fillRight - fillLeft);
+				atr = AtrAt(S, lastClosed);
+				Font(V.fontPt, false);
+			}
+			int XOf(int idx) const
+			{
+				if (idx <= lastVis) return sc.BarIndexToXPixelCoordinate(idx);
+				return xLast + (idx - lastVis) * spacing;
+			}
+			int YOf(float price) const { return sc.RegionValueToYPixelCoordinate(price, region); }
+			int YOfRegion(float value, int reg) const { return sc.RegionValueToYPixelCoordinate(value, reg); }
+			void Clip(int l, int t, int r, int b) const { if (sc.Graphics.SetClippingRegionFromRectangle) { n_ACSIL::s_GraphicsRectangle rc; rc.Left = l; rc.Top = t; rc.Right = r; rc.Bottom = b; sc.Graphics.SetClippingRegionFromRectangle(rc); } }
+			void Unclip() const { if (sc.Graphics.ResetClippingRegion) sc.Graphics.ResetClippingRegion(); }
+
+			// alpha = opacity percent (100 = opaque)
+			void Fill(int l, int t, int r, int b, uint32_t c, int alpha = 100) const
+			{
+				if (r <= l || b <= t) return;
+				n_ACSIL::s_GraphicsRectangle rc; rc.Left = l; rc.Top = t; rc.Right = r; rc.Bottom = b;
+				if (alpha >= 100 || !hasTransparent) { if (alpha < 100) c = Blend(T.bg, c, alpha / 100.0f); sc.Graphics.FillRectangleWithColor(rc, GC(c)); }
+				else sc.Graphics.FillRectangleWithColorTransparent(rc, GC(c), static_cast<uint8_t>(100 - Clamp(alpha, 0, 100)));
+			}
+			void Pen(uint32_t c, int w = 1, int style = 0) const
+			{
+				n_ACSIL::s_GraphicsPen p; p.m_PenColor.SetColorValue(c); p.m_Width = Max(1, w);
+				p.m_PenStyle = style == 1 ? n_ACSIL::s_GraphicsPen::e_PenStyle::PEN_STYLE_DASH : (style == 2 ? n_ACSIL::s_GraphicsPen::e_PenStyle::PEN_STYLE_DOT : n_ACSIL::s_GraphicsPen::e_PenStyle::PEN_STYLE_SOLID);
+				sc.Graphics.SetPen(p);
+			}
+			void Line(int x1, int y1, int x2, int y2, uint32_t c, int w = 1, int style = 0) const { Pen(c, w, style); sc.Graphics.MoveTo(x1, y1); sc.Graphics.LineTo(x2, y2); }
+			void Box(int l, int t, int r, int b, uint32_t c, int w = 1, int style = 0) const
+			{
+				Pen(c, w, style);
+				sc.Graphics.MoveTo(l, t); sc.Graphics.LineTo(r, t); sc.Graphics.LineTo(r, b); sc.Graphics.LineTo(l, b); sc.Graphics.LineTo(l, t);
+			}
+			void Circle(int cx, int cy, int r, uint32_t fill, uint32_t outline) const
+			{
+				n_ACSIL::s_GraphicsBrush b; b.m_BrushType = n_ACSIL::s_GraphicsBrush::BRUSH_TYPE_SOLID; b.m_BrushColor.SetColorValue(fill);
+				Pen(outline, 1);
+				sc.Graphics.FillEllipse(cx - r, cy - r, cx + r, cy + r, b);
+			}
+			void Font(int pt, bool bold)
+			{
+				if (pt == curFontPt && bold == curBold) return;
+				n_ACSIL::s_GraphicsFont f; f.m_FaceName = "Consolas"; f.m_Height = pt; f.m_Weight = bold ? FW_BOLD : FW_NORMAL;
+				sc.Graphics.SetTextFont(f);
+				curFontPt = pt; curBold = bold;
+				n_ACSIL::s_GraphicsSize sz; sc.Graphics.GetTextSize(SCString("Hg"), sz); fontH = Max(8, sz.Height);
+			}
+			int TextW(const char* s) const { n_ACSIL::s_GraphicsSize sz; sc.Graphics.GetTextSize(SCString(s), sz); return sz.Width; }
+			void Text(int x, int y, const char* s, uint32_t c) const { sc.Graphics.SetTextColor(GC(c)); sc.Graphics.DrawTextAt(SCString(s), x, y); }
+			void TextRight(int xr, int y, const char* s, uint32_t c) const { Text(xr - TextW(s), y, s, c); }
+			void TextCenter(int xc, int y, const char* s, uint32_t c) const { Text(xc - TextW(s) / 2, y, s, c); }
+			// Compact pill: filled rounded-ish box with text; returns its width
+			int Pill(int x, int y, const char* s, uint32_t bg, uint32_t fg, int alpha = 100, bool rightAlign = false)
+			{
+				const int w = TextW(s) + 8, h = fontH + 2;
+				const int l = rightAlign ? x - w : x;
+				Fill(l, y, l + w, y + h, bg, alpha);
+				Text(l + 4, y + 1, s, fg);
+				return w;
+			}
+			void Arrow(int x1, int y1, int x2, int y2, uint32_t c, int w, int style) const
+			{
+				Line(x1, y1, x2, y2, c, w, style);
+				const double dx = x2 - x1, dy = y2 - y1, len = sqrt(dx * dx + dy * dy); if (len < 1) return;
+				const double ux = dx / len, uy = dy / len, sz = 6;
+				n_ACSIL::s_GraphicsPoint pts[3];
+				pts[0].X = x2; pts[0].Y = y2;
+				pts[1].X = static_cast<int>(x2 - ux * sz - uy * sz * 0.6); pts[1].Y = static_cast<int>(y2 - uy * sz + ux * sz * 0.6);
+				pts[2].X = static_cast<int>(x2 - ux * sz + uy * sz * 0.6); pts[2].Y = static_cast<int>(y2 - uy * sz - ux * sz * 0.6);
+				n_ACSIL::s_GraphicsBrush b; b.m_BrushType = n_ACSIL::s_GraphicsBrush::BRUSH_TYPE_SOLID; b.m_BrushColor.SetColorValue(c); sc.Graphics.SetBrush(b);
+				Pen(c, 1); sc.Graphics.DrawPolygon(pts);
+			}
+			bool Visible(int idx) const { return idx >= firstVis && idx <= lastVis; }
+			const char* Px(float price) const { return sc.FormatGraphValue(price, sc.BaseGraphValueFormat).GetChars(); }
+		};
+
+		inline uint32_t DcsColor(const Theme& T, float dcs)
+		{
+			const float t = Clamp(static_cast<float>(fabs(dcs)) / 100.0f, 0.0f, 1.0f);
+			return dcs >= 0 ? Blend(T.neutral, T.bull, t) : Blend(T.neutral, T.bear, t);
+		}
+		inline uint32_t StateColor(const Theme& T, int state)
+		{
+			switch (state) { case 2: return T.bull; case 1: return Blend(T.neutral, T.bull, 0.55f); case -1: return Blend(T.neutral, T.bear, 0.55f); case -2: return T.bear; default: return T.neutral; }
+		}
+
+		// ---------------- Backdrop: regime tint, session shade, separators, VWAP cloud -----------------
+		void DrawBackdrop(Frame& F)
+		{
+			SCStudyInterfaceRef sc = F.sc; ChartState& S = F.S; const VisualConfig& V = F.V; const Theme& T = F.T;
+			if (F.n <= 0) return;
+			const BaseState& B = S.base; const RegimeState& R = S.regime; const VwapState& W = S.vwap;
+			const int half = F.spacing / 2 + 1;
+			F.Clip(F.left, F.top, F.right, F.bottom);
+			// regime tint + ETH shade per visible bar
+			if ((V.layer[L_TINT] || V.layer[L_SESSION]) && !R.regime.empty())
+			{
+				int runStart = F.firstVis; int runReg = -1; int runEth = -1;
+				for (int i = F.firstVis; i <= F.lastVis + 1; ++i)
+				{
+					const int reg = (i <= F.lastVis && i < static_cast<int>(R.regime.size())) ? R.regime[i] : -2;
+					const int eth = (i <= F.lastVis && i < static_cast<int>(B.isRth.size())) ? (B.isRth[i] ? 0 : 1) : -2;
+					if (reg != runReg || eth != runEth)
+					{
+						if (runReg != -1 && i > runStart)
+						{
+							const int x1 = F.XOf(runStart) - half, x2 = F.XOf(i - 1) + half;
+							if (V.layer[L_SESSION] && runEth == 1) F.Fill(x1, F.top, x2, F.bottom, T.grid, 55);
+							if (V.layer[L_TINT])
+							{
+								uint32_t c = 0; int a = 0;
+								if (runReg == RG_TREND_UP) { c = T.tintUp; a = 7; } else if (runReg == RG_TREND_DOWN) { c = T.tintDown; a = 7; }
+								else if (runReg == RG_BALANCE) { c = T.tintBalance; a = 5; } else if (runReg == RG_CHOP) { c = T.tintChop; a = 6; }
+								if (a > 0) F.Fill(x1, F.top, x2, F.bottom, c, a);
+							}
+						}
+						runStart = i; runReg = reg; runEth = eth;
+					}
+				}
+			}
+			// session separators: RTH open, IB end, RTH close
+			if (V.layer[L_SEPARATORS])
+			{
+				const AuctionState& A = S.auction;
+				for (int i = Max(1, F.firstVis); i <= F.lastVis; ++i)
+				{
+					const bool open = B.isRth[i] && !B.isRth[i - 1];
+					const bool close = !B.isRth[i] && B.isRth[i - 1];
+					const bool ibEnd = i < static_cast<int>(A.ibDone.size()) && A.ibDone[i] && !A.ibDone[i - 1] && B.isRth[i];
+					if (!open && !close && !ibEnd) continue;
+					const int x = F.XOf(i) - half;
+					F.Line(x, F.top, x, F.bottom, open ? T.gold : (ibEnd ? T.cyan : T.dim), 1, open ? 0 : 2);
+					if (open) { F.Font(V.fontPt - 1, false); F.Text(x + 3, F.top + 2, "RTH", T.gold); }
+					else if (ibEnd) { F.Font(V.fontPt - 1, false); F.Text(x + 3, F.top + 2, "IB", T.cyan); }
+				}
+			}
+			// VWAP cloud: translucent slices between the bands, tinted by slope
+			if (V.layer[L_CLOUD] && !W.vwap.empty())
+			{
+				for (int i = F.firstVis; i <= F.lastVis; ++i)
+				{
+					if (i >= static_cast<int>(W.vwap.size()) || W.vwap[i] <= 0) continue;
+					const float sl = W.slope[i];
+					const uint32_t c = sl > 0.15f ? T.bull : (sl < -0.15f ? T.bear : T.gold);
+					const int x1 = F.XOf(i) - half, x2 = x1 + F.spacing + 1;
+					const int y2u = F.YOf(W.b2u[i]), y1u = F.YOf(W.b1u[i]), y1d = F.YOf(W.b1d[i]), y2d = F.YOf(W.b2d[i]);
+					F.Fill(x1, y2u, x2, y1u, c, 6); F.Fill(x1, y1u, x2, y1d, c, 11); F.Fill(x1, y1d, x2, y2d, c, 6);
+				}
+				// ±3σ dotted
+				for (int i = Max(F.firstVis, 1); i <= F.lastVis; ++i)
+				{
+					if (i >= static_cast<int>(W.vwap.size()) || W.vwap[i] <= 0 || W.vwap[i - 1] <= 0) continue;
+					F.Line(F.XOf(i - 1), F.YOf(W.b3u[i - 1]), F.XOf(i), F.YOf(W.b3u[i]), T.dim, 1, 2);
+					F.Line(F.XOf(i - 1), F.YOf(W.b3d[i - 1]), F.XOf(i), F.YOf(W.b3d[i]), T.dim, 1, 2);
+				}
+			}
+			F.Unclip();
+		}
+
+		// ---------------- Overlay pieces ----------------
+		void DrawRibbon(Frame& F)
+		{
+			const DcsState& D = F.S.dcs; const Theme& T = F.T;
+			if (D.dcs.empty()) return;
+			const int h = 6, yb = F.bottom - 1, yt = yb - h;
+			const int half = F.spacing / 2 + 1;
+			for (int i = F.firstVis; i <= F.lastVis; ++i)
+			{
+				if (i >= static_cast<int>(D.dcs.size())) break;
+				uint32_t c = DcsColor(T, D.dcs[i]);
+				if (i == F.n - 1) c = Blend(c, T.bg, 0.5f);
+				const int x = F.XOf(i);
+				F.Fill(x - half, yt, x + half + 1, yb, c, 100);
+			}
+			F.Line(F.left, yt - 1, F.right, yt - 1, T.grid, 1);
+		}
+	} // namespace render
+
+	void DrawOverlay(HWND WindowHandle, HDC DeviceContext, SCStudyInterfaceRef sc);
+	void DrawBackdropGDI(HWND WindowHandle, HDC DeviceContext, SCStudyInterfaceRef sc);
+	void DrawTapeGDI(HWND WindowHandle, HDC DeviceContext, SCStudyInterfaceRef sc);
+
+	namespace render
 	{
-		HI_POSITION = 0, HI_PRESET, HI_FONT, HI_WIDTH, HI_OPACITY, HI_PAINT, HI_SHOW_WARN, HI_SHOW_STATS, HI_SHOW_INTER, HI_SHOW_FLOW, HI_SHOW_LEVELS,
-		HI_C_BG, HI_C_TEXT, HI_C_BULL, HI_C_BEAR, HI_C_NEUTRAL, HI_C_LEVEL, HI_C_VWAP, HI_C_WARN,
-		HI_C_STRONG_BULL, HI_C_WEAK_BULL, HI_C_NEUTRAL_BAR, HI_C_WEAK_BEAR, HI_C_STRONG_BEAR, HI_COUNT
-	};
+		// ---------------- HUD glass panel (top-right of the future space) ----------------
+		struct HudLayout { int l, t, r, b, pad, lineH; bool compact; };
 
-	void DrawHUD(HWND WindowHandle, HDC DeviceContext, SCStudyInterfaceRef sc)
+		// word-wrap into at most maxLines lines; returns lines drawn
+		int WrapText(Frame& F, int x, int y, int maxW, const char* text, uint32_t c, int maxLines)
+		{
+			std::string s(text); std::string line; int lines = 0;
+			size_t pos = 0;
+			while (pos < s.size() && lines < maxLines)
+			{
+				size_t sp = s.find(' ', pos); if (sp == std::string::npos) sp = s.size();
+				const std::string word = s.substr(pos, sp - pos);
+				const std::string cand = line.empty() ? word : line + " " + word;
+				if (F.TextW(cand.c_str()) > maxW && !line.empty()) { F.Text(x, y, line.c_str(), c); y += F.fontH + 2; ++lines; line = word; }
+				else line = cand;
+				pos = sp + 1;
+			}
+			if (!line.empty() && lines < maxLines) { F.Text(x, y, line.c_str(), c); ++lines; }
+			return lines;
+		}
+
+		void DrawHud(Frame& F, const unsigned int* hudInputs)
+		{
+			SCStudyInterfaceRef sc = F.sc; ChartState& S = F.S; const VisualConfig& V = F.V; const Theme& T = F.T; const HudSnapshot& H = S.hud;
+			const bool showStats = hudInputs[0] != 0, showInter = hudInputs[1] != 0, showFlow = hudInputs[2] != 0, showLevels = hudInputs[3] != 0, showWarn = hudInputs[4] != 0, showHealth = hudInputs[5] != 0;
+			F.Font(V.fontPt, false);
+			const int lineH = F.fontH + 4;
+			HudLayout L;
+			L.pad = 8; L.lineH = lineH;
+			const int minW = 240, maxW = 440;
+			if (F.fillVisible && F.fillW >= minW + 12) { L.r = F.fillRight; L.l = Max(F.fillLeft + 6, L.r - maxW); L.compact = (L.r - L.l) < 300; }
+			else { L.r = F.right - 8; L.l = L.r - 280; L.compact = true; }
+			L.t = F.top + 6;
+			char buf[256];
+
+			// ----- measure: count lines -----
+			int lines = 0;
+			const int badgeH = F.fontH + 10;
+			lines += 1;                       // regime chip row
+			if (!L.compact) lines += 1;       // mtf
+			if (!L.compact && showInter) lines += 1;
+			if (!L.compact && showFlow) lines += 1;
+			if (!L.compact && showLevels) lines += 1;
+			int planLines = 2;
+			if (!L.compact && showStats) lines += 1;
+			if (!L.compact && showHealth) lines += 1;
+			int warnLines = 0; if (showWarn && S.warn.text[0]) for (const char* p = S.warn.text; *p; ++p) if (*p == '\n') ++warnLines;
+			const int gaugeH = L.compact ? 0 : 10, sparkH = L.compact ? 0 : 26;
+			L.b = L.t + L.pad + badgeH + 6 + gaugeH + (gaugeH ? 6 : 0) + sparkH + (sparkH ? 6 : 0) + lines * lineH + planLines * (F.fontH + 2) + 4 + warnLines * lineH + L.pad;
+			if (L.b > F.bottom - 10) L.b = F.bottom - 10;
+
+			// ----- panel -----
+			F.Fill(L.l, L.t, L.r, L.b, T.panel, V.hudOpacity);
+			F.Box(L.l, L.t, L.r, L.b, Blend(T.panel, T.text, 0.18f), 1);
+			int x = L.l + L.pad, y = L.t + L.pad; const int w = L.r - L.l - 2 * L.pad;
+
+			// 1. bias badge + DCS + trend arrow
+			{
+				F.Font(V.fontPt + 3, true);
+				const uint32_t bc = H.bias > 0 ? T.bull : (H.bias < 0 ? T.bear : T.neutral);
+				const char* bt = H.bias > 0 ? "LONG" : (H.bias < 0 ? "SHORT" : "NEUTRAL");
+				const int bw = F.TextW(bt) + 16;
+				F.Fill(x, y, x + bw, y + badgeH, bc, 100);
+				F.Text(x + 8, y + 4, bt, T.bg);
+				sprintf_s(buf, sizeof(buf), "DCS %+.0f %s", H.dcs, H.dcsTrend > 5 ? "^" : (H.dcsTrend < -5 ? "v" : "="));
+				F.Text(x + bw + 10, y + 4, buf, DcsColor(T, H.dcs));
+				F.Font(V.fontPt, false);
+				if (!L.compact)
+				{
+					const char* reg = kRegimeNames[Clamp(H.regime, 0, 4)];
+					const uint32_t rc = H.regime == RG_TREND_UP ? T.bull : (H.regime == RG_TREND_DOWN ? T.bear : (H.regime == RG_BALANCE ? T.cyan : T.gold));
+					F.Pill(L.r - L.pad, y + 2, reg, Blend(T.panel, rc, 0.35f), rc, 100, true);
+				}
+				y += badgeH + 6;
+			}
+			// 2. gauge -100..+100
+			if (gaugeH)
+			{
+				const int gl = x, gr = x + w, gm = (gl + gr) / 2;
+				F.Fill(gl, y, gr, y + gaugeH, T.grid, 100);
+				const float thr = S.params.dcs.signalThr > 0 ? S.params.dcs.signalThr : S.dcs.weights.thrSignal;
+				const int xv = gm + static_cast<int>((gr - gl) / 2 * Clamp(H.dcs, -100.0f, 100.0f) / 100.0f);
+				if (xv > gm) F.Fill(gm, y + 1, xv, y + gaugeH - 1, DcsColor(T, H.dcs), 100); else if (xv < gm) F.Fill(xv, y + 1, gm, y + gaugeH - 1, DcsColor(T, H.dcs), 100);
+				const int xt1 = gm + static_cast<int>((gr - gl) / 2 * thr / 100.0f), xt2 = gm - static_cast<int>((gr - gl) / 2 * thr / 100.0f);
+				F.Line(xt1, y - 1, xt1, y + gaugeH + 1, T.dim, 1); F.Line(xt2, y - 1, xt2, y + gaugeH + 1, T.dim, 1); F.Line(gm, y - 1, gm, y + gaugeH + 1, T.text, 1);
+				F.Line(xv, y - 2, xv, y + gaugeH + 2, T.text, 2);
+				y += gaugeH + 6;
+			}
+			// 3. sparkline of the last 30 closed DCS values
+			if (sparkH && !S.dcs.dcs.empty() && H.lastClosedIdx >= 1)
+			{
+				const int N = 30, i1 = H.lastClosedIdx, i0 = Max(0, i1 - N + 1);
+				const int ym = y + sparkH / 2;
+				F.Line(x, ym, x + w, ym, T.grid, 1);
+				int px = -1, py = -1;
+				for (int i = i0; i <= i1; ++i)
+				{
+					const int cx = x + static_cast<int>(static_cast<double>(i - i0) / Max(1, N - 1) * w);
+					const int cy = ym - static_cast<int>(Clamp(S.dcs.dcs[i], -100.0f, 100.0f) / 100.0f * (sparkH / 2 - 1));
+					if (px >= 0) F.Line(px, py, cx, cy, DcsColor(T, S.dcs.dcs[i]), 1);
+					px = cx; py = cy;
+				}
+				y += sparkH + 6;
+			}
+			// 4. regime chip row: open type + value migration + day type
+			{
+				const char* vm = H.valueMig > 0.5f ? "value HIGHER" : (H.valueMig < -0.5f ? "value LOWER" : "value OVERLAP");
+				if (L.compact) sprintf_s(buf, sizeof(buf), "%s  %s", kRegimeNames[Clamp(H.regime, 0, 4)], vm);
+				else sprintf_s(buf, sizeof(buf), "%s  %s  %s", kOpenTypeNames[Clamp(H.openType, 0, 7)], vm, H.dayType);
+				F.Text(x, y, buf, T.text); y += lineH;
+			}
+			// 5. MTF strip
+			if (!L.compact)
+			{
+				static const char* names[4] = { "1m", "5m", "15m", "60m" };
+				F.Text(x, y, "MTF", T.dim);
+				int cx = x + F.TextW("MTF") + 8;
+				for (int k = 0; k < 4; ++k)
+				{
+					const uint32_t c = !H.mtfAvail[k] ? T.grid : (H.mtf[k] > 0 ? T.bull : (H.mtf[k] < 0 ? T.bear : T.neutral));
+					F.Fill(cx, y + 1, cx + 34, y + lineH - 3, c, 100);
+					F.Text(cx + 5, y + 1, names[k], H.mtfAvail[k] ? T.bg : T.dim);
+					cx += 40;
+				}
+				sprintf_s(buf, sizeof(buf), "bias %+.2f", S.regime.mtfBias.empty() ? 0.0f : S.regime.mtfBias[Max(0, H.lastClosedIdx)]);
+				F.TextRight(L.r - L.pad, y, buf, T.dim);
+				y += lineH;
+			}
+			// 6. intermarket row
+			if (!L.compact && showInter)
+			{
+				F.Text(x, y, "MKT", T.dim);
+				int cx = x + F.TextW("MKT") + 8;
+				struct Item { const char* name; int v; bool avail; };
+				Item items[8]; int cnt = 0;
+				items[cnt++] = { "YM", H.ym, H.ymAvail }; items[cnt++] = { "TICK", H.tick, H.tickAvail };
+				for (int k = 0; k < H.megaCount && k < 6; ++k) items[cnt++] = { H.megaNames[k], H.mega[k], true };
+				for (int k = 0; k < cnt && cx < L.r - 50; ++k)
+				{
+					const uint32_t c = !items[k].avail ? T.grid : (items[k].v > 0 ? T.bull : (items[k].v < 0 ? T.bear : T.neutral));
+					F.Circle(cx + 4, y + lineH / 2 - 1, 4, c, c);
+					sprintf_s(buf, sizeof(buf), "%s%s", items[k].name, !items[k].avail ? "" : (items[k].v > 0 ? "^" : (items[k].v < 0 ? "v" : "")));
+					F.Text(cx + 11, y, buf, items[k].avail ? T.text : T.dim);
+					cx += 11 + F.TextW(buf) + 10;
+				}
+				if (H.smt != 0) F.Pill(L.r - L.pad, y, H.smt > 0 ? "SMT+" : "SMT-", Blend(T.panel, T.gold, 0.4f), T.gold, 100, true);
+				else if (H.leadLag[0]) F.TextRight(L.r - L.pad, y, H.leadLag, T.dim);
+				y += lineH;
+			}
+			// 7. order-flow row
+			if (!L.compact && showFlow)
+			{
+				const char* cvdT = H.cvdTrend > 0 ? "CVD ^" : (H.cvdTrend < 0 ? "CVD v" : "CVD =");
+				if (H.lastEvent[0]) sprintf_s(buf, sizeof(buf), "%s z%+.1f  %s @ %s (%db)", cvdT, H.cvdZ, H.lastEvent, F.Px(H.lastEventPrice), Max(0, H.lastClosedIdx - H.lastEventIdx));
+				else sprintf_s(buf, sizeof(buf), "%s z%+.1f", cvdT, H.cvdZ);
+				F.Text(x, y, buf, H.cvdTrend > 0 ? T.bull : (H.cvdTrend < 0 ? T.bear : T.neutral)); y += lineH;
+			}
+			// 8. nearest levels + day stats
+			if (!L.compact && showLevels)
+			{
+				const float ts = F.tick;
+				if (H.resPrice > 0 && H.supPrice > 0)
+					sprintf_s(buf, sizeof(buf), "R %s %s +%dt  S %s %s -%dt  rng %.0f%% ADR", dcs_detail::LevelName(H.resKind), F.Px(H.resPrice), static_cast<int>((H.resPrice - H.close) / ts + 0.5f),
+						dcs_detail::LevelName(H.supKind), F.Px(H.supPrice), static_cast<int>((H.close - H.supPrice) / ts + 0.5f), H.adrPct);
+				else sprintf_s(buf, sizeof(buf), "Levels: waiting for session data");
+				F.Text(x, y, buf, T.cyan); y += lineH;
+			}
+			// 9. plan line
+			F.Font(V.fontPt, true);
+			y += WrapText(F, x, y, w, H.stateLine[0] ? H.stateLine : "Warming up...", T.gold, planLines) * (F.fontH + 2) + 4;
+			F.Font(V.fontPt, false);
+			// 10. stats
+			if (!L.compact && showStats)
+			{
+				if (H.statsAvail && H.curStats.count > 0)
+				{
+					const SetupStats& st = H.curStats;
+					const double pf = st.sumLossR < 0 ? st.sumWinR / -st.sumLossR : (st.sumWinR > 0 ? 99.0 : 0.0);
+					sprintf_s(buf, sizeof(buf), "%s: n=%d win %.0f%% avgR %+.2f PF %.2f%s", kSetupNames[Clamp(H.curSetup, 0, SETUP_COUNT - 1)], st.count,
+						100.0 * st.wins / Max(1, st.wins + st.losses), st.sumR / st.count, pf, st.count < S.params.val.minSample ? " (small n)" : "");
+					F.Text(x, y, buf, st.count < S.params.val.minSample ? T.dim : T.text);
+				}
+				else F.Text(x, y, "Stats: no resolved signals yet", T.dim);
+				y += lineH;
+			}
+			// 11. health row
+			if (!L.compact && showHealth)
+			{
+				sprintf_s(buf, sizeof(buf), "%s %s %s mkt %d/%d  %.1fms %s", S.warn.vapOff ? "VAP off" : "VAP on", S.warn.noDepth ? "depth off" : "depth on", S.warn.tzNotNY ? "TZ!" : "TZ ok",
+					H.interConnected, H.interConfigured, S.perf.overlayMs + S.perf.backdropMs + S.perf.tapeMs, F.fillVisible && F.fillW >= 150 ? "" : "| set Fill Space >= 40 bars");
+				F.Text(x, y, buf, T.dim); y += lineH;
+			}
+			// 12. warnings
+			if (showWarn && S.warn.text[0])
+			{
+				const char* p = S.warn.text;
+				while (*p && y < L.b - lineH)
+				{
+					const char* e = strchr(p, '\n'); if (!e) e = p + strlen(p);
+					std::string ln(p, e); F.Text(x, y, ln.c_str(), T.gold); y += lineH;
+					p = *e ? e + 1 : e;
+				}
+			}
+		}
+
+		// ---------------- Order-flow tape (bottom strip) ----------------
+		void DrawTape(Frame& F, int rowMask)
+		{
+			ChartState& S = F.S; const Theme& T = F.T; const VisualConfig& V = F.V;
+			const FlowState& FL = S.flow; const DcsState& D = S.dcs;
+			if (FL.delta.empty() || D.dcs.empty()) return;
+			F.Clip(F.left, F.top, F.right, F.bottom);
+			F.Fill(F.left, F.top, F.right, F.bottom, T.bg, 100);
+			struct Row { const char* label; int kind; };
+			static const Row rows[6] = { { "Dlt", 0 }, { "Vol", 1 }, { "Dl%", 2 }, { "CVD", 3 }, { "Imb", 4 }, { "DCS", 5 } };
+			int active[6]; int nRows = 0;
+			for (int r = 0; r < 6; ++r) if (rowMask & (1 << r)) active[nRows++] = r;
+			if (nRows == 0) { F.Unclip(); return; }
+			F.Font(Max(7, V.fontPt - 1), false);
+			const int labelW = F.TextW("CVD") + 10;
+			const int avail = F.bottom - F.top - 2;
+			int rowH = avail / nRows;
+			int shown = nRows;
+			while (shown > 1 && rowH < F.fontH + 2) { --shown; rowH = avail / shown; }
+			// per-row scale over the visible bars
+			double mx[6] = { 1, 1, 1, 1, 1, 1 };
+			for (int i = F.firstVis; i <= F.lastVis; ++i)
+			{
+				if (i >= static_cast<int>(FL.delta.size())) break;
+				mx[0] = Max(mx[0], fabs(static_cast<double>(FL.delta[i]))); mx[1] = Max(mx[1], static_cast<double>(F.sc.Volume[i]));
+				mx[3] = Max(mx[3], fabs(static_cast<double>(FL.cvdDz[i])));
+			}
+			mx[2] = 0.6; mx[4] = 3; mx[5] = 100;
+			const int half = F.spacing / 2;
+			const bool text = F.spacing >= 26;
+			char buf[32];
+			for (int r = 0; r < shown; ++r)
+			{
+				const int kind = rows[active[r]].kind;
+				const int y0 = F.top + 1 + r * rowH, y1 = y0 + rowH - 1;
+				for (int i = F.firstVis; i <= F.lastVis; ++i)
+				{
+					if (i >= static_cast<int>(FL.delta.size())) break;
+					double v = 0; uint32_t pos = T.bull, neg = T.bear;
+					switch (kind)
+					{
+					case 0: v = FL.delta[i]; break;
+					case 1: v = F.sc.Volume[i]; pos = T.cyan; break;
+					case 2: v = FL.deltaPct[i]; break;
+					case 3: v = FL.cvdDz[i]; break;
+					case 4: v = (FL.imbMark[i] == 2) ? 0 : (FL.imbMark[i] != 0 ? (FL.imbMark[i] > 0 ? 1 : -1) * Max(1, static_cast<int>(fabs(FL.fImb[i]) * 3)) : 0); break;
+					case 5: v = D.dcs[i]; break;
+					}
+					const double inten = Clamp(pow(fabs(v) / mx[kind], 0.7), 0.0, 1.0);
+					uint32_t c = Blend(T.bg, v >= 0 ? pos : neg, static_cast<float>(0.12 + 0.68 * inten));
+					if (i == F.n - 1) c = Blend(c, T.bg, 0.4f);
+					const int x = F.XOf(i);
+					F.Fill(x - half, y0, x + half, y1, c, 100);
+					if (text && rowH >= F.fontH)
+					{
+						if (kind == 2) sprintf_s(buf, sizeof(buf), "%+.0f", v * 100); else if (kind == 5) sprintf_s(buf, sizeof(buf), "%+.0f", v);
+						else if (kind == 4) sprintf_s(buf, sizeof(buf), "%+d", static_cast<int>(v)); else Abbrev(v, buf, sizeof(buf));
+						F.TextCenter(x, y0 + (rowH - F.fontH) / 2, buf, inten > 0.5 ? T.bg : T.text);
+					}
+				}
+				F.Fill(F.left, y0, F.left + labelW, y1, T.panel, 100);
+				F.Text(F.left + 4, y0 + (rowH - F.fontH) / 2, rows[active[r]].label, T.dim);
+				F.Line(F.left, y1, F.right, y1, T.grid, 1);
+			}
+			F.Unclip();
+		}
+	} // namespace render
+
+	// ---- GDI entry points -------------------------------------------------------
+	namespace render_entry
+	{
+		inline double NowMs() { LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t); return f.QuadPart ? 1000.0 * t.QuadPart / f.QuadPart : 0.0; }
+	}
+
+	void DrawBackdropGDI(HWND WindowHandle, HDC DeviceContext, SCStudyInterfaceRef sc)
 	{
 		std::lock_guard<std::recursive_mutex> lock(g_mutex);
-		ChartState* Sp = Peek(sc.ChartNumber);
-		if (Sp == nullptr) return;
-		ChartState& S = *Sp;
-		const HudSnapshot& H = S.hud;
-		if (sc.Graphics.DrawTextAt == nullptr || sc.Graphics.FillRectangle == nullptr) return;
-
-		const int fontPt = Max(7, sc.Input[HI_FONT].GetInt());
-		const int lineH = fontPt + 6;
-		const int panelW = Max(200, sc.Input[HI_WIDTH].GetInt());
-		const bool full = sc.Input[HI_PRESET].GetIndex() == 1;
-		const uint32_t cBg = sc.Input[HI_C_BG].GetColor(), cText = sc.Input[HI_C_TEXT].GetColor();
-		const uint32_t cBull = sc.Input[HI_C_BULL].GetColor(), cBear = sc.Input[HI_C_BEAR].GetColor(), cNeu = sc.Input[HI_C_NEUTRAL].GetColor();
-		const uint32_t cLevel = sc.Input[HI_C_LEVEL].GetColor(), cVwap = sc.Input[HI_C_VWAP].GetColor(), cWarn = sc.Input[HI_C_WARN].GetColor();
-
-		// line budget
-		int lines = 2;                      // bias + regime
-		lines += 1;                         // mtf
-		if (sc.Input[HI_SHOW_INTER].GetYesNo()) lines += 1;
-		if (sc.Input[HI_SHOW_FLOW].GetYesNo()) lines += 1;
-		if (sc.Input[HI_SHOW_LEVELS].GetYesNo()) lines += 1;
-		lines += 1;                         // state line
-		if (full && sc.Input[HI_SHOW_STATS].GetYesNo()) lines += 2;
-		if (full) lines += 1;
-		int warnLines = 0;
-		if (sc.Input[HI_SHOW_WARN].GetYesNo() && S.warn.text[0]) { for (const char* p = S.warn.text; *p; ++p) if (*p == '\n') ++warnLines; }
-		lines += warnLines;
-		const int panelH = lines * lineH + lineH + 10;
-
-		const int pos = sc.Input[HI_POSITION].GetIndex();
-		const int left0 = sc.StudyRegionLeftCoordinate, top0 = sc.StudyRegionTopCoordinate;
-		const int right0 = sc.StudyRegionRightCoordinate, bottom0 = sc.StudyRegionBottomCoordinate;
-		int px = left0 + 10, py = top0 + 10;
-		if (pos == 1 || pos == 3) px = right0 - panelW - 10;
-		if (pos == 2 || pos == 3) py = bottom0 - panelH - 10;
-		if (px < left0) px = left0; if (py < top0) py = top0;
-
-		// panel background
-		n_ACSIL::s_GraphicsRectangle rect; rect.Left = px; rect.Top = py; rect.Right = px + panelW; rect.Bottom = py + panelH;
-		const int opacity = Clamp(sc.Input[HI_OPACITY].GetInt(), 0, 100);
-		if (sc.Graphics.FillRectangleWithColorTransparent != nullptr && opacity < 100)
-			sc.Graphics.FillRectangleWithColorTransparent(rect, GColor(cBg), static_cast<uint8_t>(100 - opacity));
-		else
-			sc.Graphics.FillRectangleWithColor(rect, GColor(cBg));
-		if (sc.Graphics.SetBackgroundMode != nullptr) sc.Graphics.SetBackgroundMode(TRANSPARENT);
-		if (sc.Graphics.SetTextAlign != nullptr) sc.Graphics.SetTextAlign(TA_LEFT | TA_TOP | TA_NOUPDATECP);
-
-		HudPainter P(sc, px, py + 5, panelW, lineH, fontPt, cText);
-		char buf[256];
-
-		// 1. BIAS line
-		P.Font(fontPt + 4, true);
-		const char* biasTxt = H.bias > 0 ? "BIAS: LONG" : (H.bias < 0 ? "BIAS: SHORT" : "BIAS: NEUTRAL");
-		const uint32_t biasCol = H.bias > 0 ? cBull : (H.bias < 0 ? cBear : cNeu);
-		P.Text(biasTxt, biasCol);
-		P.Font(fontPt, true);
-		const char* arrow = H.dcsTrend > 5 ? "^" : (H.dcsTrend < -5 ? "v" : "-");
-		sprintf_s(buf, sizeof(buf), "DCS %+.0f  %s", H.dcs, arrow);
-		P.Text(buf, H.dcs > 0 ? cBull : (H.dcs < 0 ? cBear : cNeu), panelW / 2 + 10);
-		P.y += lineH + 6;
-
-		// 2. regime / open / value
-		P.Font(fontPt, false);
-		const uint32_t regCol = (H.regime == RG_TREND_UP) ? cBull : (H.regime == RG_TREND_DOWN ? cBear : cNeu);
-		sprintf_s(buf, sizeof(buf), "%-14s %s", kRegimeNames[Clamp(H.regime, 0, 4)], full ? kOpenTypeNames[Clamp(H.openType, 0, 7)] : "");
-		P.Line(buf, regCol);
-		if (full)
-		{
-			const char* vm = H.valueMig > 0.5f ? "Value HIGHER" : (H.valueMig < -0.5f ? "Value LOWER" : "Value OVERLAP");
-			sprintf_s(buf, sizeof(buf), "%s   %s", vm, H.vwapText);
-			P.Line(buf, H.valueMig > 0.5f ? cBull : (H.valueMig < -0.5f ? cBear : cNeu));
-		}
-
-		// 3. MTF strip
-		{
-			static const char* names[4] = { "1m", "5m", "15m", "60m" };
-			int cx = px + 8;
-			P.Text("MTF", cText);
-			cx += P.TextWidth("MTF ") + 6;
-			for (int k = 0; k < 4; ++k)
-			{
-				const uint32_t c = !H.mtfAvail[k] ? RGB(70, 70, 70) : (H.mtf[k] > 0 ? cBull : (H.mtf[k] < 0 ? cBear : cNeu));
-				P.Box(cx, P.y + 2, cx + 34, P.y + lineH - 3, c);
-				sc.Graphics.SetTextColor(GColor(RGB(0, 0, 0)));
-				sc.Graphics.DrawTextAt(SCString(names[k]), cx + 6, P.y + 1);
-				cx += 40;
-			}
-			P.y += lineH;
-		}
-
-		// 4. intermarket
-		if (sc.Input[HI_SHOW_INTER].GetYesNo())
-		{
-			int cx = px + 8;
-			P.Text("MKT", cText); cx += P.TextWidth("MKT ") + 6;
-			struct Item { const char* name; int v; bool avail; };
-			Item items[8]; int cnt = 0;
-			items[cnt++] = { "YM", H.ym, H.ymAvail };
-			items[cnt++] = { "TICK", H.tick, H.tickAvail };
-			for (int k = 0; k < H.megaCount && k < 6; ++k) items[cnt++] = { H.megaNames[k], H.mega[k], true };
-			for (int k = 0; k < cnt; ++k)
-			{
-				const uint32_t c = !items[k].avail ? RGB(70, 70, 70) : (items[k].v > 0 ? cBull : (items[k].v < 0 ? cBear : cNeu));
-				P.Dot(cx + 5, P.y + lineH / 2, 4, c);
-				sc.Graphics.SetTextColor(GColor(cText));
-				sc.Graphics.DrawTextAt(SCString(items[k].name), cx + 12, P.y);
-				cx += 12 + P.TextWidth(items[k].name) + 10;
-			}
-			if (H.smt != 0) { sc.Graphics.SetTextColor(GColor(cWarn)); sc.Graphics.DrawTextAt(SCString(H.smt > 0 ? "SMT+" : "SMT-"), cx + 4, P.y); }
-			P.y += lineH;
-		}
-
-		// 5. order flow
-		if (sc.Input[HI_SHOW_FLOW].GetYesNo())
-		{
-			const char* cvdT = H.cvdTrend > 0 ? "CVD up" : (H.cvdTrend < 0 ? "CVD down" : "CVD flat");
-			if (H.lastEvent[0]) sprintf_s(buf, sizeof(buf), "%s (z%+.1f)  %s @ %s", cvdT, H.cvdZ, H.lastEvent, sc.FormatGraphValue(H.lastEventPrice, sc.BaseGraphValueFormat).GetChars());
-			else sprintf_s(buf, sizeof(buf), "%s (z%+.1f)", cvdT, H.cvdZ);
-			P.Line(buf, H.cvdTrend > 0 ? cBull : (H.cvdTrend < 0 ? cBear : cNeu));
-		}
-
-		// 6. nearest levels
-		if (sc.Input[HI_SHOW_LEVELS].GetYesNo())
-		{
-			const float ts = S.tickSize > 0 ? S.tickSize : 0.25f;
-			if (H.resPrice > 0 && H.supPrice > 0)
-				sprintf_s(buf, sizeof(buf), "R %s +%d t (%.1f A) | S %s -%d t (%.1f A)",
-					sc.FormatGraphValue(H.resPrice, sc.BaseGraphValueFormat).GetChars(), static_cast<int>((H.resPrice - H.close) / ts + 0.5f), H.atr > 0 ? (H.resPrice - H.close) / H.atr : 0,
-					sc.FormatGraphValue(H.supPrice, sc.BaseGraphValueFormat).GetChars(), static_cast<int>((H.close - H.supPrice) / ts + 0.5f), H.atr > 0 ? (H.close - H.supPrice) / H.atr : 0);
-			else sprintf_s(buf, sizeof(buf), "Levels: waiting for session data");
-			P.Line(buf, cLevel);
-		}
-
-		// 7. state line
-		P.Font(fontPt, true);
-		P.Line(H.stateLine[0] ? H.stateLine : "Warming up...", cVwap);
-		P.Font(fontPt, false);
-
-		// 8. stats
-		if (full && sc.Input[HI_SHOW_STATS].GetYesNo())
-		{
-			if (H.statsAvail && H.curStats.count > 0)
-			{
-				const SetupStats& st = H.curStats;
-				const double pf = st.sumLossR < 0 ? st.sumWinR / -st.sumLossR : (st.sumWinR > 0 ? 99.0 : 0.0);
-				sprintf_s(buf, sizeof(buf), "%s: n=%d win %.0f%% avgR %+.2f PF %.2f%s", kSetupNames[Clamp(H.curSetup, 0, SETUP_COUNT - 1)], st.count,
-					100.0 * st.wins / Max(1, st.wins + st.losses), st.sumR / st.count, pf, st.count < S.params.val.minSample ? "  (small n)" : "");
-				P.Line(buf, st.count < S.params.val.minSample ? cWarn : cText);
-				sprintf_s(buf, sizeof(buf), "T2 %.0f%%  MFE %.2fR  MAE %.2fR  %d signals total", 100.0 * st.t2 / st.count, st.sumMfe / st.count, st.sumMae / st.count, H.signalsTotal);
-				P.Line(buf, cText);
-			}
-			else { P.Line("Stats: no resolved signals yet", cNeu); P.Line("", cNeu); }
-		}
-
-		// 8b. performance (full preset)
-		if (full)
-		{
-			sprintf_s(buf, sizeof(buf), "calc %.1f ms (max %.1f)  full recalc %d ms  bars %d  closed #%d", H.updateMs, H.maxUpdateMs, H.fullCalcMs, H.bars, H.lastClosedIdx);
-			P.Line(buf, cNeu);
-		}
-
-		// 9. warnings
-		if (sc.Input[HI_SHOW_WARN].GetYesNo() && S.warn.text[0])
-		{
-			const char* p = S.warn.text;
-			while (*p)
-			{
-				const char* e = strchr(p, '\n'); if (!e) e = p + strlen(p);
-				std::string ln(p, e);
-				P.Line(ln.c_str(), cWarn);
-				p = *e ? e + 1 : e;
-			}
-		}
+		ChartState* Sp = Peek(sc.ChartNumber); if (!Sp || sc.ArraySize <= 0 || sc.Graphics.FillRectangle == nullptr) return;
+		const double t0 = render_entry::NowMs();
+		render::Frame F(sc, *Sp, sc.GraphRegion);
+		render::DrawBackdrop(F);
+		Sp->perf.backdropMs = 0.8 * Sp->perf.backdropMs + 0.2 * (render_entry::NowMs() - t0);
 	}
+
+	void DrawTapeGDI(HWND WindowHandle, HDC DeviceContext, SCStudyInterfaceRef sc)
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_mutex);
+		ChartState* Sp = Peek(sc.ChartNumber); if (!Sp || sc.ArraySize <= 0 || sc.Graphics.FillRectangle == nullptr) return;
+		if (!Sp->vis.layer[L_TAPE]) return;
+		const double t0 = render_entry::NowMs();
+		render::Frame F(sc, *Sp, sc.GraphRegion);
+		render::DrawTape(F, Sp->vis.tapeRows);
+		Sp->perf.tapeMs = 0.8 * Sp->perf.tapeMs + 0.2 * (render_entry::NowMs() - t0);
+	}
+
+	// Overlay study input indices (shared by the study function and the GDI callback)
+	enum OverlayInput
+	{
+		OI_PRESET = 0, OI_DIAG, OI_FONT, OI_PROFILE_W, OI_HUD_OPACITY, OI_MAX_NOTES, OI_MIN_GRADE, OI_APPLY_THEME,
+		OI_SHOW_STATS, OI_SHOW_INTER, OI_SHOW_FLOW, OI_SHOW_LEVELS, OI_SHOW_WARN, OI_SHOW_HEALTH,
+		OI_LAYER0,                                   // L_COUNT tri-state layer inputs follow
+		OI_C_BG = OI_LAYER0 + L_COUNT, OI_C_GRID, OI_C_BULL, OI_C_BEAR, OI_C_NEUTRAL, OI_C_GOLD, OI_C_CYAN, OI_C_MAGENTA, OI_C_TEXT, OI_C_DIM, OI_C_PANEL,
+		OI_C_TINT_UP, OI_C_TINT_DN, OI_C_TINT_BAL, OI_C_TINT_CHOP, OI_C_STRONG_BULL, OI_C_WEAK_BULL, OI_C_NEUTRAL_BAR, OI_C_WEAK_BEAR, OI_C_STRONG_BEAR, OI_COUNT
+	};
+
+	void DrawOverlay(HWND WindowHandle, HDC DeviceContext, SCStudyInterfaceRef sc)
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_mutex);
+		ChartState* Sp = Peek(sc.ChartNumber); if (!Sp || sc.ArraySize <= 0 || sc.Graphics.FillRectangle == nullptr || sc.Graphics.DrawTextAt == nullptr) return;
+		ChartState& S = *Sp; const VisualConfig& V = S.vis;
+		const double t0 = render_entry::NowMs();
+		render::Frame F(sc, S, sc.GraphRegion);
+		if (sc.Graphics.SetBackgroundMode) sc.Graphics.SetBackgroundMode(TRANSPARENT);
+		if (sc.Graphics.SetTextAlign) sc.Graphics.SetTextAlign(TA_LEFT | TA_TOP | TA_NOUPDATECP);
+		F.Clip(F.left, F.top, F.right, F.bottom);
+		// layers are added by later phases; order = back to front
+		if (V.layer[L_RIBBON]) render::DrawRibbon(F);
+		F.Unclip();
+		if (V.layer[L_HUD])
+		{
+			unsigned int hudInputs[6] = { sc.Input[OI_SHOW_STATS].GetYesNo(), sc.Input[OI_SHOW_INTER].GetYesNo(), sc.Input[OI_SHOW_FLOW].GetYesNo(), sc.Input[OI_SHOW_LEVELS].GetYesNo(), sc.Input[OI_SHOW_WARN].GetYesNo(), sc.Input[OI_SHOW_HEALTH].GetYesNo() };
+			render::DrawHud(F, hudInputs);
+		}
+		S.perf.overlayMs = 0.8 * S.perf.overlayMs + 0.2 * (render_entry::NowMs() - t0);
+		++S.perf.paints;
+	}
+
 } // namespace nqe
 
 using namespace nqe;
@@ -2992,13 +3402,16 @@ using namespace nqe;
 #define NQE_INT_INPUT(IDX, NAME, V, LO, HI) { sc.Input[IDX].Name = NAME; sc.Input[IDX].SetInt(V); sc.Input[IDX].SetIntLimits(LO, HI); }
 #define NQE_FLT_INPUT(IDX, NAME, V, LO, HI) { sc.Input[IDX].Name = NAME; sc.Input[IDX].SetFloat(static_cast<float>(V)); sc.Input[IDX].SetFloatLimits(static_cast<float>(LO), static_cast<float>(HI)); }
 
+// Diagnostic region numbers (used only when the Overlay's "Show Diagnostic Regions" is on)
+static const int kDiagRegionFlow = 2, kDiagRegionInter = 3, kDiagRegionDcs = 4, kDiagRegionVal = 5;
+
 // --- 1. Auction / Structure ---------------------------------------------------
 enum AuctionInput
 {
 	AI_RTH_START = 0, AI_RTH_END, AI_ATR_LEN, AI_IB_MIN, AI_OPEN_MIN, AI_VA_PCT, AI_PROF_TICKS, AI_NAKED_N, AI_TPO_MIN,
-	AI_SWING_N, AI_SWING_ATR, AI_EQ_TOL, AI_BOS_DECAY, AI_IBEXT_A, AI_IBEXT_B, AI_IBEXT_C,
-	AI_D_DEVVA, AI_D_PDVA, AI_D_NAKED, AI_D_SINGLE, AI_D_ON, AI_D_IB, AI_D_PDHL, AI_D_SWING, AI_D_BOS, AI_D_LIQ, AI_MAX_ZONES,
-	AI_C_POC, AI_C_VA, AI_C_PD, AI_C_NAKED, AI_C_SINGLE, AI_C_ON, AI_C_IB, AI_C_IBEXT, AI_C_SWH, AI_C_SWL, AI_C_BOS, AI_C_CHOCH, AI_C_LIQ, AI_COUNT
+	AI_SWING_N, AI_SWING_ATR, AI_EQ_TOL, AI_BOS_DECAY, AI_IBEXT_A, AI_IBEXT_B, AI_IBEXT_C, AI_COMPOSITE_DAYS, AI_ADR_DAYS,
+	AI_D_DEVVA, AI_D_PDVA, AI_D_ON, AI_D_IB, AI_D_PDHL, AI_D_SWING, AI_D_BOS,
+	AI_C_POC, AI_C_VA, AI_C_PD, AI_C_ON, AI_C_IB, AI_C_IBEXT, AI_C_SWH, AI_C_SWL, AI_C_BOS, AI_C_CHOCH, AI_COUNT
 };
 enum AuctionSubgraph
 {
@@ -3012,7 +3425,7 @@ SCSFExport scsf_NQEdge_Auction(SCStudyInterfaceRef sc)
 	if (sc.SetDefaults)
 	{
 		sc.GraphName = "NQ Edge: Auction/Structure Engine";
-		sc.StudyDescription = "Developing/prior-day volume profile, naked POCs, single prints, ON range, IB, swings, BOS/CHoCH, liquidity pools. Owns the session and ATR settings for the whole suite.";
+		sc.StudyDescription = "Developing/prior-day volume profile, naked POCs, single prints, ON range, IB, swings, BOS/CHoCH, liquidity pools. Owns the session and ATR settings for the whole suite. Level rays/pills are drawn by the Terminal Overlay.";
 		sc.GraphRegion = 0; sc.AutoLoop = 0; sc.CalculationPrecedence = STD_PREC_LEVEL; sc.ValueFormat = VALUEFORMAT_INHERITED;
 		sc.MaintainVolumeAtPriceData = 1; sc.ScaleRangeType = SCALE_SAMEASREGION; sc.DrawZeros = 0;
 
@@ -3028,7 +3441,7 @@ SCSFExport scsf_NQEdge_Auction(SCStudyInterfaceRef sc)
 		sc.Subgraph[AS_SWH].DrawStyle = DRAWSTYLE_TRIANGLE_DOWN; sc.Subgraph[AS_SWL].DrawStyle = DRAWSTYLE_TRIANGLE_UP;
 		sc.Subgraph[AS_BOSU].DrawStyle = DRAWSTYLE_ARROW_UP; sc.Subgraph[AS_BOSD].DrawStyle = DRAWSTYLE_ARROW_DOWN;
 		sc.Subgraph[AS_CHU].DrawStyle = DRAWSTYLE_DIAMOND; sc.Subgraph[AS_CHD].DrawStyle = DRAWSTYLE_DIAMOND;
-		sc.Subgraph[AS_SWH].LineWidth = 3; sc.Subgraph[AS_SWL].LineWidth = 3; sc.Subgraph[AS_BOSU].LineWidth = 3; sc.Subgraph[AS_BOSD].LineWidth = 3; sc.Subgraph[AS_CHU].LineWidth = 3; sc.Subgraph[AS_CHD].LineWidth = 3;
+		sc.Subgraph[AS_SWH].LineWidth = 2; sc.Subgraph[AS_SWL].LineWidth = 2; sc.Subgraph[AS_BOSU].LineWidth = 2; sc.Subgraph[AS_BOSD].LineWidth = 2; sc.Subgraph[AS_CHU].LineWidth = 2; sc.Subgraph[AS_CHD].LineWidth = 2;
 
 		sc.Input[AI_RTH_START].Name = "Session: RTH Start Time"; sc.Input[AI_RTH_START].SetTime(HMS_TIME(9, 30, 0));
 		sc.Input[AI_RTH_END].Name = "Session: RTH End Time"; sc.Input[AI_RTH_END].SetTime(HMS_TIME(16, 0, 0));
@@ -3046,30 +3459,25 @@ SCSFExport scsf_NQEdge_Auction(SCStudyInterfaceRef sc)
 		NQE_FLT_INPUT(AI_IBEXT_A, "IB Extension Multiple A", 0.5, 0.0, 5.0);
 		NQE_FLT_INPUT(AI_IBEXT_B, "IB Extension Multiple B", 1.0, 0.0, 5.0);
 		NQE_FLT_INPUT(AI_IBEXT_C, "IB Extension Multiple C", 2.0, 0.0, 5.0);
-		NQE_YESNO_INPUT(AI_D_DEVVA, "Draw: Developing POC/VAH/VAL", 1);
-		NQE_YESNO_INPUT(AI_D_PDVA, "Draw: Prior Day POC/VAH/VAL", 1);
-		NQE_YESNO_INPUT(AI_D_NAKED, "Draw: Naked POCs", 1);
-		NQE_YESNO_INPUT(AI_D_SINGLE, "Draw: Single Prints", 1);
-		NQE_YESNO_INPUT(AI_D_ON, "Draw: Overnight High/Low", 1);
-		NQE_YESNO_INPUT(AI_D_IB, "Draw: IB and Extensions", 1);
-		NQE_YESNO_INPUT(AI_D_PDHL, "Draw: Prior Day High/Low", 1);
-		NQE_YESNO_INPUT(AI_D_SWING, "Draw: Swing Points", 1);
-		NQE_YESNO_INPUT(AI_D_BOS, "Draw: BOS/CHoCH Markers", 1);
-		NQE_YESNO_INPUT(AI_D_LIQ, "Draw: Liquidity Pools", 1);
-		NQE_INT_INPUT(AI_MAX_ZONES, "Draw: Max Zone Drawings", 40, 5, 200);
-		NQE_COLOR_INPUT(AI_C_POC, "Color: Developing POC", 0, 200, 255);
-		NQE_COLOR_INPUT(AI_C_VA, "Color: Developing VAH/VAL", 0, 150, 190);
-		NQE_COLOR_INPUT(AI_C_PD, "Color: Prior Day POC/VA", 120, 120, 160);
-		NQE_COLOR_INPUT(AI_C_NAKED, "Color: Naked POC", 255, 120, 255);
-		NQE_COLOR_INPUT(AI_C_SINGLE, "Color: Single Prints", 160, 120, 60);
+		NQE_INT_INPUT(AI_COMPOSITE_DAYS, "Profile: Composite Days (docked profile)", 5, 1, 30);
+		NQE_INT_INPUT(AI_ADR_DAYS, "Session: ADR Lookback Days", 10, 1, 60);
+		NQE_YESNO_INPUT(AI_D_DEVVA, "Lines: Developing POC/VAH/VAL", 1);
+		NQE_YESNO_INPUT(AI_D_PDVA, "Lines: Prior Day POC/VAH/VAL", 1);
+		NQE_YESNO_INPUT(AI_D_ON, "Lines: Overnight High/Low", 1);
+		NQE_YESNO_INPUT(AI_D_IB, "Lines: IB and Extensions", 1);
+		NQE_YESNO_INPUT(AI_D_PDHL, "Lines: Prior Day High/Low", 1);
+		NQE_YESNO_INPUT(AI_D_SWING, "Marks: Swing Points", 0);
+		NQE_YESNO_INPUT(AI_D_BOS, "Marks: BOS/CHoCH", 1);
+		NQE_COLOR_INPUT(AI_C_POC, "Color: Developing POC", 255, 200, 87);
+		NQE_COLOR_INPUT(AI_C_VA, "Color: Developing VAH/VAL", 62, 198, 255);
+		NQE_COLOR_INPUT(AI_C_PD, "Color: Prior Day Levels", 92, 101, 119);
 		NQE_COLOR_INPUT(AI_C_ON, "Color: Overnight High/Low", 90, 140, 200);
 		NQE_COLOR_INPUT(AI_C_IB, "Color: Initial Balance", 230, 200, 60);
 		NQE_COLOR_INPUT(AI_C_IBEXT, "Color: IB Extensions", 140, 120, 40);
-		NQE_COLOR_INPUT(AI_C_SWH, "Color: Swing High", 220, 80, 80);
-		NQE_COLOR_INPUT(AI_C_SWL, "Color: Swing Low", 80, 220, 120);
-		NQE_COLOR_INPUT(AI_C_BOS, "Color: BOS", 255, 255, 255);
+		NQE_COLOR_INPUT(AI_C_SWH, "Color: Swing High", 255, 77, 94);
+		NQE_COLOR_INPUT(AI_C_SWL, "Color: Swing Low", 0, 200, 150);
+		NQE_COLOR_INPUT(AI_C_BOS, "Color: BOS", 230, 234, 242);
 		NQE_COLOR_INPUT(AI_C_CHOCH, "Color: CHoCH", 255, 160, 0);
-		NQE_COLOR_INPUT(AI_C_LIQ, "Color: Liquidity Pool", 0, 220, 220);
 		return;
 	}
 	if (sc.LastCallToFunction) { Release(sc, E_AUCTION); return; }
@@ -3085,20 +3493,21 @@ SCSFExport scsf_NQEdge_Auction(SCStudyInterfaceRef sc)
 	ap.profileTicksPerLevel = sc.Input[AI_PROF_TICKS].GetInt(); ap.nakedPocsTracked = sc.Input[AI_NAKED_N].GetInt(); ap.tpoMinutes = sc.Input[AI_TPO_MIN].GetInt();
 	ap.swingStrength = sc.Input[AI_SWING_N].GetInt(); ap.swingMinAtr = sc.Input[AI_SWING_ATR].GetFloat(); ap.equalTolTicks = sc.Input[AI_EQ_TOL].GetInt();
 	ap.bosDecayBars = sc.Input[AI_BOS_DECAY].GetInt(); ap.ibExtA = sc.Input[AI_IBEXT_A].GetFloat(); ap.ibExtB = sc.Input[AI_IBEXT_B].GetFloat(); ap.ibExtC = sc.Input[AI_IBEXT_C].GetFloat();
+	ap.compositeDays = sc.Input[AI_COMPOSITE_DAYS].GetInt(); ap.adrDays = sc.Input[AI_ADR_DAYS].GetInt();
 	SetParams(S, E_AUCTION, S.params.auction, ap);
 
 	CheckDataStamp(sc, S);
 	CheckWarnings(sc, S);
 	EnsureAuction(sc, S);
 
-	// Subgraph mirror
 	int& gen = sc.GetPersistentInt(1);
 	int start = Min(sc.UpdateStartIndex, S.auction.dirtyFrom); S.auction.dirtyFrom = INT_MAX;
 	if (gen != S.auction.generation) { start = 0; gen = S.auction.generation; }
 	if (start < 0) start = 0;
 	const AuctionState& A = S.auction; const AuctionParams& P = S.params.auction;
-	const bool dDev = sc.Input[AI_D_DEVVA].GetYesNo() != 0, dPd = sc.Input[AI_D_PDVA].GetYesNo() != 0, dOn = sc.Input[AI_D_ON].GetYesNo() != 0, dIb = sc.Input[AI_D_IB].GetYesNo() != 0;
-	const bool dPdhl = sc.Input[AI_D_PDHL].GetYesNo() != 0, dSw = sc.Input[AI_D_SWING].GetYesNo() != 0, dBos = sc.Input[AI_D_BOS].GetYesNo() != 0;
+	const bool levelsOn = S.vis.layer[L_LEVELS];
+	const bool dDev = levelsOn && sc.Input[AI_D_DEVVA].GetYesNo() != 0, dPd = levelsOn && sc.Input[AI_D_PDVA].GetYesNo() != 0, dOn = levelsOn && sc.Input[AI_D_ON].GetYesNo() != 0, dIb = levelsOn && sc.Input[AI_D_IB].GetYesNo() != 0;
+	const bool dPdhl = levelsOn && sc.Input[AI_D_PDHL].GetYesNo() != 0, dSw = sc.Input[AI_D_SWING].GetYesNo() != 0, dBos = sc.Input[AI_D_BOS].GetYesNo() != 0 && S.vis.preset != PRESET_CLEAN;
 	sc.Subgraph[AS_POC].PrimaryColor = sc.Input[AI_C_POC].GetColor(); sc.Subgraph[AS_VAH].PrimaryColor = sc.Subgraph[AS_VAL].PrimaryColor = sc.Input[AI_C_VA].GetColor();
 	sc.Subgraph[AS_PDPOC].PrimaryColor = sc.Subgraph[AS_PDVAH].PrimaryColor = sc.Subgraph[AS_PDVAL].PrimaryColor = sc.Input[AI_C_PD].GetColor();
 	sc.Subgraph[AS_ONH].PrimaryColor = sc.Subgraph[AS_ONL].PrimaryColor = sc.Input[AI_C_ON].GetColor();
@@ -3136,41 +3545,6 @@ SCSFExport scsf_NQEdge_Auction(SCStudyInterfaceRef sc)
 		sc.Subgraph[AS_F_STRUCT][i] = A.structTrend[i]; sc.Subgraph[AS_F_BOS][i] = A.bos[i]; sc.Subgraph[AS_F_VAPOS][i] = A.vaPos[i];
 		sc.Subgraph[AS_F_POCPOS][i] = A.pocPos[i]; sc.Subgraph[AS_F_IBPOS][i] = A.ibPos[i]; sc.Subgraph[AS_F_VALMIG][i] = A.valueMig[i]; sc.Subgraph[AS_F_OPEN][i] = A.openTypeDir[i];
 	}
-
-	// Drawings owned by this study: naked POC rays, single-print zones, liquidity pools
-	AuctionState& AW = S.auction;
-	for (size_t k = 0; k < AW.deadLines.size(); ++k) { int ln = AW.deadLines[k]; DeleteDrawing(sc, ln); }
-	AW.deadLines.clear();
-	const int last = sc.ArraySize - 1;
-	const int maxZones = Max(5, sc.Input[AI_MAX_ZONES].GetInt());
-	if (sc.Input[AI_D_NAKED].GetYesNo())
-	{
-		for (size_t k = 0; k < AW.nakedPocs.size(); ++k)
-		{
-			char txt[32]; sprintf_s(txt, sizeof(txt), "nPOC");
-			DrawRay(sc, AW.nakedPocLine[k], AW.nakedPocBorn[k], AW.nakedPocs[k], sc.Input[AI_C_NAKED].GetColor(), 1, LINESTYLE_DOT, txt);
-		}
-	}
-	else for (size_t k = 0; k < AW.nakedPocLine.size(); ++k) DeleteDrawing(sc, AW.nakedPocLine[k]);
-	if (sc.Input[AI_D_SINGLE].GetYesNo())
-	{
-		int drawn = 0;
-		for (size_t z = 0; z < AW.singlePrints.size() && drawn < maxZones; ++z, ++drawn)
-			DrawRect(sc, AW.singlePrints[z].lineNumber, AW.singlePrints[z].bornIdx, last, AW.singlePrints[z].top, AW.singlePrints[z].bottom, sc.Input[AI_C_SINGLE].GetColor(), 75, "single prints");
-	}
-	else for (size_t z = 0; z < AW.singlePrints.size(); ++z) DeleteDrawing(sc, AW.singlePrints[z].lineNumber);
-	if (sc.Input[AI_D_LIQ].GetYesNo())
-	{
-		int drawn = 0;
-		for (int z = static_cast<int>(AW.liquidity.size()) - 1; z >= 0; --z)
-		{
-			Zone& Z = AW.liquidity[z];
-			if (!Z.active) { if (Z.deadIdx >= 0 && last - Z.deadIdx > 5) DeleteDrawing(sc, Z.lineNumber); else if (Z.lineNumber) DrawRect(sc, Z.lineNumber, Z.bornIdx, Z.deadIdx, Z.top, Z.bottom, sc.Input[AI_C_LIQ].GetColor(), 85); continue; }
-			if (drawn++ >= maxZones) { DeleteDrawing(sc, Z.lineNumber); continue; }
-			DrawRect(sc, Z.lineNumber, Z.bornIdx, last, Z.top, Z.bottom, sc.Input[AI_C_LIQ].GetColor(), 70, Z.kind == LVL_LIQ_EQH ? "EQH liquidity" : "EQL liquidity");
-		}
-	}
-	else for (size_t z = 0; z < AW.liquidity.size(); ++z) DeleteDrawing(sc, AW.liquidity[z].lineNumber);
 }
 
 // --- 2. VWAP ------------------------------------------------------------------
@@ -3182,7 +3556,7 @@ SCSFExport scsf_NQEdge_VWAP(SCStudyInterfaceRef sc)
 	if (sc.SetDefaults)
 	{
 		sc.GraphName = "NQ Edge: VWAP Engine";
-		sc.StudyDescription = "Session VWAP with variance bands, anchored VWAPs (overnight open, RTH open, last swing high/low), ATR-normalized slope and acceptance state.";
+		sc.StudyDescription = "Session VWAP with variance bands, anchored VWAPs (overnight open, RTH open, last swing high/low), ATR-normalized slope and acceptance state. Band fills come from the Terminal Backdrop (VWAP cloud).";
 		sc.GraphRegion = 0; sc.AutoLoop = 0; sc.CalculationPrecedence = STD_PREC_LEVEL; sc.ValueFormat = VALUEFORMAT_INHERITED; sc.ScaleRangeType = SCALE_SAMEASREGION; sc.DrawZeros = 0;
 		const char* names[VS_COUNT] = { "VWAP", "+1 SD", "-1 SD", "+2 SD", "-2 SD", "+3 SD", "-3 SD", "AVWAP ON", "AVWAP RTH", "AVWAP Swing High", "AVWAP Swing Low", "f.vwapSlope", "f.vwapPos", "f.vwapAccept" };
 		for (int k = 0; k < VS_COUNT; ++k) { sc.Subgraph[k].Name = names[k]; sc.Subgraph[k].DrawZeros = 0; sc.Subgraph[k].DrawStyle = k >= VS_F_SLOPE ? DRAWSTYLE_IGNORE : DRAWSTYLE_LINE; sc.Subgraph[k].LineWidth = 1; }
@@ -3193,18 +3567,18 @@ SCSFExport scsf_NQEdge_VWAP(SCStudyInterfaceRef sc)
 		NQE_FLT_INPUT(VI_B3, "Band 3 Std Dev Multiplier", 3.0, 0.1, 10.0);
 		NQE_INT_INPUT(VI_SLOPE, "Slope Lookback Bars", 10, 1, 200);
 		NQE_INT_INPUT(VI_ACCEPT, "Acceptance Closes", 3, 1, 20);
-		NQE_YESNO_INPUT(VI_D_SESSION, "Draw: Session VWAP + Bands", 1);
-		NQE_YESNO_INPUT(VI_D_ON, "Draw: Overnight-anchored VWAP", 1);
-		NQE_YESNO_INPUT(VI_D_RTH, "Draw: RTH-anchored VWAP", 0);
-		NQE_YESNO_INPUT(VI_D_SWING, "Draw: Swing-anchored VWAPs", 1);
-		NQE_COLOR_INPUT(VI_C_VWAP, "Color: VWAP", 255, 215, 0);
-		NQE_COLOR_INPUT(VI_C_B1, "Color: Band 1", 190, 170, 60);
-		NQE_COLOR_INPUT(VI_C_B2, "Color: Band 2", 150, 130, 50);
-		NQE_COLOR_INPUT(VI_C_B3, "Color: Band 3", 110, 95, 40);
+		NQE_YESNO_INPUT(VI_D_SESSION, "Lines: Session VWAP + Bands", 1);
+		NQE_YESNO_INPUT(VI_D_ON, "Lines: Overnight-anchored VWAP", 1);
+		NQE_YESNO_INPUT(VI_D_RTH, "Lines: RTH-anchored VWAP", 0);
+		NQE_YESNO_INPUT(VI_D_SWING, "Lines: Swing-anchored VWAPs", 0);
+		NQE_COLOR_INPUT(VI_C_VWAP, "Color: VWAP", 255, 200, 87);
+		NQE_COLOR_INPUT(VI_C_B1, "Color: Band 1", 190, 160, 70);
+		NQE_COLOR_INPUT(VI_C_B2, "Color: Band 2", 140, 120, 55);
+		NQE_COLOR_INPUT(VI_C_B3, "Color: Band 3", 92, 101, 119);
 		NQE_COLOR_INPUT(VI_C_ON, "Color: AVWAP Overnight", 120, 170, 255);
 		NQE_COLOR_INPUT(VI_C_RTH, "Color: AVWAP RTH", 255, 170, 90);
-		NQE_COLOR_INPUT(VI_C_SWH, "Color: AVWAP Swing High", 230, 100, 100);
-		NQE_COLOR_INPUT(VI_C_SWL, "Color: AVWAP Swing Low", 100, 230, 140);
+		NQE_COLOR_INPUT(VI_C_SWH, "Color: AVWAP Swing High", 255, 77, 94);
+		NQE_COLOR_INPUT(VI_C_SWL, "Color: AVWAP Swing Low", 0, 200, 150);
 		return;
 	}
 	if (sc.LastCallToFunction) { Release(sc, E_VWAP); return; }
@@ -3217,15 +3591,17 @@ SCSFExport scsf_NQEdge_VWAP(SCStudyInterfaceRef sc)
 	CheckDataStamp(sc, S);
 	EnsureVwap(sc, S);
 
-	// colours + visibility follow inputs
 	sc.Subgraph[VS_VWAP].PrimaryColor = sc.Input[VI_C_VWAP].GetColor();
 	sc.Subgraph[VS_B1U].PrimaryColor = sc.Subgraph[VS_B1D].PrimaryColor = sc.Input[VI_C_B1].GetColor();
 	sc.Subgraph[VS_B2U].PrimaryColor = sc.Subgraph[VS_B2D].PrimaryColor = sc.Input[VI_C_B2].GetColor();
 	sc.Subgraph[VS_B3U].PrimaryColor = sc.Subgraph[VS_B3D].PrimaryColor = sc.Input[VI_C_B3].GetColor();
 	sc.Subgraph[VS_ON].PrimaryColor = sc.Input[VI_C_ON].GetColor(); sc.Subgraph[VS_RTH].PrimaryColor = sc.Input[VI_C_RTH].GetColor();
 	sc.Subgraph[VS_SWH].PrimaryColor = sc.Input[VI_C_SWH].GetColor(); sc.Subgraph[VS_SWL].PrimaryColor = sc.Input[VI_C_SWL].GetColor();
-	const bool dS = sc.Input[VI_D_SESSION].GetYesNo() != 0, dO = sc.Input[VI_D_ON].GetYesNo() != 0, dR = sc.Input[VI_D_RTH].GetYesNo() != 0, dW = sc.Input[VI_D_SWING].GetYesNo() != 0;
-	for (int k = VS_VWAP; k <= VS_B3D; ++k) sc.Subgraph[k].DrawStyle = dS ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE;
+	const bool cloud = S.vis.layer[L_CLOUD];                     // the backdrop draws band fills; hide the band lines then
+	const bool clean = S.vis.preset == PRESET_CLEAN;
+	const bool dS = sc.Input[VI_D_SESSION].GetYesNo() != 0, dO = sc.Input[VI_D_ON].GetYesNo() != 0 && !clean, dR = sc.Input[VI_D_RTH].GetYesNo() != 0 && !clean, dW = sc.Input[VI_D_SWING].GetYesNo() != 0 && !clean;
+	sc.Subgraph[VS_VWAP].DrawStyle = dS ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE;
+	for (int k = VS_B1U; k <= VS_B3D; ++k) sc.Subgraph[k].DrawStyle = (dS && !cloud && !clean) ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE;
 	sc.Subgraph[VS_ON].DrawStyle = dO ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE; sc.Subgraph[VS_RTH].DrawStyle = dR ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE;
 	sc.Subgraph[VS_SWH].DrawStyle = dW ? DRAWSTYLE_DASH : DRAWSTYLE_IGNORE; sc.Subgraph[VS_SWL].DrawStyle = dW ? DRAWSTYLE_DASH : DRAWSTYLE_IGNORE;
 
@@ -3247,8 +3623,7 @@ enum FlowInput
 {
 	FI_CVD_RESET = 0, FI_CVD_SLOPE, FI_VOLZ_LEN, FI_ABS_Z, FI_ABS_RANGE, FI_ABS_FRAC, FI_EXH_RUN, FI_EXH_PCT, FI_IMB_RATIO, FI_IMB_MINVOL, FI_IMB_STACK,
 	FI_LT_PCT, FI_LT_MIN, FI_LT_LOOK, FI_LT_MAX, FI_TRAP_LOOK, FI_TRAP_K, FI_TRAP_DELTA, FI_DIV_ATR, FI_DECAY, FI_MAX_ZONES,
-	FI_D_CVD, FI_D_ABS, FI_D_IMB, FI_D_BUBBLE, FI_D_DIV, FI_D_TRAP, FI_D_EXH,
-	FI_C_CVD_UP, FI_C_CVD_DN, FI_C_ABS_BULL, FI_C_ABS_BEAR, FI_C_IMB_BUY, FI_C_IMB_SELL, FI_C_BUB_BUY, FI_C_BUB_SELL, FI_C_DIV, FI_C_TRAP, FI_C_EXH, FI_COUNT
+	FI_C_CVD_UP, FI_C_CVD_DN, FI_COUNT
 };
 enum FlowSubgraph { FS_CVD = 0, FS_DELTA, FS_DELTA_PCT, FS_VOLZ, FS_CVDZ, FS_F_ABS, FS_F_EXH, FS_F_IMB, FS_F_TRAP, FS_F_DIV, FS_F_LARGE, FS_COUNT };
 
@@ -3257,12 +3632,12 @@ SCSFExport scsf_NQEdge_OrderFlow(SCStudyInterfaceRef sc)
 	if (sc.SetDefaults)
 	{
 		sc.GraphName = "NQ Edge: Order Flow Engine";
-		sc.StudyDescription = "Tick-level delta/CVD, CVD divergence, absorption, exhaustion, stacked imbalances, large trades (T&S + VAP), trapped traders. Zones drawn on the price chart.";
-		sc.GraphRegion = 1; sc.AutoLoop = 0; sc.CalculationPrecedence = STD_PREC_LEVEL; sc.ValueFormat = 0; sc.MaintainVolumeAtPriceData = 1; sc.DrawZeros = 0;
+		sc.StudyDescription = "Tick-level delta/CVD, CVD divergence, absorption, exhaustion, stacked imbalances, large trades (T&S + VAP), trapped traders, swing legs. Visuals are drawn by the Terminal studies; the CVD line appears only in the diagnostic region.";
+		sc.GraphRegion = 0; sc.AutoLoop = 0; sc.CalculationPrecedence = STD_PREC_LEVEL; sc.ValueFormat = 0; sc.MaintainVolumeAtPriceData = 1; sc.DrawZeros = 0;
 		const char* names[FS_COUNT] = { "CVD", "Delta", "Delta %", "Volume Z", "CVD Z", "f.absorb", "f.exhaust", "f.imbalance", "f.trapped", "f.cvdDiv", "f.largeTrade" };
 		for (int k = 0; k < FS_COUNT; ++k) { sc.Subgraph[k].Name = names[k]; sc.Subgraph[k].DrawStyle = DRAWSTYLE_IGNORE; sc.Subgraph[k].DrawZeros = 1; }
-		sc.Subgraph[FS_CVD].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[FS_CVD].LineWidth = 2; sc.Subgraph[FS_CVD].PrimaryColor = RGB(0, 200, 120); sc.Subgraph[FS_CVD].SecondaryColor = RGB(220, 70, 70); sc.Subgraph[FS_CVD].SecondaryColorUsed = 1;
-		sc.Subgraph[FS_DELTA].DrawStyle = DRAWSTYLE_BAR; sc.Subgraph[FS_DELTA].PrimaryColor = RGB(90, 90, 90);
+		sc.Subgraph[FS_CVD].LineWidth = 2; sc.Subgraph[FS_CVD].PrimaryColor = RGB(0, 200, 150); sc.Subgraph[FS_CVD].SecondaryColor = RGB(255, 77, 94); sc.Subgraph[FS_CVD].SecondaryColorUsed = 1;
+		sc.Subgraph[FS_DELTA].PrimaryColor = RGB(90, 90, 90);
 
 		sc.Input[FI_CVD_RESET].Name = "CVD Reset"; sc.Input[FI_CVD_RESET].SetCustomInputStrings("RTH Open;Trading Day Start;Never"); sc.Input[FI_CVD_RESET].SetCustomInputIndex(0);
 		NQE_INT_INPUT(FI_CVD_SLOPE, "CVD Slope Bars", 10, 2, 200);
@@ -3278,31 +3653,15 @@ SCSFExport scsf_NQEdge_OrderFlow(SCStudyInterfaceRef sc)
 		NQE_FLT_INPUT(FI_LT_PCT, "Large Trade: Rolling Percentile", 99.0, 80.0, 99.99);
 		NQE_INT_INPUT(FI_LT_MIN, "Large Trade: Min Size", 20, 1, 100000);
 		NQE_INT_INPUT(FI_LT_LOOK, "Large Trade: Lookback Trades", 2000, 100, 50000);
-		NQE_INT_INPUT(FI_LT_MAX, "Large Trade: Max Bubbles Drawn", 100, 0, 500);
+		NQE_INT_INPUT(FI_LT_MAX, "Large Trade: Max Bubbles Kept", 100, 0, 500);
 		NQE_INT_INPUT(FI_TRAP_LOOK, "Trapped: Breakout Lookback Bars", 20, 3, 200);
 		NQE_INT_INPUT(FI_TRAP_K, "Trapped: Reversal Within K Bars", 3, 1, 20);
 		NQE_FLT_INPUT(FI_TRAP_DELTA, "Trapped: Min Breakout Delta %", 20.0, 0.0, 100.0);
 		NQE_FLT_INPUT(FI_DIV_ATR, "Divergence: Min Swing Distance (ATR)", 0.5, 0.0, 10.0);
 		NQE_INT_INPUT(FI_DECAY, "Event Decay Bars (feature half-life)", 8, 1, 100);
-		NQE_INT_INPUT(FI_MAX_ZONES, "Max Active Zones Drawn", 30, 1, 200);
-		NQE_YESNO_INPUT(FI_D_CVD, "Draw: CVD", 1);
-		NQE_YESNO_INPUT(FI_D_ABS, "Draw: Absorption Zones", 1);
-		NQE_YESNO_INPUT(FI_D_IMB, "Draw: Imbalance Zones", 1);
-		NQE_YESNO_INPUT(FI_D_BUBBLE, "Draw: Large Trade Bubbles", 1);
-		NQE_YESNO_INPUT(FI_D_DIV, "Draw: Divergence Markers", 1);
-		NQE_YESNO_INPUT(FI_D_TRAP, "Draw: Trapped Trader Markers", 1);
-		NQE_YESNO_INPUT(FI_D_EXH, "Draw: Exhaustion Markers", 1);
-		NQE_COLOR_INPUT(FI_C_CVD_UP, "Color: CVD Up", 0, 200, 120);
-		NQE_COLOR_INPUT(FI_C_CVD_DN, "Color: CVD Down", 220, 70, 70);
-		NQE_COLOR_INPUT(FI_C_ABS_BULL, "Color: Absorption (buyers absorbed selling)", 0, 180, 110);
-		NQE_COLOR_INPUT(FI_C_ABS_BEAR, "Color: Absorption (sellers absorbed buying)", 200, 60, 60);
-		NQE_COLOR_INPUT(FI_C_IMB_BUY, "Color: Stacked Buy Imbalance", 40, 200, 90);
-		NQE_COLOR_INPUT(FI_C_IMB_SELL, "Color: Stacked Sell Imbalance", 210, 50, 80);
-		NQE_COLOR_INPUT(FI_C_BUB_BUY, "Color: Large Buy Bubble", 60, 230, 120);
-		NQE_COLOR_INPUT(FI_C_BUB_SELL, "Color: Large Sell Bubble", 240, 80, 80);
-		NQE_COLOR_INPUT(FI_C_DIV, "Color: CVD Divergence", 255, 180, 0);
-		NQE_COLOR_INPUT(FI_C_TRAP, "Color: Trapped Traders", 255, 100, 255);
-		NQE_COLOR_INPUT(FI_C_EXH, "Color: Exhaustion", 200, 200, 90);
+		NQE_INT_INPUT(FI_MAX_ZONES, "Max Active Zones Kept", 30, 1, 200);
+		NQE_COLOR_INPUT(FI_C_CVD_UP, "Color: CVD Up (diagnostic)", 0, 200, 150);
+		NQE_COLOR_INPUT(FI_C_CVD_DN, "Color: CVD Down (diagnostic)", 255, 77, 94);
 		return;
 	}
 	if (sc.LastCallToFunction) { Release(sc, E_FLOW); return; }
@@ -3322,7 +3681,10 @@ SCSFExport scsf_NQEdge_OrderFlow(SCStudyInterfaceRef sc)
 	CheckDataStamp(sc, S);
 	EnsureFlow(sc, S);
 
-	sc.Subgraph[FS_CVD].DrawStyle = sc.Input[FI_D_CVD].GetYesNo() ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE;
+	const bool diag = S.vis.diagnostics;
+	sc.GraphRegion = diag ? kDiagRegionFlow : 0;
+	sc.Subgraph[FS_CVD].DrawStyle = diag ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE;
+	sc.Subgraph[FS_DELTA].DrawStyle = diag ? DRAWSTYLE_BAR : DRAWSTYLE_IGNORE;
 	int& gen = sc.GetPersistentInt(1);
 	int start = Min(sc.UpdateStartIndex, S.flow.dirtyFrom); S.flow.dirtyFrom = INT_MAX;
 	if (gen != S.flow.generation) { start = 0; gen = S.flow.generation; }
@@ -3336,68 +3698,6 @@ SCSFExport scsf_NQEdge_OrderFlow(SCStudyInterfaceRef sc)
 		sc.Subgraph[FS_F_ABS][i] = F.fAbsorb[i]; sc.Subgraph[FS_F_EXH][i] = F.fExhaust[i]; sc.Subgraph[FS_F_IMB][i] = F.fImb[i]; sc.Subgraph[FS_F_TRAP][i] = F.fTrapped[i];
 		sc.Subgraph[FS_F_DIV][i] = F.fCvdDiv[i]; sc.Subgraph[FS_F_LARGE][i] = F.fLarge[i];
 	}
-
-	// ---- drawings on the price chart (region 0) owned by this study ----
-	FlowState& FW = S.flow;
-	for (size_t k = 0; k < FW.deadLines.size(); ++k) { int ln = FW.deadLines[k]; DeleteDrawing(sc, ln); }
-	FW.deadLines.clear();
-	const int last = sc.ArraySize - 1;
-	const int maxZones = Max(1, sc.Input[FI_MAX_ZONES].GetInt());
-	struct ZoneDrawer
-	{
-		static void Draw(SCStudyInterfaceRef sc, std::vector<Zone>& zones, bool on, int last, int maxZones, uint32_t cBull, uint32_t cBear, const char* bullTxt, const char* bearTxt)
-		{
-			int drawn = 0;
-			for (int z = static_cast<int>(zones.size()) - 1; z >= 0; --z)
-			{
-				Zone& Z = zones[z];
-				if (!on) { DeleteDrawing(sc, Z.lineNumber); continue; }
-				if (!Z.active)
-				{
-					if (Z.deadIdx >= 0 && last - Z.deadIdx > 3) DeleteDrawing(sc, Z.lineNumber);
-					else if (Z.lineNumber) DrawRect(sc, Z.lineNumber, Z.bornIdx, Z.deadIdx, Z.top, Z.bottom, Z.dir > 0 ? cBull : cBear, 88);
-					continue;
-				}
-				if (drawn++ >= maxZones) { DeleteDrawing(sc, Z.lineNumber); continue; }
-				DrawRect(sc, Z.lineNumber, Z.bornIdx, last, Z.top, Z.bottom, Z.dir > 0 ? cBull : cBear, 70, Z.dir > 0 ? bullTxt : bearTxt);
-			}
-		}
-	};
-	ZoneDrawer::Draw(sc, FW.absorbZones, sc.Input[FI_D_ABS].GetYesNo() != 0, last, maxZones, sc.Input[FI_C_ABS_BULL].GetColor(), sc.Input[FI_C_ABS_BEAR].GetColor(), "absorption", "absorption");
-	ZoneDrawer::Draw(sc, FW.imbZones, sc.Input[FI_D_IMB].GetYesNo() != 0, last, maxZones, sc.Input[FI_C_IMB_BUY].GetColor(), sc.Input[FI_C_IMB_SELL].GetColor(), "stacked buy imb", "stacked sell imb");
-
-	// bubbles: size scaled by rank within the visible set
-	{
-		const bool on = sc.Input[FI_D_BUBBLE].GetYesNo() != 0;
-		const int maxB = Max(0, sc.Input[FI_LT_MAX].GetInt());
-		double maxSize = 1; for (size_t q = 0; q < FW.bubbles.size(); ++q) maxSize = Max(maxSize, FW.bubbles[q].size);
-		int drawn = 0;
-		for (int q = static_cast<int>(FW.bubbles.size()) - 1; q >= 0; --q)
-		{
-			Bubble& bb = FW.bubbles[q];
-			if (!on || drawn >= maxB) { DeleteDrawing(sc, bb.lineNumber); continue; }
-			++drawn;
-			const int sz = 4 + static_cast<int>(12.0 * sqrt(bb.size / maxSize));
-			const uint32_t col = bb.dir > 0 ? sc.Input[FI_C_BUB_BUY].GetColor() : sc.Input[FI_C_BUB_SELL].GetColor();
-			// live bubbles on the forming bar can still grow; everything else is drawn once
-			if (bb.lineNumber == 0 || (bb.live && bb.idx == last)) DrawMarker(sc, bb.lineNumber, bb.idx, bb.price, bb.live ? MARKER_POINT : MARKER_SQUARE, sz, col, bb.live ? sz : 1);
-		}
-	}
-
-	// event markers (divergence = 1, trapped = 2, exhaustion = 3)
-	{
-		const bool dDiv = sc.Input[FI_D_DIV].GetYesNo() != 0, dTrap = sc.Input[FI_D_TRAP].GetYesNo() != 0, dExh = sc.Input[FI_D_EXH].GetYesNo() != 0;
-		for (size_t q = 0; q < FW.markers.size(); ++q)
-		{
-			FlowState::Marker& m = FW.markers[q];
-			const bool on = (m.kind == 1 && dDiv) || (m.kind == 2 && dTrap) || (m.kind == 3 && dExh);
-			if (!on) { DeleteDrawing(sc, m.lineNumber); continue; }
-			if (m.lineNumber != 0) continue;
-			const uint32_t col = m.kind == 1 ? sc.Input[FI_C_DIV].GetColor() : (m.kind == 2 ? sc.Input[FI_C_TRAP].GetColor() : sc.Input[FI_C_EXH].GetColor());
-			const int type = m.kind == 1 ? (m.dir > 0 ? MARKER_TRIANGLEUP : MARKER_TRIANGLEDOWN) : (m.kind == 2 ? MARKER_X : MARKER_DIAMOND);
-			DrawMarker(sc, m.lineNumber, m.idx, m.price, type, 7, col, 2);
-		}
-	}
 }
 
 // --- 4. Regime + MTF ----------------------------------------------------------
@@ -3409,11 +3709,11 @@ SCSFExport scsf_NQEdge_Regime(SCStudyInterfaceRef sc)
 	if (sc.SetDefaults)
 	{
 		sc.GraphName = "NQ Edge: Regime + MTF Bias";
-		sc.StudyDescription = "Classifies every closed bar as Trend Up / Trend Down / Balance / Volatile Chop (with hysteresis) and computes 1m/5m/15m/60m trend bias. Shades the chart background by regime.";
+		sc.StudyDescription = "Classifies every closed bar as Trend Up / Trend Down / Balance / Volatile Chop (with hysteresis) and computes 1m/5m/15m/60m trend bias. The regime tint is drawn by the Terminal Backdrop; the opaque shade here is diagnostic.";
 		sc.GraphRegion = 0; sc.AutoLoop = 0; sc.CalculationPrecedence = LOW_PREC_LEVEL; sc.ValueFormat = 2; sc.ScaleRangeType = SCALE_INDEPENDENT; sc.DrawZeros = 0; sc.DrawStudyUnderneathMainPriceGraph = 1;
-		const char* names[RS_COUNT] = { "Regime Shade", "Regime", "Efficiency Ratio", "ATR Ratio", "f.regimeTrend", "MTF 1m", "MTF 5m", "MTF 15m", "MTF 60m", "f.mtfBias" };
+		const char* names[RS_COUNT] = { "Regime Shade (diagnostic)", "Regime", "Efficiency Ratio", "ATR Ratio", "f.regimeTrend", "MTF 1m", "MTF 5m", "MTF 15m", "MTF 60m", "f.mtfBias" };
 		for (int k = 0; k < RS_COUNT; ++k) { sc.Subgraph[k].Name = names[k]; sc.Subgraph[k].DrawStyle = DRAWSTYLE_IGNORE; sc.Subgraph[k].DrawZeros = 0; }
-		sc.Subgraph[RS_BG].DrawStyle = DRAWSTYLE_BACKGROUND; sc.Subgraph[RS_BG].PrimaryColor = RGB(20, 40, 20);
+		sc.Subgraph[RS_BG].PrimaryColor = RGB(20, 40, 20);
 		NQE_INT_INPUT(RI_ER_LEN, "Efficiency Ratio Length", 20, 5, 500);
 		NQE_FLT_INPUT(RI_ER_TREND, "ER Trend Threshold", 0.35, 0.05, 1.0);
 		NQE_FLT_INPUT(RI_ER_BAL, "ER Balance Threshold", 0.20, 0.0, 1.0);
@@ -3425,7 +3725,7 @@ SCSFExport scsf_NQEdge_Regime(SCStudyInterfaceRef sc)
 		NQE_INT_INPUT(RI_HYST, "Hysteresis Bars", 3, 1, 50);
 		NQE_INT_INPUT(RI_MTF_EMA, "MTF EMA Length", 20, 2, 200);
 		NQE_INT_INPUT(RI_MTF_SWING, "MTF Swing Strength", 3, 1, 20);
-		NQE_YESNO_INPUT(RI_SHADE, "Shade Background By Regime", 1);
+		NQE_YESNO_INPUT(RI_SHADE, "Opaque Regime Shade (diagnostic)", 0);
 		NQE_COLOR_INPUT(RI_C_UP, "Color: Trend Up Shade", 18, 40, 24);
 		NQE_COLOR_INPUT(RI_C_DN, "Color: Trend Down Shade", 44, 20, 22);
 		NQE_COLOR_INPUT(RI_C_BAL, "Color: Balance Shade", 26, 26, 34);
@@ -3471,13 +3771,11 @@ SCSFExport scsf_NQEdge_Intermarket(SCStudyInterfaceRef sc)
 	if (sc.SetDefaults)
 	{
 		sc.GraphName = "NQ Edge: Intermarket Engine";
-		sc.StudyDescription = "Relative strength vs YM/ES/RTY, SMT divergence, NYSE TICK (cumulative, extremes, divergence), mega-cap leadership breadth. Every chart number is optional (0 = off).";
-		sc.GraphRegion = 2; sc.AutoLoop = 0; sc.CalculationPrecedence = LOW_PREC_LEVEL; sc.ValueFormat = 2; sc.DrawZeros = 1;
+		sc.StudyDescription = "Relative strength vs YM/ES/RTY, SMT divergence, NYSE TICK (cumulative, extremes, divergence), mega-cap leadership breadth, lead/lag. Every chart number is optional (0 = off). Set the chart numbers from the title bars of the other charts in this chartbook.";
+		sc.GraphRegion = 0; sc.AutoLoop = 0; sc.CalculationPrecedence = LOW_PREC_LEVEL; sc.ValueFormat = 2; sc.DrawZeros = 1;
 		const char* names[IS_COUNT] = { "RS vs YM", "RS vs ES", "RS vs RTY", "f.rsIndex", "f.smt", "f.tickCum", "f.tickExt", "f.tickDiv", "f.megaCap", "Intermarket Composite" };
 		for (int k = 0; k < IS_COUNT; ++k) { sc.Subgraph[k].Name = names[k]; sc.Subgraph[k].DrawStyle = DRAWSTYLE_IGNORE; sc.Subgraph[k].DrawZeros = 1; }
-		sc.Subgraph[IS_RS_INDEX].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[IS_RS_INDEX].PrimaryColor = RGB(120, 180, 255);
-		sc.Subgraph[IS_MEGA].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[IS_MEGA].PrimaryColor = RGB(255, 200, 80);
-		sc.Subgraph[IS_COMPOSITE].DrawStyle = DRAWSTYLE_BAR; sc.Subgraph[IS_COMPOSITE].PrimaryColor = RGB(90, 90, 90);
+		sc.Subgraph[IS_RS_INDEX].PrimaryColor = RGB(120, 180, 255); sc.Subgraph[IS_MEGA].PrimaryColor = RGB(255, 200, 80); sc.Subgraph[IS_COMPOSITE].PrimaryColor = RGB(90, 90, 90);
 		sc.Input[II_YM].Name = "Chart Number: YM (0 = off)"; sc.Input[II_YM].SetChartNumber(0);
 		sc.Input[II_ES].Name = "Chart Number: ES (0 = off)"; sc.Input[II_ES].SetChartNumber(0);
 		sc.Input[II_RTY].Name = "Chart Number: RTY (0 = off)"; sc.Input[II_RTY].SetChartNumber(0);
@@ -3491,8 +3789,8 @@ SCSFExport scsf_NQEdge_Intermarket(SCStudyInterfaceRef sc)
 		NQE_INT_INPUT(II_TICK_LOOK, "TICK: Extremes Lookback Bars", 10, 1, 200);
 		NQE_INT_INPUT(II_TICK_EMA, "TICK: Trend EMA Length", 10, 2, 200);
 		NQE_INT_INPUT(II_MEGA_EMA, "Mega Cap: Trend EMA Length", 20, 2, 200);
-		NQE_COLOR_INPUT(II_C_RS, "Color: RS Line", 120, 180, 255);
-		NQE_COLOR_INPUT(II_C_BREADTH, "Color: Leadership Breadth", 255, 200, 80);
+		NQE_COLOR_INPUT(II_C_RS, "Color: RS Line (diagnostic)", 120, 180, 255);
+		NQE_COLOR_INPUT(II_C_BREADTH, "Color: Leadership Breadth (diagnostic)", 255, 200, 80);
 		return;
 	}
 	if (sc.LastCallToFunction) { Release(sc, E_INTER); return; }
@@ -3507,6 +3805,9 @@ SCSFExport scsf_NQEdge_Intermarket(SCStudyInterfaceRef sc)
 	SetParams(S, E_INTER, S.params.inter, ip);
 	CheckDataStamp(sc, S);
 	EnsureInter(sc, S);
+	const bool diag = S.vis.diagnostics;
+	sc.GraphRegion = diag ? kDiagRegionInter : 0;
+	sc.Subgraph[IS_RS_INDEX].DrawStyle = diag ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE; sc.Subgraph[IS_MEGA].DrawStyle = diag ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE; sc.Subgraph[IS_COMPOSITE].DrawStyle = diag ? DRAWSTYLE_BAR : DRAWSTYLE_IGNORE;
 	sc.Subgraph[IS_RS_INDEX].PrimaryColor = sc.Input[II_C_RS].GetColor(); sc.Subgraph[IS_MEGA].PrimaryColor = sc.Input[II_C_BREADTH].GetColor();
 	int& gen = sc.GetPersistentInt(1);
 	int start = Min(sc.UpdateStartIndex, S.inter.dirtyFrom); S.inter.dirtyFrom = INT_MAX;
@@ -3524,8 +3825,8 @@ SCSFExport scsf_NQEdge_Intermarket(SCStudyInterfaceRef sc)
 // --- 6. DCS -------------------------------------------------------------------
 enum DcsInput
 {
-	DI_FILE = 0, DI_RELOAD, DI_THR, DI_FADE, DI_SMOOTH, DI_STRONG, DI_WEAK, DI_S1, DI_S2, DI_S3, DI_S4, DI_S5, DI_MTF, DI_TOL, DI_STOPBUF, DI_MINRR, DI_MINTGT, DI_MAXSIG, DI_TGTBARS, DI_ALERTS, DI_SOUND,
-	DI_C_GREEN, DI_C_RED, DI_C_GRAY, DI_C_SMOOTH, DI_C_THR, DI_C_LONG, DI_C_SHORT, DI_C_ENTRY, DI_C_STOP, DI_C_TARGET, DI_C_LABEL, DI_COUNT
+	DI_FILE = 0, DI_RELOAD, DI_THR, DI_FADE, DI_SMOOTH, DI_STRONG, DI_WEAK, DI_S1, DI_S2, DI_S3, DI_S4, DI_S5, DI_MTF, DI_TOL, DI_STOPBUF, DI_MINRR, DI_MINTGT, DI_ALERTS, DI_SOUND, DI_ALERT_GRADE,
+	DI_C_GREEN, DI_C_RED, DI_C_GRAY, DI_C_SMOOTH, DI_C_THR, DI_COUNT
 };
 enum DcsSubgraph { DS_DCS = 0, DS_SMOOTH, DS_THR_UP, DS_THR_DN, DS_SIGNAL, DS_BIAS, DS_COUNT };
 
@@ -3534,15 +3835,13 @@ SCSFExport scsf_NQEdge_DCS(SCStudyInterfaceRef sc)
 	if (sc.SetDefaults)
 	{
 		sc.GraphName = "NQ Edge: Directional Conviction Score";
-		sc.StudyDescription = "Fuses all engine features into a regime-gated score (-100..+100), detects the five trade setups with structural stops and liquidity targets, draws and alerts them.";
-		sc.GraphRegion = 3; sc.AutoLoop = 0; sc.CalculationPrecedence = VERY_LOW_PREC_LEVEL; sc.ValueFormat = 0; sc.DrawZeros = 1;
+		sc.StudyDescription = "Fuses all engine features into a regime-gated score (-100..+100), detects and grades the five trade setups with structural stops and liquidity targets, and alerts them. The DCS ribbon, signal cards and R/R boxes are drawn by the Terminal Overlay; the histogram appears only in the diagnostic region.";
+		sc.GraphRegion = 0; sc.AutoLoop = 0; sc.CalculationPrecedence = VERY_LOW_PREC_LEVEL; sc.ValueFormat = 0; sc.DrawZeros = 1;
 		const char* names[DS_COUNT] = { "DCS", "DCS Smoothed", "+Threshold", "-Threshold", "Signal", "Bias" };
-		for (int k = 0; k < DS_COUNT; ++k) { sc.Subgraph[k].Name = names[k]; sc.Subgraph[k].DrawZeros = 1; }
-		sc.Subgraph[DS_DCS].DrawStyle = DRAWSTYLE_BAR; sc.Subgraph[DS_DCS].PrimaryColor = RGB(128, 128, 128); sc.Subgraph[DS_DCS].LineWidth = 2;
-		sc.Subgraph[DS_SMOOTH].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[DS_SMOOTH].PrimaryColor = RGB(255, 255, 255); sc.Subgraph[DS_SMOOTH].LineWidth = 1;
-		sc.Subgraph[DS_THR_UP].DrawStyle = DRAWSTYLE_DASH; sc.Subgraph[DS_THR_UP].PrimaryColor = RGB(90, 90, 90);
-		sc.Subgraph[DS_THR_DN].DrawStyle = DRAWSTYLE_DASH; sc.Subgraph[DS_THR_DN].PrimaryColor = RGB(90, 90, 90);
-		sc.Subgraph[DS_SIGNAL].DrawStyle = DRAWSTYLE_IGNORE; sc.Subgraph[DS_BIAS].DrawStyle = DRAWSTYLE_IGNORE;
+		for (int k = 0; k < DS_COUNT; ++k) { sc.Subgraph[k].Name = names[k]; sc.Subgraph[k].DrawZeros = 1; sc.Subgraph[k].DrawStyle = DRAWSTYLE_IGNORE; }
+		sc.Subgraph[DS_DCS].PrimaryColor = RGB(128, 128, 128); sc.Subgraph[DS_DCS].LineWidth = 2;
+		sc.Subgraph[DS_SMOOTH].PrimaryColor = RGB(255, 255, 255); sc.Subgraph[DS_SMOOTH].LineWidth = 1;
+		sc.Subgraph[DS_THR_UP].PrimaryColor = RGB(90, 90, 90); sc.Subgraph[DS_THR_DN].PrimaryColor = RGB(90, 90, 90);
 		sc.Input[DI_FILE].Name = "Weights File Name (in Data folder)"; sc.Input[DI_FILE].SetString("NQEdge_weights.txt");
 		NQE_INT_INPUT(DI_RELOAD, "Weights Hot-Reload Check Seconds", 5, 1, 600);
 		NQE_FLT_INPUT(DI_THR, "Signal Threshold |DCS| (0 = from weights file, default 40)", 0.0, 0.0, 100.0);
@@ -3560,21 +3859,14 @@ SCSFExport scsf_NQEdge_DCS(SCStudyInterfaceRef sc)
 		NQE_FLT_INPUT(DI_STOPBUF, "Stop Buffer Beyond Structure (ATR)", 0.5, 0.0, 3.0);
 		NQE_FLT_INPUT(DI_MINRR, "Min Reward:Risk To T1", 1.0, 0.1, 10.0);
 		NQE_FLT_INPUT(DI_MINTGT, "Min Target Distance (ATR)", 0.5, 0.1, 10.0);
-		NQE_INT_INPUT(DI_MAXSIG, "Max Signals Drawn", 30, 1, 300);
-		NQE_INT_INPUT(DI_TGTBARS, "Entry/Stop/Target Line Length (bars)", 20, 2, 200);
 		NQE_YESNO_INPUT(DI_ALERTS, "Alerts Enabled", 1);
 		sc.Input[DI_SOUND].Name = "Alert Sound Number"; sc.Input[DI_SOUND].SetAlertSoundNumber(1);
-		NQE_COLOR_INPUT(DI_C_GREEN, "Color: Deep Green (DCS +100)", 0, 220, 110);
-		NQE_COLOR_INPUT(DI_C_RED, "Color: Deep Red (DCS -100)", 230, 60, 60);
-		NQE_COLOR_INPUT(DI_C_GRAY, "Color: Neutral Gray (DCS 0)", 110, 110, 110);
-		NQE_COLOR_INPUT(DI_C_SMOOTH, "Color: Smoothed Line", 255, 255, 255);
-		NQE_COLOR_INPUT(DI_C_THR, "Color: Threshold Lines", 90, 90, 90);
-		NQE_COLOR_INPUT(DI_C_LONG, "Color: Long Signal", 0, 230, 120);
-		NQE_COLOR_INPUT(DI_C_SHORT, "Color: Short Signal", 240, 70, 70);
-		NQE_COLOR_INPUT(DI_C_ENTRY, "Color: Entry Line", 255, 255, 255);
-		NQE_COLOR_INPUT(DI_C_STOP, "Color: Stop Line", 230, 60, 60);
-		NQE_COLOR_INPUT(DI_C_TARGET, "Color: Target Lines", 0, 200, 255);
-		NQE_COLOR_INPUT(DI_C_LABEL, "Color: Signal Label", 255, 255, 255);
+		sc.Input[DI_ALERT_GRADE].Name = "Alert Minimum Grade"; sc.Input[DI_ALERT_GRADE].SetCustomInputStrings("A only;A and B;All"); sc.Input[DI_ALERT_GRADE].SetCustomInputIndex(1);
+		NQE_COLOR_INPUT(DI_C_GREEN, "Color: Deep Green (diagnostic histogram)", 0, 200, 150);
+		NQE_COLOR_INPUT(DI_C_RED, "Color: Deep Red (diagnostic histogram)", 255, 77, 94);
+		NQE_COLOR_INPUT(DI_C_GRAY, "Color: Neutral Gray (diagnostic histogram)", 138, 147, 166);
+		NQE_COLOR_INPUT(DI_C_SMOOTH, "Color: Smoothed Line (diagnostic)", 255, 255, 255);
+		NQE_COLOR_INPUT(DI_C_THR, "Color: Threshold Lines (diagnostic)", 90, 90, 90);
 		return;
 	}
 	if (sc.LastCallToFunction) { Release(sc, E_DCS); return; }
@@ -3587,12 +3879,16 @@ SCSFExport scsf_NQEdge_DCS(SCStudyInterfaceRef sc)
 	dp.strongThr = sc.Input[DI_STRONG].GetFloat(); dp.weakThr = sc.Input[DI_WEAK].GetFloat();
 	for (int k = 1; k < SETUP_COUNT; ++k) dp.setupOn[k] = sc.Input[DI_S1 + k - 1].GetYesNo();
 	dp.requireMtf = sc.Input[DI_MTF].GetYesNo(); dp.levelTolAtr = sc.Input[DI_TOL].GetFloat(); dp.stopBufferAtr = sc.Input[DI_STOPBUF].GetFloat(); dp.minRR = sc.Input[DI_MINRR].GetFloat();
-	dp.minTargetAtr = sc.Input[DI_MINTGT].GetFloat(); dp.maxSignalsDrawn = sc.Input[DI_MAXSIG].GetInt(); dp.targetLineBars = sc.Input[DI_TGTBARS].GetInt();
-	dp.alertsOn = sc.Input[DI_ALERTS].GetYesNo(); dp.alertSound = sc.Input[DI_SOUND].GetAlertSoundNumber();
+	dp.minTargetAtr = sc.Input[DI_MINTGT].GetFloat(); dp.maxSignalsDrawn = 30; dp.targetLineBars = 20;
+	dp.alertsOn = sc.Input[DI_ALERTS].GetYesNo(); dp.alertSound = sc.Input[DI_SOUND].GetAlertSoundNumber(); dp.alertMinGrade = sc.Input[DI_ALERT_GRADE].GetIndex() + 1;
 	SetParams(S, E_DCS, S.params.dcs, dp);
 	CheckDataStamp(sc, S);
 	EnsureDcs(sc, S);
 
+	const bool diag = S.vis.diagnostics;
+	sc.GraphRegion = diag ? kDiagRegionDcs : 0;
+	sc.Subgraph[DS_DCS].DrawStyle = diag ? DRAWSTYLE_BAR : DRAWSTYLE_IGNORE; sc.Subgraph[DS_SMOOTH].DrawStyle = diag ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE;
+	sc.Subgraph[DS_THR_UP].DrawStyle = sc.Subgraph[DS_THR_DN].DrawStyle = diag ? DRAWSTYLE_DASH : DRAWSTYLE_IGNORE;
 	sc.Subgraph[DS_SMOOTH].PrimaryColor = sc.Input[DI_C_SMOOTH].GetColor(); sc.Subgraph[DS_THR_UP].PrimaryColor = sc.Subgraph[DS_THR_DN].PrimaryColor = sc.Input[DI_C_THR].GetColor();
 	const uint32_t cG = sc.Input[DI_C_GREEN].GetColor(), cR = sc.Input[DI_C_RED].GetColor(), cN = sc.Input[DI_C_GRAY].GetColor();
 	int& gen = sc.GetPersistentInt(1);
@@ -3608,45 +3904,18 @@ SCSFExport scsf_NQEdge_DCS(SCStudyInterfaceRef sc)
 		sc.Subgraph[DS_THR_UP][i] = thrLine; sc.Subgraph[DS_THR_DN][i] = -thrLine;
 		const float t = Clamp(static_cast<float>(fabs(v)) / 100.0f, 0.0f, 1.0f);
 		uint32_t c = v >= 0 ? sc.RGBInterpolate(cN, cG, t) : sc.RGBInterpolate(cN, cR, t);
-		if (i == sc.ArraySize - 1) c = sc.RGBInterpolate(c, RGB(0, 0, 0), 0.5f);   // provisional (forming bar) drawn dim
+		if (i == sc.ArraySize - 1) c = sc.RGBInterpolate(c, RGB(0, 0, 0), 0.5f);
 		sc.Subgraph[DS_DCS].DataColor[i] = c;
 		sc.Subgraph[DS_SIGNAL][i] = static_cast<float>(D.signalType[i]) * static_cast<float>(D.signalDir[i]);
 		sc.Subgraph[DS_BIAS][i] = static_cast<float>(D.barState[i]);
 	}
-
-	// ---- signal drawings (region 0) and alerts ----
+	// alert only for a signal on the newest closed bar, only in real time, only at or above the minimum grade
 	DcsState& DW = S.dcs;
-	const int maxDrawn = Max(1, sc.Input[DI_MAXSIG].GetInt());
-	const int lineBars = Max(2, sc.Input[DI_TGTBARS].GetInt());
-	const uint32_t cLong = sc.Input[DI_C_LONG].GetColor(), cShort = sc.Input[DI_C_SHORT].GetColor(), cEntry = sc.Input[DI_C_ENTRY].GetColor();
-	const uint32_t cStop = sc.Input[DI_C_STOP].GetColor(), cTgt = sc.Input[DI_C_TARGET].GetColor(), cLabel = sc.Input[DI_C_LABEL].GetColor();
 	const int total = static_cast<int>(DW.signals.size());
-	for (int k = total - 1; k >= 0; --k)
-	{
-		Signal& g = DW.signals[k];
-		const bool keep = (total - 1 - k) < maxDrawn;
-		if (!keep)
-		{
-			if (g.lineArrow == 0 && g.lineEntry == 0 && g.lineStop == 0 && g.lineT1 == 0 && g.lineT2 == 0 && g.lineText == 0) break;   // older ones are already clean
-			DeleteDrawing(sc, g.lineArrow); DeleteDrawing(sc, g.lineEntry); DeleteDrawing(sc, g.lineStop); DeleteDrawing(sc, g.lineT1); DeleteDrawing(sc, g.lineT2); DeleteDrawing(sc, g.lineText);
-			continue;
-		}
-		if (g.lineArrow != 0 && DrawingAlive(sc, g.lineArrow)) continue;    // drawn once; closed-bar signals never change
-		const float atr = AtrAt(S, g.idx);
-		const float ay = g.dir > 0 ? sc.Low[g.idx] - 0.3f * atr : sc.High[g.idx] + 0.3f * atr;
-		DrawMarker(sc, g.lineArrow, g.idx, ay, g.dir > 0 ? MARKER_ARROWUP : MARKER_ARROWDOWN, 10, g.dir > 0 ? cLong : cShort, 3);
-		const int e = Min(sc.ArraySize - 1 + 0, g.idx + lineBars);
-		DrawSegment(sc, g.lineEntry, g.idx, e, g.entry, cEntry, 1, LINESTYLE_SOLID);
-		DrawSegment(sc, g.lineStop, g.idx, e, g.stop, cStop, 1, LINESTYLE_DASH);
-		DrawSegment(sc, g.lineT1, g.idx, e, g.t1, cTgt, 1, LINESTYLE_DOT);
-		DrawSegment(sc, g.lineT2, g.idx, e, g.t2, cTgt, 1, LINESTYLE_DOT);
-		DrawLabel(sc, g.lineText, g.idx, g.dir > 0 ? g.stop : g.t1, g.label, cLabel, 8, true);
-	}
-	// alert only for a signal on the newest closed bar, only in real time
 	if (sc.Input[DI_ALERTS].GetYesNo() && total > 0 && !sc.IsFullRecalculation && sc.DownloadingHistoricalData == 0 && !sc.IsReplayRunning())
 	{
 		const Signal& g = DW.signals[total - 1];
-		if (g.idx == sc.ArraySize - 2 && DW.lastAlertIdx != g.idx)
+		if (g.idx == sc.ArraySize - 2 && DW.lastAlertIdx != g.idx && g.grade <= S.params.dcs.alertMinGrade)
 		{
 			DW.lastAlertIdx = g.idx;
 			SCString msg; msg.Format("NQ Edge %s @ %s stop %s T1 %s T2 %s", g.label, sc.FormatGraphValue(g.entry, sc.BaseGraphValueFormat).GetChars(),
@@ -3666,16 +3935,16 @@ SCSFExport scsf_NQEdge_Validation(SCStudyInterfaceRef sc)
 	if (sc.SetDefaults)
 	{
 		sc.GraphName = "NQ Edge: Signal Validation";
-		sc.StudyDescription = "Replays every DCS signal forward on closed bars (1-tick slippage, stop-first) and reports per-setup count, win %, average R, profit factor, T2 %, MFE/MAE to the HUD.";
-		sc.GraphRegion = 4; sc.AutoLoop = 0; sc.CalculationPrecedence = VERY_LOW_PREC_LEVEL; sc.ValueFormat = 2; sc.DrawZeros = 1;
-		sc.Subgraph[VLS_CUMR].Name = "Cumulative R"; sc.Subgraph[VLS_CUMR].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[VLS_CUMR].PrimaryColor = RGB(0, 200, 255); sc.Subgraph[VLS_CUMR].LineWidth = 2;
-		sc.Subgraph[VLS_RESULT].Name = "Signal Result (R)"; sc.Subgraph[VLS_RESULT].DrawStyle = DRAWSTYLE_POINT; sc.Subgraph[VLS_RESULT].PrimaryColor = RGB(255, 255, 255); sc.Subgraph[VLS_RESULT].LineWidth = 4; sc.Subgraph[VLS_RESULT].DrawZeros = 0;
+		sc.StudyDescription = "Replays every DCS signal forward on closed bars (1-tick slippage, stop-first) and reports outcomes by setup, regime and grade to the HUD and projection arrow. The cumulative-R curve appears only in the diagnostic region.";
+		sc.GraphRegion = 0; sc.AutoLoop = 0; sc.CalculationPrecedence = VERY_LOW_PREC_LEVEL; sc.ValueFormat = 2; sc.DrawZeros = 1;
+		sc.Subgraph[VLS_CUMR].Name = "Cumulative R"; sc.Subgraph[VLS_CUMR].DrawStyle = DRAWSTYLE_IGNORE; sc.Subgraph[VLS_CUMR].PrimaryColor = RGB(62, 198, 255); sc.Subgraph[VLS_CUMR].LineWidth = 2;
+		sc.Subgraph[VLS_RESULT].Name = "Signal Result (R)"; sc.Subgraph[VLS_RESULT].DrawStyle = DRAWSTYLE_IGNORE; sc.Subgraph[VLS_RESULT].PrimaryColor = RGB(255, 255, 255); sc.Subgraph[VLS_RESULT].LineWidth = 4; sc.Subgraph[VLS_RESULT].DrawZeros = 0;
 		NQE_INT_INPUT(VLI_SLIP, "Slippage Ticks (entry and stop)", 1, 0, 20);
 		NQE_INT_INPUT(VLI_MAXBARS, "Max Bars To Resolution", 120, 5, 2000);
 		NQE_YESNO_INPUT(VLI_STOPFIRST, "Assume Stop First When Bar Hits Both", 1);
 		NQE_INT_INPUT(VLI_MINSAMPLE, "Min Sample Size (warn below)", 30, 1, 1000);
-		NQE_COLOR_INPUT(VLI_C_CURVE, "Color: Cumulative R", 0, 200, 255);
-		NQE_COLOR_INPUT(VLI_C_MARK, "Color: Result Marker", 255, 255, 255);
+		NQE_COLOR_INPUT(VLI_C_CURVE, "Color: Cumulative R (diagnostic)", 62, 198, 255);
+		NQE_COLOR_INPUT(VLI_C_MARK, "Color: Result Marker (diagnostic)", 255, 255, 255);
 		return;
 	}
 	if (sc.LastCallToFunction) { Release(sc, E_VAL); return; }
@@ -3686,6 +3955,9 @@ SCSFExport scsf_NQEdge_Validation(SCStudyInterfaceRef sc)
 	SetParams(S, E_VAL, S.params.val, vp);
 	CheckDataStamp(sc, S);
 	EnsureVal(sc, S);
+	const bool diag = S.vis.diagnostics;
+	sc.GraphRegion = diag ? kDiagRegionVal : 0;
+	sc.Subgraph[VLS_CUMR].DrawStyle = diag ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE; sc.Subgraph[VLS_RESULT].DrawStyle = diag ? DRAWSTYLE_POINT : DRAWSTYLE_IGNORE;
 	sc.Subgraph[VLS_CUMR].PrimaryColor = sc.Input[VLI_C_CURVE].GetColor(); sc.Subgraph[VLS_RESULT].PrimaryColor = sc.Input[VLI_C_MARK].GetColor();
 	int& gen = sc.GetPersistentInt(1);
 	int start = Min(sc.UpdateStartIndex, S.val.dirtyFrom); S.val.dirtyFrom = INT_MAX;
@@ -3707,7 +3979,7 @@ SCSFExport scsf_NQEdge_FeatureLogger(SCStudyInterfaceRef sc)
 	if (sc.SetDefaults)
 	{
 		sc.GraphName = "NQ Edge: Feature Logger";
-		sc.StudyDescription = "Writes one CSV row per closed bar (OHLCV, every engine feature, DCS, regime, setup flags, forward returns at +5/+15/+30/+60 min, MFE/MAE) to the Data folder for the Python research loop.";
+		sc.StudyDescription = "Writes one CSV row per closed bar (OHLCV, every engine feature, DCS, regime, setup flags + grade, forward returns at +5/+15/+30/+60 min, MFE/MAE) to the Data folder for the Python research loop.";
 		sc.GraphRegion = 0; sc.AutoLoop = 0; sc.CalculationPrecedence = VERY_LOW_PREC_LEVEL; sc.DrawZeros = 0;
 		sc.Subgraph[0].Name = "Rows Written"; sc.Subgraph[0].DrawStyle = DRAWSTYLE_IGNORE;
 		NQE_YESNO_INPUT(LI_ENABLED, "Logging Enabled", 1);
@@ -3728,69 +4000,186 @@ SCSFExport scsf_NQEdge_FeatureLogger(SCStudyInterfaceRef sc)
 	if (sc.ArraySize > 0) sc.Subgraph[0][sc.ArraySize - 1] = static_cast<float>(S.log.rowsWritten);
 }
 
-// --- 9. HUD + Bar Painter -----------------------------------------------------
+// --- 9. Terminal Overlay (HUD, levels, profile, signals, projection, footprint, candles) ----
 SCSFExport scsf_NQEdge_HUD(SCStudyInterfaceRef sc)
 {
 	if (sc.SetDefaults)
 	{
-		sc.GraphName = "NQ Edge: HUD + Bar Painter";
-		sc.StudyDescription = "Heads-up panel (bias, DCS, regime, MTF strip, intermarket, order flow, nearest levels, plain-English state, live stats, warnings) and DCS bar painting.";
+		sc.GraphName = "NQ Edge: Terminal Overlay";
+		sc.StudyDescription = "Draws every visual layer above the candles for the visible bars only: conviction candles, DCS ribbon, level rays with right-edge pills, docked volume profile, zones, bubbles, swing-delta labels, regression channel, signal cards + R/R boxes, event notes, projection arrow, HUD glass panel, footprint cells. Owns the preset, theme and layer switches for the whole suite.";
 		sc.GraphRegion = 0; sc.AutoLoop = 0; sc.CalculationPrecedence = VERY_LOW_PREC_LEVEL; sc.ValueFormat = VALUEFORMAT_INHERITED; sc.ScaleRangeType = SCALE_SAMEASREGION; sc.DrawZeros = 0;
-		sc.Subgraph[0].Name = "DCS Bar Paint"; sc.Subgraph[0].DrawStyle = DRAWSTYLE_COLOR_BAR; sc.Subgraph[0].PrimaryColor = RGB(128, 128, 128); sc.Subgraph[0].DrawZeros = 0;
-		sc.Input[HI_POSITION].Name = "HUD Position"; sc.Input[HI_POSITION].SetCustomInputStrings("Top Left;Top Right;Bottom Left;Bottom Right"); sc.Input[HI_POSITION].SetCustomInputIndex(0);
-		sc.Input[HI_PRESET].Name = "Preset"; sc.Input[HI_PRESET].SetCustomInputStrings("Minimal;Full"); sc.Input[HI_PRESET].SetCustomInputIndex(1);
-		NQE_INT_INPUT(HI_FONT, "Font Size (pt)", 11, 7, 24);
-		NQE_INT_INPUT(HI_WIDTH, "Panel Width (px)", 360, 200, 1200);
-		NQE_INT_INPUT(HI_OPACITY, "Panel Opacity %", 80, 0, 100);
-		NQE_YESNO_INPUT(HI_PAINT, "Paint Price Bars By DCS State", 1);
-		NQE_YESNO_INPUT(HI_SHOW_WARN, "Show Warnings", 1);
-		NQE_YESNO_INPUT(HI_SHOW_STATS, "Show Signal Stats", 1);
-		NQE_YESNO_INPUT(HI_SHOW_INTER, "Show Intermarket Row", 1);
-		NQE_YESNO_INPUT(HI_SHOW_FLOW, "Show Order Flow Row", 1);
-		NQE_YESNO_INPUT(HI_SHOW_LEVELS, "Show Nearest Levels Row", 1);
-		NQE_COLOR_INPUT(HI_C_BG, "Color: Panel Background", 12, 14, 18);
-		NQE_COLOR_INPUT(HI_C_TEXT, "Color: Text", 220, 220, 220);
-		NQE_COLOR_INPUT(HI_C_BULL, "Color: Bull", 0, 220, 110);
-		NQE_COLOR_INPUT(HI_C_BEAR, "Color: Bear", 240, 70, 70);
-		NQE_COLOR_INPUT(HI_C_NEUTRAL, "Color: Neutral", 150, 150, 150);
-		NQE_COLOR_INPUT(HI_C_LEVEL, "Color: Levels (cyan)", 0, 200, 255);
-		NQE_COLOR_INPUT(HI_C_VWAP, "Color: VWAP/State (gold)", 255, 215, 0);
-		NQE_COLOR_INPUT(HI_C_WARN, "Color: Warning", 255, 170, 0);
-		NQE_COLOR_INPUT(HI_C_STRONG_BULL, "Bar Color: Strong Bull", 0, 230, 120);
-		NQE_COLOR_INPUT(HI_C_WEAK_BULL, "Bar Color: Weak Bull", 0, 140, 80);
-		NQE_COLOR_INPUT(HI_C_NEUTRAL_BAR, "Bar Color: Neutral", 120, 120, 120);
-		NQE_COLOR_INPUT(HI_C_WEAK_BEAR, "Bar Color: Weak Bear", 150, 60, 60);
-		NQE_COLOR_INPUT(HI_C_STRONG_BEAR, "Bar Color: Strong Bear", 240, 60, 60);
+		sc.Subgraph[0].Name = "Conviction Body"; sc.Subgraph[0].DrawStyle = DRAWSTYLE_COLOR_BAR_CANDLE_FILL; sc.Subgraph[0].PrimaryColor = RGB(128, 128, 128); sc.Subgraph[0].DrawZeros = 0;
+		sc.Subgraph[1].Name = "Forming Bar (hollow)"; sc.Subgraph[1].DrawStyle = DRAWSTYLE_COLOR_BAR_HOLLOW; sc.Subgraph[1].PrimaryColor = RGB(128, 128, 128); sc.Subgraph[1].DrawZeros = 0;
+		sc.Input[OI_PRESET].Name = "Preset"; sc.Input[OI_PRESET].SetCustomInputStrings("COMMAND;FOOTPRINT;CLEAN"); sc.Input[OI_PRESET].SetCustomInputIndex(0);
+		NQE_YESNO_INPUT(OI_DIAG, "Show Diagnostic Regions (CVD, intermarket, DCS histogram, cum. R)", 0);
+		NQE_INT_INPUT(OI_FONT, "Font Size (pt)", 10, 7, 20);
+		NQE_INT_INPUT(OI_PROFILE_W, "Docked Profile Width (% of fill space)", 45, 10, 90);
+		NQE_INT_INPUT(OI_HUD_OPACITY, "HUD Opacity %", 82, 20, 100);
+		NQE_INT_INPUT(OI_MAX_NOTES, "Max Event Notes Visible", 8, 0, 40);
+		sc.Input[OI_MIN_GRADE].Name = "Signals Shown: Minimum Grade"; sc.Input[OI_MIN_GRADE].SetCustomInputStrings("A only;A and B;All"); sc.Input[OI_MIN_GRADE].SetCustomInputIndex(1);
+		NQE_YESNO_INPUT(OI_APPLY_THEME, "Apply Terminal Theme To Chart Colors (once)", 0);
+		NQE_YESNO_INPUT(OI_SHOW_STATS, "HUD: Setup Scoreboard", 1);
+		NQE_YESNO_INPUT(OI_SHOW_INTER, "HUD: Intermarket Row", 1);
+		NQE_YESNO_INPUT(OI_SHOW_FLOW, "HUD: Order Flow Row", 1);
+		NQE_YESNO_INPUT(OI_SHOW_LEVELS, "HUD: Levels + Day Stats Row", 1);
+		NQE_YESNO_INPUT(OI_SHOW_WARN, "HUD: Warnings", 1);
+		NQE_YESNO_INPUT(OI_SHOW_HEALTH, "HUD: Health Row", 1);
+		for (int k = 0; k < L_COUNT; ++k)
+		{
+			SCString nm; nm.Format("Layer: %s", kLayerNames[k]);
+			sc.Input[OI_LAYER0 + k].Name = nm; sc.Input[OI_LAYER0 + k].SetCustomInputStrings("Preset default;On;Off"); sc.Input[OI_LAYER0 + k].SetCustomInputIndex(0);
+		}
+		NQE_COLOR_INPUT(OI_C_BG, "Theme: Background", 11, 14, 20);
+		NQE_COLOR_INPUT(OI_C_GRID, "Theme: Grid", 22, 27, 38);
+		NQE_COLOR_INPUT(OI_C_BULL, "Theme: Bull", 0, 200, 150);
+		NQE_COLOR_INPUT(OI_C_BEAR, "Theme: Bear", 255, 77, 94);
+		NQE_COLOR_INPUT(OI_C_NEUTRAL, "Theme: Neutral", 138, 147, 166);
+		NQE_COLOR_INPUT(OI_C_GOLD, "Theme: VWAP Gold", 255, 200, 87);
+		NQE_COLOR_INPUT(OI_C_CYAN, "Theme: Levels Cyan", 62, 198, 255);
+		NQE_COLOR_INPUT(OI_C_MAGENTA, "Theme: Naked POC Magenta", 214, 93, 255);
+		NQE_COLOR_INPUT(OI_C_TEXT, "Theme: Text", 230, 234, 242);
+		NQE_COLOR_INPUT(OI_C_DIM, "Theme: Dim Text", 92, 101, 119);
+		NQE_COLOR_INPUT(OI_C_PANEL, "Theme: Panel", 14, 18, 26);
+		NQE_COLOR_INPUT(OI_C_TINT_UP, "Theme: Trend Up Tint", 0, 200, 150);
+		NQE_COLOR_INPUT(OI_C_TINT_DN, "Theme: Trend Down Tint", 255, 77, 94);
+		NQE_COLOR_INPUT(OI_C_TINT_BAL, "Theme: Balance Tint", 62, 198, 255);
+		NQE_COLOR_INPUT(OI_C_TINT_CHOP, "Theme: Chop Tint", 255, 200, 87);
+		NQE_COLOR_INPUT(OI_C_STRONG_BULL, "Candle: Strong Bull", 0, 200, 150);
+		NQE_COLOR_INPUT(OI_C_WEAK_BULL, "Candle: Weak Bull", 0, 120, 95);
+		NQE_COLOR_INPUT(OI_C_NEUTRAL_BAR, "Candle: Neutral", 90, 97, 112);
+		NQE_COLOR_INPUT(OI_C_WEAK_BEAR, "Candle: Weak Bear", 150, 55, 65);
+		NQE_COLOR_INPUT(OI_C_STRONG_BEAR, "Candle: Strong Bear", 255, 77, 94);
 		return;
 	}
-	sc.p_GDIFunction = DrawHUD;   // set after SetDefaults so a reloaded DLL re-registers the pointer
+	sc.p_GDIFunction = DrawOverlay;   // set after SetDefaults so a reloaded DLL re-registers the pointer
 	if (sc.LastCallToFunction) { Release(sc, -1); return; }
 	std::lock_guard<std::recursive_mutex> lock(g_mutex);
 	ChartState& S = Acquire(sc);
 	++S.hudUpdates;
+
+	// ---- publish the visual configuration (preset + layer overrides + theme) ----
+	VisualConfig& V = S.vis;
+	V.preset = Clamp(static_cast<int>(sc.Input[OI_PRESET].GetIndex()), 0, 2);
+	for (int k = 0; k < L_COUNT; ++k)
+	{
+		const int tri = sc.Input[OI_LAYER0 + k].GetIndex();
+		V.layer[k] = tri == 1 ? true : (tri == 2 ? false : kPresetLayers[V.preset][k] != 0);
+	}
+	V.diagnostics = sc.Input[OI_DIAG].GetYesNo() != 0;
+	V.fontPt = sc.Input[OI_FONT].GetInt(); V.profileWidthPct = sc.Input[OI_PROFILE_W].GetInt(); V.hudOpacity = sc.Input[OI_HUD_OPACITY].GetInt();
+	V.maxNotes = sc.Input[OI_MAX_NOTES].GetInt(); V.minGrade = sc.Input[OI_MIN_GRADE].GetIndex() + 1; V.tapeRows = 63;
+	Theme& T = V.theme;
+	T.bg = sc.Input[OI_C_BG].GetColor(); T.grid = sc.Input[OI_C_GRID].GetColor(); T.bull = sc.Input[OI_C_BULL].GetColor(); T.bear = sc.Input[OI_C_BEAR].GetColor(); T.neutral = sc.Input[OI_C_NEUTRAL].GetColor();
+	T.gold = sc.Input[OI_C_GOLD].GetColor(); T.cyan = sc.Input[OI_C_CYAN].GetColor(); T.magenta = sc.Input[OI_C_MAGENTA].GetColor(); T.text = sc.Input[OI_C_TEXT].GetColor(); T.dim = sc.Input[OI_C_DIM].GetColor(); T.panel = sc.Input[OI_C_PANEL].GetColor();
+	T.tintUp = sc.Input[OI_C_TINT_UP].GetColor(); T.tintDown = sc.Input[OI_C_TINT_DN].GetColor(); T.tintBalance = sc.Input[OI_C_TINT_BAL].GetColor(); T.tintChop = sc.Input[OI_C_TINT_CHOP].GetColor();
+
+	// optional one-time chart colour application (Global Settings >> Graphics Settings equivalent, per chart)
+	int& themeApplied = sc.GetPersistentInt(2);
+	if (sc.Input[OI_APPLY_THEME].GetYesNo() && themeApplied == 0 && sc.Internal_SetGraphicsSetting != nullptr)
+	{
+		if (sc.SetUseGlobalGraphicsSettings != nullptr) sc.SetUseGlobalGraphicsSettings(sc.ChartNumber, 0);
+		sc.SetGraphicsSetting(sc.ChartNumber, n_ACSIL::GRAPHICS_SETTING_CHART_BACKGROUND, T.bg);
+		sc.SetGraphicsSetting(sc.ChartNumber, n_ACSIL::GRAPHICS_SETTING_CHART_GRID, T.grid);
+		sc.SetGraphicsSetting(sc.ChartNumber, n_ACSIL::GRAPHICS_SETTING_CHART_GRID_SECONDARY, T.grid);
+		sc.SetGraphicsSetting(sc.ChartNumber, n_ACSIL::GRAPHICS_SETTING_CHART_TEXT, T.text);
+		sc.SetGraphicsSetting(sc.ChartNumber, n_ACSIL::GRAPHICS_SETTING_CANDLESTICK_UP_OUTLINE, T.neutral);
+		sc.SetGraphicsSetting(sc.ChartNumber, n_ACSIL::GRAPHICS_SETTING_CANDLESTICK_DOWN_OUTLINE, T.neutral);
+		sc.SetGraphicsSetting(sc.ChartNumber, n_ACSIL::GRAPHICS_SETTING_CANDLESTICK_UP_FILL, T.bull);
+		sc.SetGraphicsSetting(sc.ChartNumber, n_ACSIL::GRAPHICS_SETTING_CANDLESTICK_DOWN_FILL, T.bear);
+		sc.SetGraphicsSetting(sc.ChartNumber, n_ACSIL::GRAPHICS_SETTING_BAR_HIGH_LOW_UP, T.neutral);
+		sc.SetGraphicsSetting(sc.ChartNumber, n_ACSIL::GRAPHICS_SETTING_BAR_HIGH_LOW_DOWN, T.neutral);
+		themeApplied = 1;
+		sc.AddMessageToLog("NQ Edge: terminal theme applied to this chart's Graphics Settings", 0);
+	}
+	if (!sc.Input[OI_APPLY_THEME].GetYesNo()) themeApplied = 0;
+
 	CheckDataStamp(sc, S);
 	CheckWarnings(sc, S);
 	{
 		LARGE_INTEGER f0, t0, t1; QueryPerformanceFrequency(&f0); QueryPerformanceCounter(&t0);
-		EnsureLog(sc, S);          // pulls the full chain
+		EnsureLog(sc, S);          // pulls the full engine chain
 		QueryPerformanceCounter(&t1);
 		const double ms = f0.QuadPart > 0 ? 1000.0 * static_cast<double>(t1.QuadPart - t0.QuadPart) / static_cast<double>(f0.QuadPart) : 0.0;
 		S.hud.updateMs = ms; if (sc.UpdateStartIndex > 0) S.hud.maxUpdateMs = Max(S.hud.maxUpdateMs, ms); S.hud.fullCalcMs = sc.LastFullCalculationTimeInMicroseconds / 1000; S.hud.bars = sc.ArraySize;
 	}
 	BuildHudSnapshot(sc, S);
 
-	const bool paint = sc.Input[HI_PAINT].GetYesNo() != 0;
-	sc.Subgraph[0].DrawStyle = paint ? DRAWSTYLE_COLOR_BAR : DRAWSTYLE_IGNORE;
-	const uint32_t cols[5] = { sc.Input[HI_C_STRONG_BEAR].GetColor(), sc.Input[HI_C_WEAK_BEAR].GetColor(), sc.Input[HI_C_NEUTRAL_BAR].GetColor(), sc.Input[HI_C_WEAK_BULL].GetColor(), sc.Input[HI_C_STRONG_BULL].GetColor() };
+	// ---- conviction candles: body colour by DCS state (closed bars), hollow forming bar ----
+	const bool paint = V.layer[L_CANDLES];
+	sc.Subgraph[0].DrawStyle = paint ? DRAWSTYLE_COLOR_BAR_CANDLE_FILL : DRAWSTYLE_IGNORE;
+	sc.Subgraph[1].DrawStyle = paint ? DRAWSTYLE_COLOR_BAR_HOLLOW : DRAWSTYLE_IGNORE;
+	const uint32_t cols[5] = { sc.Input[OI_C_STRONG_BEAR].GetColor(), sc.Input[OI_C_WEAK_BEAR].GetColor(), sc.Input[OI_C_NEUTRAL_BAR].GetColor(), sc.Input[OI_C_WEAK_BULL].GetColor(), sc.Input[OI_C_STRONG_BULL].GetColor() };
 	int& gen = sc.GetPersistentInt(1);
 	int start = sc.UpdateStartIndex;
 	if (gen != S.dcs.generation) { start = 0; gen = S.dcs.generation; }
-	for (int i = start; i < sc.ArraySize; ++i)
+	if (start < 0) start = 0;
+	for (int i = Max(0, start - 1); i < sc.ArraySize; ++i)
 	{
 		const int st = Clamp(static_cast<int>(S.dcs.barState[i]) + 2, 0, 4);
-		sc.Subgraph[0][i] = paint ? 1.0f : 0.0f;
-		uint32_t c = cols[st];
-		if (i == sc.ArraySize - 1) c = sc.RGBInterpolate(c, RGB(0, 0, 0), 0.45f);   // forming bar: provisional, drawn dim
-		sc.Subgraph[0].DataColor[i] = c;
+		const bool forming = (i == sc.ArraySize - 1);
+		sc.Subgraph[0][i] = (paint && !forming) ? 1.0f : 0.0f;
+		sc.Subgraph[0].DataColor[i] = cols[st];
+		sc.Subgraph[1][i] = (paint && forming) ? 1.0f : 0.0f;
+		sc.Subgraph[1].DataColor[i] = cols[st];
+	}
+}
+
+// --- 10. Terminal Backdrop (drawn underneath the candles) ----------------------
+SCSFExport scsf_NQEdge_Backdrop(SCStudyInterfaceRef sc)
+{
+	if (sc.SetDefaults)
+	{
+		sc.GraphName = "NQ Edge: Terminal Backdrop";
+		sc.StudyDescription = "Drawn underneath the price bars: regime tint, RTH/ETH session shade, session separators (RTH open, IB end, close) and the translucent VWAP cloud. Layer switches and colours live on the Terminal Overlay study.";
+		sc.GraphRegion = 0; sc.AutoLoop = 0; sc.CalculationPrecedence = VERY_LOW_PREC_LEVEL; sc.ValueFormat = VALUEFORMAT_INHERITED; sc.ScaleRangeType = SCALE_SAMEASREGION; sc.DrawZeros = 0;
+		sc.DrawStudyUnderneathMainPriceGraph = 1;
+		sc.Subgraph[0].Name = "Backdrop"; sc.Subgraph[0].DrawStyle = DRAWSTYLE_IGNORE;
+		return;
+	}
+	sc.p_GDIFunction = DrawBackdropGDI;
+	if (sc.LastCallToFunction) { Release(sc, -1); return; }
+	std::lock_guard<std::recursive_mutex> lock(g_mutex);
+	ChartState& S = Acquire(sc);
+	CheckDataStamp(sc, S);
+	EnsureVwap(sc, S);          // cloud + separators need VWAP/auction/base; regime tint needs the regime engine
+	EnsureRegime(sc, S);
+}
+
+// --- 11. Order-Flow Tape (bottom strip) ---------------------------------------
+enum TapeInput { TI_HEIGHT = 0, TI_R_DELTA, TI_R_VOL, TI_R_DPCT, TI_R_CVD, TI_R_IMB, TI_R_DCS, TI_COUNT };
+
+SCSFExport scsf_NQEdge_Tape(SCStudyInterfaceRef sc)
+{
+	if (sc.SetDefaults)
+	{
+		sc.GraphName = "NQ Edge: Order-Flow Tape";
+		sc.StudyDescription = "Bottom strip: colour-scaled table under each visible bar (Delta, Volume, Delta %, CVD change, Imbalances, DCS). Cell colour intensity = magnitude. Sets its own region height.";
+		sc.GraphRegion = 1; sc.AutoLoop = 0; sc.CalculationPrecedence = VERY_LOW_PREC_LEVEL; sc.ValueFormat = 0; sc.DrawZeros = 0; sc.ScaleRangeType = SCALE_INDEPENDENT;
+		sc.Subgraph[0].Name = "Tape"; sc.Subgraph[0].DrawStyle = DRAWSTYLE_IGNORE;
+		NQE_INT_INPUT(TI_HEIGHT, "Strip Height (% of chart)", 13, 4, 40);
+		NQE_YESNO_INPUT(TI_R_DELTA, "Row: Delta", 1);
+		NQE_YESNO_INPUT(TI_R_VOL, "Row: Volume", 1);
+		NQE_YESNO_INPUT(TI_R_DPCT, "Row: Delta %", 1);
+		NQE_YESNO_INPUT(TI_R_CVD, "Row: CVD Change", 1);
+		NQE_YESNO_INPUT(TI_R_IMB, "Row: Imbalances", 1);
+		NQE_YESNO_INPUT(TI_R_DCS, "Row: DCS", 1);
+		return;
+	}
+	sc.p_GDIFunction = DrawTapeGDI;
+	if (sc.LastCallToFunction) { Release(sc, -1); return; }
+	std::lock_guard<std::recursive_mutex> lock(g_mutex);
+	ChartState& S = Acquire(sc);
+	CheckDataStamp(sc, S);
+	EnsureDcs(sc, S);
+	int mask = 0;
+	for (int r = 0; r < 6; ++r) if (sc.Input[TI_R_DELTA + r].GetYesNo()) mask |= (1 << r);
+	S.vis.tapeRows = mask;
+	// region height: apply when the input (or preset) changes; CLEAN collapses the strip
+	const int wanted = S.vis.layer[L_TAPE] ? sc.Input[TI_HEIGHT].GetInt() : 3;
+	int& applied = sc.GetPersistentInt(3);
+	if (applied != wanted && sc.SetGraphRegionHeightPercentage != nullptr)
+	{
+		sc.SetGraphRegionHeightPercentage(sc.ChartNumber, sc.GraphRegion, static_cast<double>(wanted));
+		applied = wanted;
 	}
 }

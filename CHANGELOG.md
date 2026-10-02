@@ -46,3 +46,11 @@
 - HUD: "Add study: …" warnings for missing engine studies (after the first full update), time-zone check against Sierra's POSIX string, performance line (update ms, max, last full recalculation, bar count) in the Full preset.
 - Registry freed at DLL unload; validation no longer blocks on the first pending signal; logger append mode never truncates and skips rows already written; DCS threshold inputs default to 0 = taken from the weights file (an explicit value overrides).
 - Docs: `docs/SETUP.md`, `sierra/chartbooks/README.md`, `sierra/studycollections/README.md`, decisions 14–25, CLAUDE.md contributor notes.
+
+## v2 Phase 1–2 — Terminal layout, renderer, theme, candles, cloud, backdrop
+- New GDI renderer (`nqe::render::Frame`): visible-bar geometry, fill-space detection, transparent fills (`FillRectangleWithColorTransparent`, opaque blend fallback), fonts, pills, arrows; per-paint frame time.
+- Three terminal studies: **Terminal Overlay** (above the candles: DCS ribbon, HUD glass panel in the future space, conviction candles; owns preset/theme/layer switches), **Terminal Backdrop** (under the candles: regime tint, RTH/ETH shade, RTH open / IB end / close separators, translucent VWAP cloud tinted by slope), **Order-Flow Tape** (bottom strip table: Delta, Volume, Delta %, CVD change, Imbalances, DCS; sets its own region height).
+- Presets COMMAND / FOOTPRINT / CLEAN with per-layer "Preset default / On / Off" overrides; "Show Diagnostic Regions" (default off) moves the CVD, intermarket, DCS histogram and cumulative-R plots into their own regions; by default every engine lives in the price region.
+- Conviction candles: body fill by DCS state (`DRAWSTYLE_COLOR_BAR_CANDLE_FILL`), hollow forming bar; optional one-time application of the terminal palette to the chart's Graphics Settings.
+- HUD moved into the fill space (auto-sizes, compact when the space is small): bias badge, gauge, 30-bar sparkline, regime/open/value row, MTF strip, intermarket dots with arrows, order-flow row with event age, levels row, plan line (wrapped), stats, health row, warnings.
+- Removed all `sc.UseTool` drawings (naked POC rays, zones, bubbles, markers, signal lines); these become renderer layers.
