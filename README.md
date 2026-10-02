@@ -7,5 +7,6 @@ a heads-up display, and a Python research loop that learns the weights.
 
 * Build: `scripts\check.ps1` (local syntax check) then Sierra Chart **Analysis >> Build Custom Studies DLL >> Remote Build**.
 * Install: `scripts\deploy.ps1`.
-* Docs: `docs/SETUP.md` (first-time setup), `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`, `CLAUDE.md`.
+* Docs: `docs/SETUP.md` (first-time setup), `docs/COCKPIT.md` (the full multi-chart layout and how to trade it),
+  `docs/VISUAL_GUIDE.md`, `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`, `CLAUDE.md`.
 * Research: `research/README.md`.

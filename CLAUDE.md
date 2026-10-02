@@ -50,7 +50,7 @@ projection, footprint/depth, signal-power features) are implemented — see CHAN
 built and run in Sierra by the user; v2 is syntax-checked only. `docs/DECISIONS.md` 26–34 list the
 v2 API details to confirm on the first Remote Build. `docs/VISUAL_GUIDE.md` explains every visual.
 
-## v4.3 (current): one study, PRO preset, Flow series
+## v4.4 (current): one study, PRO preset, Flow series, cockpit
 `scsf_NQEdge_Terminal` is the only study the trader adds. It sets every engine's parameters from its
 own inputs (`S.terminalPresent` makes the engine studies passive) and draws with Sierra drawing
 objects managed by line number (`term::Slot*` helpers, `TermState` slots, `SlotFlush` each update,
@@ -63,7 +63,10 @@ The data stamp compares bar content (a closed bar's volume, the mid close) as we
 Terminal rebuilds all engines on a full recalculation. The trading day is derived from
 `BaseParams::dayStartSec` (input, 18:00), not from Sierra's trading-day date. Section `// --- 10.`
 holds the Flow series (`scsf_NQEdge_FlowCandles`, `FlowCVD`, `FlowDelta`): subgraph-only studies for
-companion charts that share the engines; Flow Candles sets parameters only when the Terminal is absent. The v2 GDI overlay/backdrop/tape studies were
+companion charts that share the engines; Flow Candles sets parameters only when the Terminal is absent. v4.4: `HudSnapshot::action/actionKind`
+(derived from the newest unresolved signal or the plan), internals line (ES/YM/RTY/TICK/mega caps), position
+and daily-risk guard from `sc.GetTradePosition` (`limitHit` suppresses alerts), `TL_KEYTIMES` vertical lines,
+`LVL_PWH/LVL_PWL`. `docs/COCKPIT.md` is the multi-chart layout recipe. The v2 GDI overlay/backdrop/tape studies were
 removed; `render::Frame`, `DrawProfile` and `DrawTape` remain. New Terminal layer: add a `TL_*` entry,
 its name in `kTermLayerNames`, both `kTermPreset` rows, slots in `TermState`, and a draw block that
 either redraws (when `heavy`) or `SlotKeep`s.

@@ -243,3 +243,20 @@ cover the profile, which is harmless); `ChartBarSpacing` being in pixels.
 
 Unverified without a Sierra build: `DRAWSTYLE_VALUE_ON_HIGH/LOW` honour per-bar `DataColor` (otherwise delta numbers are a
 single colour); `DRAWSTYLE_RIGHT/LEFT_PRICE_BAR_DASH` draw at the subgraph value (used for the imbalance zone price).
+
+## v4.4 decisions
+
+68. **The action pill is derived, never a new signal.** It restates the newest unresolved signal (BUY/SELL NOW on its bar,
+    IN TRADE afterwards with the live R multiple) or the plan line (WAIT), so it can never disagree with the arrows and
+    boxes. "Live" now means `resolved == 0` within the validation timeout, so a stopped-out signal stops being shown as a
+    trade on the next closed bar.
+69. **Daily risk guard reads `sc.GetTradePosition`** (works in Trade Simulation Mode and live). Limit = daily P&L plus
+    open P&L at or below −limit, or `TotalTrades` at or above the maximum. *Unverified:* whether `TotalTrades` counts
+    today's closed trades (Sierra's field comment says "total trades"); if it is cumulative, set the max to 0 and rely on
+    the dollar limit. A breached guard suppresses signal alerts but still draws the signals.
+70. **Prior-week levels** use a Sunday-based week key of the trading-day date, committed on closed bars like the daily
+    range; they carry the same grading weight as PDH/PDL and appear in every setup's reference-level list.
+71. **Key-time lines are `DRAWING_VERTICALLINE` objects** at bar indexes (RTH open and close from `isRth` transitions,
+    IB end = open + IB minutes / bar seconds), kept for the last two sessions only; labels are relative-Y text at 99 %.
+72. **The cockpit is documented, not generated.** Chartbooks are binary; `docs/COCKPIT.md` is the exact recipe (which chart
+    carries which study, which chart numbers feed the Terminal, how to read and act on the HUD).

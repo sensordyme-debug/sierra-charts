@@ -172,3 +172,18 @@
   restarted the trading-day VWAP, the overnight range and the profiles mid-evening.
 - Health line shows the region height the GDI pass captured (`reg 1203px`) to diagnose HUD row pitch.
 - Docs: VISUAL_GUIDE (Flow series), SETUP §8, DECISIONS 64–67.
+
+## v4.4 — the cockpit: action pill, internals, position / daily-risk guard, key times, prior-week levels
+- **Action pill** (HUD line 2): `BUY NOW entry | stop | T1 | size`, `SELL NOW …`, `IN LONG +0.6R | stop | T1` (adds `trail to
+  entry` at +1R), `WAIT | <plan>`, `NO TRADE | volatile chop / warming up / daily limit hit`. The live signal is now the newest
+  unresolved one (validation decides), not "within five bars".
+- **Internals line** (PRO): relative-strength signs for ES / YM / RTY, NYSE TICK value, mega-cap leadership, lead / lag; a
+  prompt to set the chart numbers while none are configured.
+- **Position + daily risk** (PRO): Sierra's trade position (live or Trade Simulation Mode) — `LONG 2 @ 7776.25 | open $+45 |
+  day $-120 | limit $-500` or `FLAT | day … | trades n`. Inputs *Risk: Daily Loss Limit ($)* and *Max Trades Per Day*; when
+  breached the line and the action pill turn into `DAILY LIMIT HIT | stand down` and signal alerts are suppressed.
+- **Key Session Times** layer: dotted vertical lines with `OPEN`, `IB end`, `CLOSE` labels for the last two RTH sessions (on in
+  both presets).
+- **Prior-week high / low** (`PWH` / `PWL`) join the level set: pills, HUD R/S, setup reference levels and grading.
+- HUD is 15 lines in PRO, 8 in CLEAN. `docs/COCKPIT.md` describes the full multi-chart layout, inputs, how to read the HUD, the
+  trade from entry to exit, and the routine.

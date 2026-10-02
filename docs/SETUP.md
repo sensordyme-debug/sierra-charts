@@ -1,4 +1,4 @@
-# Setup (Sierra Chart) — v4.3: one study, PRO preset, Flow series for the other charts
+# Setup (Sierra Chart) — v4.4: one study, PRO preset, Flow series, cockpit
 
 ## 1. Settings the suite needs (the HUD's last line warns when they are wrong)
 
@@ -37,6 +37,8 @@ Then set, in the Terminal's inputs:
   the plan and the alert). It uses Sierra's currency value per tick for the symbol; if Sierra reports
   none, no size is shown.
 - *Signals Outside RTH* — *Grade A only* by default; *Off* to trade RTH only, *All* for testing overnight.
+- *Risk: Daily Loss Limit ($)* and *Max Trades Per Day* — the guard reads Sierra's trade position (Trade >>
+  Trade Simulation Mode On while learning); when breached the HUD says `DAILY LIMIT HIT` and alerts stop.
 - Optionally *Alert Sound Number*, *Signals Shown: Minimum Grade* (A and B by default), *Setup: Min /
   Max Stop (ATR)* and *Min R:R To T1*.
 
@@ -79,3 +81,10 @@ open their own regions). Flow Candles carries the session, swing and order-flow 
 the panels read the same engines. Do not add the diagnostic *Order Flow Engine* study to a chart that
 has Flow Candles (both set the flow parameters). On the main chart the Terminal owns the parameters and
 Flow Candles simply draws alongside it.
+
+## 9. The full cockpit
+
+`docs/COCKPIT.md` is the complete multi-chart layout: the execution chart, the 5-minute and 15-minute
+context charts with the Flow series, the ES / YM / RTY / TICK / mega-cap feed charts and the chart numbers
+that connect them, the inputs that matter, how to read the HUD top to bottom, and the trade from the
+signal bar to the exit.

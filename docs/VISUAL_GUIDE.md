@@ -1,4 +1,4 @@
-# NQ Edge Terminal — Visual guide (v4.3, PRO by default)
+# NQ Edge Terminal — Visual guide (v4.4, PRO by default)
 
 Palette: bull `#00C896` green, bear `#FF4D5E` red, neutral `#6E7686` gray, VWAP/fib gold `#FFC857`,
 levels cyan `#3EC6FF`, text `#E6EAF2`, dim `#788091`. Every colour is an input.
@@ -39,7 +39,8 @@ Reading from the candles outward:
   retracements of the last completed leg, each ending in a small gold pill (`61.8% 7731.75`) in the
   pill column. A fib tag is skipped where a level pill or the HUD already sits. (Layer *Fib Levels*.)
 - **Six thin cyan lines**: the three nearest levels above price and the three below (POC, VAH/VAL,
-  prior-day POC/VA/H/L/close, IB high/low, overnight H/L, naked POC, swings, liquidity, open). Each
+  prior-day POC/VA/H/L/close, prior-week high/low, IB high/low, overnight H/L, naked POC, swings,
+  liquidity, open). Each
   runs from where it was born to its pill. The **pills** are opaque cyan, right-aligned against the
   docked profile; a pill that would sit on top of another moves one column to the left. A level being
   tested turns solid with a white, bold pill. Equal prices share a pill.
@@ -70,30 +71,44 @@ Reading from the candles outward:
 - Along the **bottom 11 %** of the price region a colour-scaled table, one column per visible bar:
   Delta, Volume, Delta %, CVD change, Imbalances, DCS (the Sierra "calculated values" strip).
   (Layer *Calculated-Values Strip*.)
-- In the fill space, wherever it covers the fewest pills (top, bottom, or between two pills), twelve
+- In the fill space, wherever it covers the fewest pills (top, bottom, or between two pills), fifteen
   compact lines (≈ 48 characters, row height sized from the real region height), the **HUD**. When the
   fill space is too narrow for HUD + pills + profile, the HUD font drops one point, the profile
   narrows, and the last line says `Fill Space >= N` with the number of bars that would fit everything:
   1. A coloured **pill** `LONG` / `SHORT` / `NEUTRAL` + `DCS +62 ^` (score trend over five bars).
-  2. `TREND UP | Open-Drive up | value higher`, coloured by regime.
-  3. `Normal day | 5/6 groups agree | range 64% ADR` — day type, how many feature groups (trend,
+  2. The **action pill**, the one thing to do now: `BUY NOW 7776.25 | stop 7772.00 | T1 7784.25 | 3x`
+     (green) or `SELL NOW …` (red) on the bar an A/B setup closed; `IN LONG +0.6R | stop … | T1 …` while
+     the trade is open (adds `trail to entry` at +1R); `WAIT | Buy pullback to VWAP 7770.25` (gray) when
+     the bias exists but the location does not; `NO TRADE | volatile chop` or `NO TRADE | daily limit
+     hit` (dark red).
+  3. `TREND UP | Open-Drive up | value higher`, coloured by regime.
+  4. `Normal day | 5/6 groups agree | range 64% ADR` — day type, how many feature groups (trend,
      flow, reversal, location, intermarket, context) lean the same way as the score, and today's range
      against the average daily range (`prev RTH …` outside RTH).
-  4. The **plan** in gold: `Buy pullback to VWAP 7725.25` (or `LONG Trend Pullback B: entry 7726.00`).
-  5. Its second line: `trigger absorb/delta flip | invalid < 7718.00` (or `stop … | T1 … | R:R 2.3 | size 3x`).
-  6. `MTF 1m. 5m+ 15m- 60m+ | leg R2 0.71 | SMT-` (+ bullish, − bearish, = flat, . n/a).
-  7. `CVD ^ z+1.4 | delta +820 (+18%) | YM leads` — order flow and lead/lag.
-  8. `R VAH 7741.25 +12t | S VWAP 7725.25 -8t` — nearest structural levels (bands and zones are
-     drawn, not listed).
-  9. `last: 17:10 sell imb stack @ 7774.63 (1b)` — the newest event.
-  10. `Trend Pullback: 58% win | +0.42R | n=88` — scoreboard of the current setup.
-  11. `1h12m to close | bar 0:37 | MESZ26-CME` — session clock, bar countdown, symbol.
-  12. `VAP on | depth off | mkt 4/4 | 0.8 ms` — data health, or the first warning in gold.
+  5. The **plan** in gold: `Buy pullback to VWAP 7725.25` (or `LONG Trend Pullback B: entry 7726.00`).
+  6. Its second line: `trigger absorb/delta flip | invalid < 7718.00` (or `stop … | T1 … | R:R 2.3 | size 3x`).
+  7. `MTF 1m. 5m+ 15m- 60m+ | leg R2 0.71 | SMT-` (+ bullish, − bearish, = flat, . n/a).
+  8. `CVD ^ z+1.4 | delta +820 (+18%)` — order flow of the last closed bar.
+  9. `ES+ YM= RTY- | TICK +0.62 | AAPL+ NVDA+ MSFT- | YM leads` — the other feeds: relative strength
+     of NQ against each index, NYSE TICK, mega-cap leadership, which index leads. Until the chart numbers
+     are set it says so.
+  10. `R VAH 7741.25 +12t | S VWAP 7725.25 -8t` — nearest structural levels (bands and zones are
+      drawn, not listed).
+  11. `last: 17:10 sell imb stack @ 7774.63 (1b)` — the newest event.
+  12. `Trend Pullback: 58% win | +0.42R | n=88` — scoreboard of the current setup.
+  13. `LONG 2 @ 7776.25 | open $+45 | day $-120 | limit $-500` or `FLAT | day $+210 | trades 3 | limit
+      $-500` — Sierra's own position and daily P&L (live or Trade Simulation Mode). When the daily loss
+      limit or the trade count is breached this line becomes a red `DAILY LIMIT HIT | stand down` pill,
+      the action pill says `NO TRADE`, and alerts stop.
+  14. `1h12m to close | bar 0:37 | MESZ26-CME` — session clock, bar countdown, symbol.
+  15. `VAP on | depth off | mkt 8/8 | 0.8 ms | reg 1203px` — data health, or the first warning in gold.
+- Thin dotted **vertical lines** with `OPEN`, `IB end` and `CLOSE` labels at the top mark the last two
+  RTH sessions. (Layer *Key Session Times*.)
 
 ## What CLEAN looks like
 
 Bias candles, VWAP + dotted band, two nearest levels above and below with pills, A/B arrows + boxes,
-and a seven-line HUD (lines 1, 2, 4, 5, 6, 8 and 12 above). Nothing else.
+key session-time lines, and an eight-line HUD (lines 1, 2, 3, 5, 6, 7, 10 and 15 above). Nothing else.
 
 ## Hierarchy rules the renderer enforces
 
