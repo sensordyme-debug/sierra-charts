@@ -636,13 +636,13 @@ namespace nqe
 	struct DrawSlot { int line = 0; bool used = false; };
 	struct TermState
 	{
-		static const int HUD_SLOTS = 16, LVL_SLOTS = 6, SIG_SLOTS = 3, SWING_SLOTS = 24, ZONE_SLOTS = 8, BUBBLE_SLOTS = 30, NOTE_SLOTS = 12, PROJ_SLOTS = 3, FIB_SLOTS = 4, CHAN_SLOTS = 3, NUM_SLOTS = 60, KT_SLOTS = 12;
+		static const int HUD_SLOTS = 16, LVL_SLOTS = 6, SIG_SLOTS = 3, SWING_SLOTS = 24, ZONE_SLOTS = 8, BUBBLE_SLOTS = 30, NOTE_SLOTS = 12, PROJ_SLOTS = 3, FIB_SLOTS = 4, CHAN_SLOTS = 3, NUM_SLOTS = 60, KT_SLOTS = 12, TLN_SLOTS = 2, ABSB_SLOTS = 12;
 		struct SigDraw { DrawSlot risk, reward, t1, label; };
-		static const int SLOTS = HUD_SLOTS + 2 * LVL_SLOTS + 4 * SIG_SLOTS + SWING_SLOTS + ZONE_SLOTS + BUBBLE_SLOTS + NOTE_SLOTS + PROJ_SLOTS + 2 * FIB_SLOTS + CHAN_SLOTS + NUM_SLOTS + KT_SLOTS;
+		static const int SLOTS = HUD_SLOTS + 2 * LVL_SLOTS + 4 * SIG_SLOTS + SWING_SLOTS + ZONE_SLOTS + BUBBLE_SLOTS + NOTE_SLOTS + PROJ_SLOTS + 2 * FIB_SLOTS + CHAN_SLOTS + NUM_SLOTS + KT_SLOTS + TLN_SLOTS + ABSB_SLOTS;
 		union
 		{
 			DrawSlot all[SLOTS];
-			struct { DrawSlot hud[HUD_SLOTS]; DrawSlot lvlLine[LVL_SLOTS]; DrawSlot lvlTag[LVL_SLOTS]; SigDraw sig[SIG_SLOTS]; DrawSlot swing[SWING_SLOTS]; DrawSlot zone[ZONE_SLOTS]; DrawSlot bubble[BUBBLE_SLOTS]; DrawSlot note[NOTE_SLOTS]; DrawSlot proj[PROJ_SLOTS]; DrawSlot fibLine[FIB_SLOTS]; DrawSlot fibTag[FIB_SLOTS]; DrawSlot chan[CHAN_SLOTS]; DrawSlot num[NUM_SLOTS]; DrawSlot kt[KT_SLOTS]; };
+			struct { DrawSlot hud[HUD_SLOTS]; DrawSlot lvlLine[LVL_SLOTS]; DrawSlot lvlTag[LVL_SLOTS]; SigDraw sig[SIG_SLOTS]; DrawSlot swing[SWING_SLOTS]; DrawSlot zone[ZONE_SLOTS]; DrawSlot bubble[BUBBLE_SLOTS]; DrawSlot note[NOTE_SLOTS]; DrawSlot proj[PROJ_SLOTS]; DrawSlot fibLine[FIB_SLOTS]; DrawSlot fibTag[FIB_SLOTS]; DrawSlot chan[CHAN_SLOTS]; DrawSlot num[NUM_SLOTS]; DrawSlot kt[KT_SLOTS]; DrawSlot tl[TLN_SLOTS]; DrawSlot absb[ABSB_SLOTS]; };
 		};
 		int regionH = 0, regionW = 0;      // price-region pixel size, captured by the GDI pass
 		TermState() { for (int k = 0; k < SLOTS; ++k) { all[k].line = 0; all[k].used = false; } }
@@ -923,6 +923,41 @@ namespace nqe
 
 	// Rolling helpers over base arrays
 	inline float AtrAt(const ChartState& S, int i) { return (i >= 0 && i < static_cast<int>(S.base.atr.size())) ? S.base.atr[i] : S.tickSize * 10; }
+
+	// Trend line through two confirmed swings: the newest swing high (or low) and the most recent earlier one whose connecting
+	// line no bar high (low) in between cuts by more than 0.1 ATR. `broken` = a close beyond the line after the second pivot.
+	struct TrendLine
+	{
+		int i1 = -1, i2 = -1; float p1 = 0, p2 = 0; bool broken = false;
+		float Slope() const { return i2 > i1 ? (p2 - p1) / static_cast<float>(i2 - i1) : 0.0f; }
+		float At(int i) const { return p2 + Slope() * static_cast<float>(i - i2); }
+	};
+	inline bool FindTrendLine(SCStudyInterfaceRef sc, const ChartState& S, int lastClosed, bool highs, int maxSwings, TrendLine& out)
+	{
+		const AuctionState& A = S.auction; const float tol = 0.1f * AtrAt(S, lastClosed);
+		std::vector<int> idx;
+		for (int k = static_cast<int>(A.swings.size()) - 1; k >= 0 && static_cast<int>(idx.size()) < Max(2, maxSwings); --k)
+		{
+			const Swing& w = A.swings[k];
+			if (w.high != highs || w.confirmIdx > lastClosed || w.idx < 0 || w.idx > lastClosed) continue;
+			idx.push_back(k);
+		}
+		if (idx.size() < 2) return false;
+		const Swing& s2 = A.swings[idx[0]];
+		for (size_t q = 1; q < idx.size(); ++q)
+		{
+			const Swing& s1 = A.swings[idx[q]];
+			if (s2.idx - s1.idx < 3) continue;
+			const float slope = (s2.price - s1.price) / static_cast<float>(s2.idx - s1.idx);
+			bool ok = true;
+			for (int i = s1.idx + 1; i < s2.idx && ok; ++i) { const float lv = s1.price + slope * static_cast<float>(i - s1.idx); if (highs ? sc.High[i] > lv + tol : sc.Low[i] < lv - tol) ok = false; }
+			if (!ok) continue;
+			out.i1 = s1.idx; out.i2 = s2.idx; out.p1 = s1.price; out.p2 = s2.price; out.broken = false;
+			for (int i = s2.idx + 1; i <= lastClosed; ++i) { const float lv = out.At(i); if (highs ? sc.Close[i] > lv + tol : sc.Close[i] < lv - tol) { out.broken = true; break; } }
+			return true;
+		}
+		return false;
+	}
 
 	// ==== 5  Drawing helpers ====================================================
 
@@ -4263,12 +4298,12 @@ SCSFExport scsf_NQEdge_FeatureLogger(SCStudyInterfaceRef sc)
 // --- 9. NQ Edge Terminal: the one study ---------------------------------------
 // Draws only in the price region with Sierra-native objects managed by line number (deleted and
 // re-adjusted on every update). The docked profile and the calculated-values strip use GDI.
-enum TermLayer { TL_CANDLES = 0, TL_BAND, TL_LEVELS, TL_SIGNALS, TL_HUD, TL_PROFILE, TL_ZONES, TL_BUBBLES, TL_SWING, TL_NOTES, TL_PROJ, TL_TAPE, TL_FIB, TL_NUMBERS, TL_CHANNEL, TL_FOOTPRINT, TL_KEYTIMES, TL_COUNT };
-static const char* kTermLayerNames[TL_COUNT] = { "Bias Candles", "VWAP + 1 Sigma Band", "Nearest Levels (pills)", "Signal Arrows + Boxes", "HUD", "Volume Profile (docked right)", "Zones", "Order-Flow Bubbles", "Swing Delta Numbers", "Event Log + Markers", "Projection Arrow", "Calculated-Values Strip", "Fib Levels (last leg)", "Delta Per Bar", "Regression Channel", "Footprint Cells (bid x ask)", "Key Session Times (open / IB / close)" };
+enum TermLayer { TL_CANDLES = 0, TL_BAND, TL_LEVELS, TL_SIGNALS, TL_HUD, TL_PROFILE, TL_ZONES, TL_BUBBLES, TL_SWING, TL_NOTES, TL_PROJ, TL_TAPE, TL_FIB, TL_NUMBERS, TL_CHANNEL, TL_FOOTPRINT, TL_KEYTIMES, TL_TRENDLINES, TL_COUNT };
+static const char* kTermLayerNames[TL_COUNT] = { "Bias Candles", "VWAP + 1 Sigma Band", "Nearest Levels (pills)", "Signal Arrows + Boxes", "HUD", "Volume Profile (docked right)", "Zones", "Bubbles (large prints + absorption)", "Swing Delta Numbers", "Event Log + Markers", "Projection Arrow", "Calculated-Values Strip", "Fib Levels (last leg)", "Delta Per Bar", "Regression Channel", "Footprint Cells (bid x ask)", "Key Session Times (open / IB / close)", "Trend Lines (auto, from swings)" };
 static const unsigned char kTermPreset[2][TL_COUNT] =
 {
-	{ 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },   // CLEAN
-	{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 },   // PRO
+	{ 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1 },   // CLEAN
+	{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 },   // PRO
 };
 static const char* kOpenShort[8] = { "--", "Open-Drive up", "Open-Drive down", "Test-Drive up", "Test-Drive down", "Reject-Reverse up", "Reject-Reverse down", "Open-Auction" };
 enum TermInput
@@ -4278,7 +4313,7 @@ enum TermInput
 	TI_WEIGHTS, TI_THR, TI_STRONG, TI_WEAK, TI_S1, TI_S2, TI_S3, TI_S4, TI_S5, TI_MIN_GRADE, TI_ALERTS, TI_SOUND, TI_LOG, TI_VWAP_ANCHOR,
 	TI_RISK, TI_ETH, TI_MIN_STOP, TI_MAX_STOP, TI_MIN_RR, TI_DAY_LOSS, TI_MAX_TRADES,
 	TI_LAYER0,                                   // TL_COUNT tri-state inputs follow
-	TI_FONT = TI_LAYER0 + TL_COUNT, TI_NUM_BARS, TI_PROFILE_W, TI_BAND_STYLE, TI_BAND_ALPHA,
+	TI_FONT = TI_LAYER0 + TL_COUNT, TI_NUM_BARS, TI_PROFILE_W, TI_BAND_STYLE, TI_BAND_ALPHA, TI_TL_SWINGS,
 	TI_COL_BULL, TI_COL_BEAR, TI_COL_NEUTRAL, TI_COL_NEUTRAL_UP, TI_COL_VWAP, TI_COL_LEVEL, TI_COL_LONG, TI_COL_SHORT, TI_COL_TEXT, TI_COL_PANEL, TI_COL_DIM, TI_COUNT
 };
 enum TermSubgraph
@@ -4461,6 +4496,7 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 		NQE_INT_INPUT(TI_PROFILE_W, "Profile Width (% of fill space)", 25, 10, 60);
 		sc.Input[TI_BAND_STYLE].Name = "VWAP Band Style"; sc.Input[TI_BAND_STYLE].SetCustomInputStrings("Dotted lines;Filled;Off"); sc.Input[TI_BAND_STYLE].SetCustomInputIndex(0);
 		NQE_INT_INPUT(TI_BAND_ALPHA, "VWAP Band Fill Transparency %", 90, 50, 98);
+		NQE_INT_INPUT(TI_TL_SWINGS, "Trend Lines: Swings Scanned", 8, 2, 30);
 		NQE_COLOR_INPUT(TI_COL_BULL, "Color: Bull", 0, 200, 150);
 		NQE_COLOR_INPUT(TI_COL_BEAR, "Color: Bear", 255, 77, 94);
 		NQE_COLOR_INPUT(TI_COL_NEUTRAL, "Color: Neutral (down bar)", 110, 118, 134);
@@ -4817,6 +4853,29 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 			SlotMarker(sc, T.bubble[slot++], b.idx, b.price, MARKER_POINT, 4 + static_cast<int>(8.0 * sqrt(b.size / mx)), b.dir > 0 ? cBull : cBear);
 		}
 	}
+	// absorption bubbles: one per absorption bar at the absorbed price, sized by that bar's volume z-score
+	if (on[TL_BUBBLES] && !heavy) SlotKeep(T.absb, TermState::ABSB_SLOTS);
+	else if (on[TL_BUBBLES] && lastClosed >= 0)
+	{
+		int slot = 0;
+		for (int i = lastClosed; i >= Max(0, lastClosed - 150) && slot < TermState::ABSB_SLOTS; --i)
+		{
+			if (FL.absorbMark[i] == 0) continue;
+			const float price = FL.absorbMark[i] > 0 ? sc.Low[i] : sc.High[i];
+			if (fabs(price - close) > 3.0f * atr) continue;
+			const int size = 8 + 4 * Clamp(static_cast<int>(FL.volZ[i] - 1.0f), 0, 4);
+			SlotMarker(sc, T.absb[slot++], i, price, MARKER_POINT, size, FL.absorbMark[i] > 0 ? cBull : cBear);
+		}
+	}
+	// trend lines: resistance through the last two valid swing highs (red), support through swing lows (green); dotted once broken
+	if (on[TL_TRENDLINES] && !heavy) SlotKeep(T.tl, TermState::TLN_SLOTS);
+	else if (on[TL_TRENDLINES] && lastClosed > 10)
+	{
+		const int sw = sc.Input[TI_TL_SWINGS].GetInt();
+		TrendLine tl;
+		if (FindTrendLine(sc, S, lastClosed, true, sw, tl)) SlotLine(sc, T.tl[0], tl.i1, lineEnd, tl.p1, tl.At(lineEnd), cBear, 1, tl.broken ? LINESTYLE_DOT : LINESTYLE_SOLID);
+		if (FindTrendLine(sc, S, lastClosed, false, sw, tl)) SlotLine(sc, T.tl[1], tl.i1, lineEnd, tl.p1, tl.At(lineEnd), cBull, 1, tl.broken ? LINESTYLE_DOT : LINESTYLE_SOLID);
+	}
 	// event log: the last 6 distinct order-flow / structure events as a list at the end opposite the HUD, each with a dash marker at its price
 	const int LOGN = TermState::NOTE_SLOTS / 2;
 	if (on[TL_NOTES] && !heavy) SlotKeep(T.note, TermState::NOTE_SLOTS);
@@ -5038,13 +5097,14 @@ enum FlowCandleInput
 	FCI_RTH_START = 0, FCI_RTH_END, FCI_DAY_START, FCI_ATR_LEN, FCI_SWING_N, FCI_CVD_RESET, FCI_ABS_Z, FCI_IMB_RATIO, FCI_IMB_STACK, FCI_LT_PCT, FCI_LT_MIN,
 	FCI_COLOR_MODE, FCI_SHOW_ABS, FCI_SHOW_EXH, FCI_SHOW_TRAP, FCI_SHOW_DIV, FCI_SHOW_IMB, FCI_SHOW_POC, FCI_SHOW_BUBBLES, FCI_BUBBLE_BARS, FCI_SHOW_DELTA, FCI_SHOW_VOL,
 	FCI_ALERT, FCI_SOUND,
-	FCI_C_BULL, FCI_C_BEAR, FCI_C_NEU, FCI_C_GOLD, FCI_C_MAGENTA, FCI_C_DIM, FCI_COUNT
+	FCI_C_BULL, FCI_C_BEAR, FCI_C_NEU, FCI_C_GOLD, FCI_C_MAGENTA, FCI_C_DIM, FCI_SHOW_TL, FCI_TL_SWINGS, FCI_ABS_STYLE, FCI_COUNT
 };
 enum FlowCandleSubgraph
 {
 	FCS_CANDLE = 0, FCS_FORMING, FCS_ABS_BUY, FCS_ABS_SELL, FCS_EXH_TOP, FCS_EXH_BOT, FCS_TRAP_LONGS, FCS_TRAP_SHORTS, FCS_DIV_UP, FCS_DIV_DN,
 	FCS_IMB_BUY, FCS_IMB_SELL, FCS_POC, FCS_BUB_BUY_S, FCS_BUB_BUY_M, FCS_BUB_BUY_L, FCS_BUB_SELL_S, FCS_BUB_SELL_M, FCS_BUB_SELL_L,
-	FCS_DELTA_TXT, FCS_VOL_TXT, FCS_H_DELTA_PCT, FCS_H_VOLZ, FCS_H_CVD, FCS_COUNT
+	FCS_DELTA_TXT, FCS_VOL_TXT, FCS_H_DELTA_PCT, FCS_H_VOLZ, FCS_H_CVD,
+	FCS_TL_RES, FCS_TL_SUP, FCS_ABSB_BUY_S, FCS_ABSB_BUY_M, FCS_ABSB_BUY_L, FCS_ABSB_SELL_S, FCS_ABSB_SELL_M, FCS_ABSB_SELL_L, FCS_COUNT
 };
 
 SCSFExport scsf_NQEdge_FlowCandles(SCStudyInterfaceRef sc)
@@ -5056,7 +5116,8 @@ SCSFExport scsf_NQEdge_FlowCandles(SCStudyInterfaceRef sc)
 		sc.StudyDescription = "Order-flow candlesticks for any chart: bars coloured by a delta gradient (brighter on high volume), absorption diamonds, exhaustion triangles, trapped-trader crosses, CVD-divergence marks, stacked-imbalance dashes, the bar's POC, buy/sell bubbles in three sizes, delta and volume numbers, optional alerts. Shares the NQ Edge engines with the Terminal when both are on the chart.";
 		sc.GraphRegion = 0; sc.AutoLoop = 0; sc.CalculationPrecedence = LOW_PREC_LEVEL; sc.ValueFormat = 0; sc.ScaleRangeType = SCALE_SAMEASREGION; sc.DrawZeros = 0; sc.MaintainVolumeAtPriceData = 1;
 		const char* names[FCS_COUNT] = { "Flow Candle", "Forming Bar", "Absorption (buyers)", "Absorption (sellers)", "Exhaustion Top", "Exhaustion Bottom", "Trapped Longs", "Trapped Shorts", "CVD Divergence Up", "CVD Divergence Down",
-			"Imbalance Stack (buy)", "Imbalance Stack (sell)", "Bar POC", "Buy Bubble S", "Buy Bubble M", "Buy Bubble L", "Sell Bubble S", "Sell Bubble M", "Sell Bubble L", "Delta", "Volume", "h.Delta %", "h.Volume Z", "h.CVD" };
+			"Imbalance Stack (buy)", "Imbalance Stack (sell)", "Bar POC", "Buy Bubble S", "Buy Bubble M", "Buy Bubble L", "Sell Bubble S", "Sell Bubble M", "Sell Bubble L", "Delta", "Volume", "h.Delta %", "h.Volume Z", "h.CVD",
+			"Trend Line (resistance)", "Trend Line (support)", "Absorption Bubble Buy S", "Absorption Bubble Buy M", "Absorption Bubble Buy L", "Absorption Bubble Sell S", "Absorption Bubble Sell M", "Absorption Bubble Sell L" };
 		for (int k = 0; k < FCS_COUNT; ++k) { sc.Subgraph[k].Name = names[k]; sc.Subgraph[k].DrawStyle = DRAWSTYLE_IGNORE; sc.Subgraph[k].DrawZeros = 0; sc.Subgraph[k].LineWidth = 1; }
 		sc.Subgraph[FCS_CANDLE].DrawStyle = DRAWSTYLE_COLOR_BAR; sc.Subgraph[FCS_CANDLE].PrimaryColor = RGB(138, 147, 166);
 		sc.Subgraph[FCS_FORMING].DrawStyle = DRAWSTYLE_COLOR_BAR_HOLLOW; sc.Subgraph[FCS_FORMING].PrimaryColor = RGB(138, 147, 166);
@@ -5076,6 +5137,14 @@ SCSFExport scsf_NQEdge_FlowCandles(SCStudyInterfaceRef sc)
 		{
 			sc.Subgraph[FCS_BUB_BUY_S + k].DrawStyle = DRAWSTYLE_POINT; sc.Subgraph[FCS_BUB_BUY_S + k].LineWidth = bubW[k]; sc.Subgraph[FCS_BUB_BUY_S + k].PrimaryColor = RGB(0, 200, 150);
 			sc.Subgraph[FCS_BUB_SELL_S + k].DrawStyle = DRAWSTYLE_POINT; sc.Subgraph[FCS_BUB_SELL_S + k].LineWidth = bubW[k]; sc.Subgraph[FCS_BUB_SELL_S + k].PrimaryColor = RGB(255, 77, 94);
+		}
+		sc.Subgraph[FCS_TL_RES].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[FCS_TL_RES].LineWidth = 1; sc.Subgraph[FCS_TL_RES].PrimaryColor = RGB(255, 77, 94);
+		sc.Subgraph[FCS_TL_SUP].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[FCS_TL_SUP].LineWidth = 1; sc.Subgraph[FCS_TL_SUP].PrimaryColor = RGB(0, 200, 150);
+		const int absW[3] = { 8, 12, 16 };
+		for (int k = 0; k < 3; ++k)
+		{
+			sc.Subgraph[FCS_ABSB_BUY_S + k].DrawStyle = DRAWSTYLE_POINT; sc.Subgraph[FCS_ABSB_BUY_S + k].LineWidth = absW[k]; sc.Subgraph[FCS_ABSB_BUY_S + k].PrimaryColor = RGB(0, 200, 150);
+			sc.Subgraph[FCS_ABSB_SELL_S + k].DrawStyle = DRAWSTYLE_POINT; sc.Subgraph[FCS_ABSB_SELL_S + k].LineWidth = absW[k]; sc.Subgraph[FCS_ABSB_SELL_S + k].PrimaryColor = RGB(255, 77, 94);
 		}
 		sc.Subgraph[FCS_DELTA_TXT].DrawStyle = DRAWSTYLE_VALUE_ON_HIGH; sc.Subgraph[FCS_DELTA_TXT].PrimaryColor = RGB(0, 200, 150);
 		sc.Subgraph[FCS_VOL_TXT].DrawStyle = DRAWSTYLE_VALUE_ON_LOW; sc.Subgraph[FCS_VOL_TXT].PrimaryColor = RGB(120, 128, 145);
@@ -5110,6 +5179,9 @@ SCSFExport scsf_NQEdge_FlowCandles(SCStudyInterfaceRef sc)
 		NQE_COLOR_INPUT(FCI_C_GOLD, "Color: Exhaustion / POC", 255, 200, 87);
 		NQE_COLOR_INPUT(FCI_C_MAGENTA, "Color: Divergence", 214, 93, 255);
 		NQE_COLOR_INPUT(FCI_C_DIM, "Color: Volume Number", 120, 128, 145);
+		NQE_YESNO_INPUT(FCI_SHOW_TL, "Show: Trend Lines (auto, from swings)", 1);
+		NQE_INT_INPUT(FCI_TL_SWINGS, "Trend Lines: Swings Scanned", 8, 2, 30);
+		sc.Input[FCI_ABS_STYLE].Name = "Absorption Marker"; sc.Input[FCI_ABS_STYLE].SetCustomInputStrings("Bubbles (sized by volume);Diamonds"); sc.Input[FCI_ABS_STYLE].SetCustomInputIndex(0);
 		return;
 	}
 	if (sc.LastCallToFunction) { Release(sc, -1); return; }
@@ -5132,7 +5204,9 @@ SCSFExport scsf_NQEdge_FlowCandles(SCStudyInterfaceRef sc)
 	sc.Subgraph[FCS_ABS_BUY].PrimaryColor = cBull; sc.Subgraph[FCS_ABS_SELL].PrimaryColor = cBear; sc.Subgraph[FCS_EXH_TOP].PrimaryColor = sc.Subgraph[FCS_EXH_BOT].PrimaryColor = cGold;
 	sc.Subgraph[FCS_TRAP_LONGS].PrimaryColor = cBear; sc.Subgraph[FCS_TRAP_SHORTS].PrimaryColor = cBull; sc.Subgraph[FCS_DIV_UP].PrimaryColor = sc.Subgraph[FCS_DIV_DN].PrimaryColor = cMag;
 	sc.Subgraph[FCS_IMB_BUY].PrimaryColor = cBull; sc.Subgraph[FCS_IMB_SELL].PrimaryColor = cBear; sc.Subgraph[FCS_POC].PrimaryColor = cGold; sc.Subgraph[FCS_VOL_TXT].PrimaryColor = cDim;
-	for (int k = 0; k < 3; ++k) { sc.Subgraph[FCS_BUB_BUY_S + k].PrimaryColor = cBull; sc.Subgraph[FCS_BUB_SELL_S + k].PrimaryColor = cBear; }
+	for (int k = 0; k < 3; ++k) { sc.Subgraph[FCS_BUB_BUY_S + k].PrimaryColor = cBull; sc.Subgraph[FCS_BUB_SELL_S + k].PrimaryColor = cBear; sc.Subgraph[FCS_ABSB_BUY_S + k].PrimaryColor = cBull; sc.Subgraph[FCS_ABSB_SELL_S + k].PrimaryColor = cBear; }
+	sc.Subgraph[FCS_TL_RES].PrimaryColor = cBear; sc.Subgraph[FCS_TL_SUP].PrimaryColor = cBull;
+	const int absStyle = sc.Input[FCI_ABS_STYLE].GetIndex();
 	const int mode = sc.Input[FCI_COLOR_MODE].GetIndex();
 	const bool showAbs = sc.Input[FCI_SHOW_ABS].GetYesNo() != 0, showExh = sc.Input[FCI_SHOW_EXH].GetYesNo() != 0, showTrap = sc.Input[FCI_SHOW_TRAP].GetYesNo() != 0, showDiv = sc.Input[FCI_SHOW_DIV].GetYesNo() != 0;
 	const bool showImb = sc.Input[FCI_SHOW_IMB].GetYesNo() != 0, showPoc = sc.Input[FCI_SHOW_POC].GetYesNo() != 0, showBub = sc.Input[FCI_SHOW_BUBBLES].GetYesNo() != 0, showDelta = sc.Input[FCI_SHOW_DELTA].GetYesNo() != 0, showVol = sc.Input[FCI_SHOW_VOL].GetYesNo() != 0;
@@ -5155,7 +5229,11 @@ SCSFExport scsf_NQEdge_FlowCandles(SCStudyInterfaceRef sc)
 		else if (mode == 2) cc = sc.Close[i] >= sc.Open[i] ? cBull : cBear;
 		sc.Subgraph[FCS_CANDLE][i] = forming ? 0.0f : 1.0f; sc.Subgraph[FCS_CANDLE].DataColor[i] = cc;
 		sc.Subgraph[FCS_FORMING][i] = forming ? 1.0f : 0.0f; sc.Subgraph[FCS_FORMING].DataColor[i] = cc;
-		if (showAbs) { if (F.absorbMark[i] == 1) sc.Subgraph[FCS_ABS_BUY][i] = sc.Low[i] - 0.2f * atr; else if (F.absorbMark[i] == -1) sc.Subgraph[FCS_ABS_SELL][i] = sc.High[i] + 0.2f * atr; }
+		if (showAbs && F.absorbMark[i] != 0)
+		{
+			if (absStyle == 1) { if (F.absorbMark[i] > 0) sc.Subgraph[FCS_ABS_BUY][i] = sc.Low[i] - 0.2f * atr; else sc.Subgraph[FCS_ABS_SELL][i] = sc.High[i] + 0.2f * atr; }
+			else { const int cls = vz >= 4.0f ? 2 : (vz >= 3.0f ? 1 : 0); sc.Subgraph[(F.absorbMark[i] > 0 ? FCS_ABSB_BUY_S : FCS_ABSB_SELL_S) + cls][i] = F.absorbMark[i] > 0 ? sc.Low[i] : sc.High[i]; }
+		}
 		if (showExh) { if (F.exhaustMark[i] == -1) sc.Subgraph[FCS_EXH_TOP][i] = sc.High[i] + 0.35f * atr; else if (F.exhaustMark[i] == 1) sc.Subgraph[FCS_EXH_BOT][i] = sc.Low[i] - 0.35f * atr; }
 		if (showTrap) { if (F.trapMark[i] == -1) sc.Subgraph[FCS_TRAP_LONGS][i] = sc.High[i] + 0.5f * atr; else if (F.trapMark[i] == 1) sc.Subgraph[FCS_TRAP_SHORTS][i] = sc.Low[i] - 0.5f * atr; }
 		if (showDiv) { if (F.divMark[i] == -1) sc.Subgraph[FCS_DIV_DN][i] = sc.High[i] + 0.65f * atr; else if (F.divMark[i] == 1) sc.Subgraph[FCS_DIV_UP][i] = sc.Low[i] - 0.65f * atr; }
@@ -5192,6 +5270,21 @@ SCSFExport scsf_NQEdge_FlowCandles(SCStudyInterfaceRef sc)
 			if (sc.Subgraph[sg][b.idx] == 0) sc.Subgraph[sg][b.idx] = b.price;
 		}
 	}
+	// trend lines from confirmed swings: resistance through the last two valid swing highs, support through swing lows
+	if (sc.Input[FCI_SHOW_TL].GetYesNo())
+	{
+		const int sw = sc.Input[FCI_TL_SWINGS].GetInt(); const int lastClosed = n - 2; const int clearFrom = Max(0, n - 1500);
+		for (int side = 0; side < 2; ++side)
+		{
+			const int sg = side == 0 ? FCS_TL_RES : FCS_TL_SUP;
+			TrendLine tl; const bool ok = lastClosed > 10 && FindTrendLine(sc, S, lastClosed, side == 0, sw, tl);
+			for (int i = clearFrom; i < n; ++i) sc.Subgraph[sg][i] = 0;
+			if (!ok) continue;
+			for (int i = Max(clearFrom, tl.i1); i < n; ++i) sc.Subgraph[sg][i] = tl.At(i);
+			sc.Subgraph[sg].LineStyle = tl.broken ? LINESTYLE_DOT : LINESTYLE_SOLID;
+		}
+	}
+	else { sc.Subgraph[FCS_TL_RES].DrawStyle = DRAWSTYLE_IGNORE; sc.Subgraph[FCS_TL_SUP].DrawStyle = DRAWSTYLE_IGNORE; }
 	// alerts: the newest closed bar only, real time only
 	if (sc.Input[FCI_ALERT].GetYesNo() && n >= 2 && !sc.IsFullRecalculation && sc.DownloadingHistoricalData == 0 && !sc.IsReplayRunning())
 	{

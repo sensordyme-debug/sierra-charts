@@ -260,3 +260,12 @@ single colour); `DRAWSTYLE_RIGHT/LEFT_PRICE_BAR_DASH` draw at the subgraph value
     IB end = open + IB minutes / bar seconds), kept for the last two sessions only; labels are relative-Y text at 99 %.
 72. **The cockpit is documented, not generated.** Chartbooks are binary; `docs/COCKPIT.md` is the exact recipe (which chart
     carries which study, which chart numbers feed the Terminal, how to read and act on the HUD).
+
+## v4.5 decisions
+
+73. **Trend lines are pairs of confirmed swings, validated against the bars between them** (no bar high above a resistance
+    line, no bar low below a support line, 0.1 ATR tolerance). The newest swing is always the second pivot, so the line
+    moves when a new swing confirms, never when the forming bar changes; "broken" is a close beyond the line after the second
+    pivot. Only one resistance and one support line are drawn, which keeps the chart within the hierarchy rules.
+74. **Absorption bubbles are sized by volume z-score** (the absorption detector requires z ≥ 2, so the smallest bubble already
+    marks an above-average bar). Large-print bubbles stay smaller (4–12 px) so the two kinds read differently at a glance.

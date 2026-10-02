@@ -50,7 +50,7 @@ projection, footprint/depth, signal-power features) are implemented — see CHAN
 built and run in Sierra by the user; v2 is syntax-checked only. `docs/DECISIONS.md` 26–34 list the
 v2 API details to confirm on the first Remote Build. `docs/VISUAL_GUIDE.md` explains every visual.
 
-## v4.4 (current): one study, PRO preset, Flow series, cockpit
+## v4.5 (current): one study, PRO preset, Flow series, cockpit
 `scsf_NQEdge_Terminal` is the only study the trader adds. It sets every engine's parameters from its
 own inputs (`S.terminalPresent` makes the engine studies passive) and draws with Sierra drawing
 objects managed by line number (`term::Slot*` helpers, `TermState` slots, `SlotFlush` each update,
@@ -66,7 +66,9 @@ holds the Flow series (`scsf_NQEdge_FlowCandles`, `FlowCVD`, `FlowDelta`): subgr
 companion charts that share the engines; Flow Candles sets parameters only when the Terminal is absent. v4.4: `HudSnapshot::action/actionKind`
 (derived from the newest unresolved signal or the plan), internals line (ES/YM/RTY/TICK/mega caps), position
 and daily-risk guard from `sc.GetTradePosition` (`limitHit` suppresses alerts), `TL_KEYTIMES` vertical lines,
-`LVL_PWH/LVL_PWL`. `docs/COCKPIT.md` is the multi-chart layout recipe. The v2 GDI overlay/backdrop/tape studies were
+`LVL_PWH/LVL_PWL`. `docs/COCKPIT.md` is the multi-chart layout recipe. v4.5: `nqe::TrendLine` / `FindTrendLine` (swing-pair
+lines validated against the bars between), used by the Terminal (`TL_TRENDLINES`, drawing objects) and
+Flow Candles (line subgraphs); absorption bubbles sized by volume z in both. The v2 GDI overlay/backdrop/tape studies were
 removed; `render::Frame`, `DrawProfile` and `DrawTape` remain. New Terminal layer: add a `TL_*` entry,
 its name in `kTermLayerNames`, both `kTermPreset` rows, slots in `TermState`, and a draw block that
 either redraws (when `heavy`) or `SlotKeep`s.

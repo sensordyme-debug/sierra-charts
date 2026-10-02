@@ -187,3 +187,14 @@
 - **Prior-week high / low** (`PWH` / `PWL`) join the level set: pills, HUD R/S, setup reference levels and grading.
 - HUD is 15 lines in PRO, 8 in CLEAN. `docs/COCKPIT.md` describes the full multi-chart layout, inputs, how to read the HUD, the
   trade from entry to exit, and the routine.
+
+## v4.5 — auto trend lines + absorption bubbles
+- **Trend lines from confirmed swings** (`FindTrendLine`): resistance through the newest swing high and the most recent
+  earlier swing high whose connecting line no bar high cuts by more than 0.1 ATR; support the same way through swing lows.
+  Solid while intact, dotted once a close breaks the line. Terminal layer *Trend Lines (auto, from swings)* (on in both
+  presets, drawing objects extended into the fill space); Flow Candles draws them as line subgraphs up to the last bar.
+  Input *Trend Lines: Swings Scanned* (8).
+- **Absorption bubbles**: a point at the absorbed price on every absorption bar, sized by the bar's volume z-score (Terminal:
+  8–24 px within 3 ATR of price, last 150 bars, in the Bubbles layer; Flow Candles: three size classes at z ≥ 2 / 3 / 4,
+  default marker style, *Absorption Marker* input keeps the diamonds as an option).
+- Docs: VISUAL_GUIDE, DECISIONS 73–74.

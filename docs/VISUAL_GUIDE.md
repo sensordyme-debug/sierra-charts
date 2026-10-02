@@ -1,4 +1,4 @@
-# NQ Edge Terminal — Visual guide (v4.4, PRO by default)
+# NQ Edge Terminal — Visual guide (v4.5, PRO by default)
 
 Palette: bull `#00C896` green, bear `#FF4D5E` red, neutral `#6E7686` gray, VWAP/fib gold `#FFC857`,
 levels cyan `#3EC6FF`, text `#E6EAF2`, dim `#788091`. Every colour is an input.
@@ -48,7 +48,12 @@ Reading from the candles outward:
   absorption, **I** stacked imbalance, **L** liquidity pool, **F** failed-auction supply/demand; green
   support-type, red resistance-type, ≥ 82 % transparent, only within 2 ATR of price. (Layer *Zones*.)
 - **Dots** at large aggressive prints in the last 90 bars, green buyer / red seller, sized by volume
-  percentile. (Layer *Order-Flow Bubbles*.)
+  percentile, and larger **absorption bubbles** at the low of a bar where passive buyers absorbed
+  (green) or the high where passive sellers absorbed (red), sized by that bar's volume z-score.
+  (Layer *Bubbles (large prints + absorption)*.)
+- Two **trend lines**: a red resistance line through the newest swing high and the most recent earlier
+  swing high no bar cut, and a green support line through swing lows the same way, both extended into
+  the fill space; a line turns dotted once a close breaks it. (Layer *Trend Lines (auto, from swings)*.)
 - An **event log** of six lines at the end of the chart opposite the HUD, newest first and bold:
   `17:10 sell imb stack @ 7774.63 (1b)`, `16:35 absorb: buyers @ 7771.25 (8b)`, `15:05 CHoCH down
   @ 7788.50 (27b)`, `trapped longs`, `IB break up`, `acceptance above value`. Repeats of the same event
@@ -131,8 +136,9 @@ companion charts (other NQ timeframes, ES, YM, the mega caps) where the full Ter
 
 - **NQ Edge Flow Candles** (price region). Every bar is coloured by its **delta gradient**: deep green
   when buyers hit the ask hard, deep red when sellers hit the bid, gray when delta is small; bars on
-  high volume (z ≥ 1.5) are brighter. Around the bars: a **diamond** under a bar where passive buyers
-  absorbed (above it for sellers), a gold **triangle** at an exhausted top or bottom, a red **X** above
+  high volume (z ≥ 1.5) are brighter. Red and green **trend lines** through the last two valid swing
+  highs / lows (dotted once broken). Around the bars: an **absorption bubble** at the low of a bar where
+  passive buyers absorbed (at the high for sellers), bigger on heavier volume (or a diamond, by input), a gold **triangle** at an exhausted top or bottom, a red **X** above
   a bar that trapped longs (green below for trapped shorts), a magenta **plus** where price made a new
   swing extreme on weaker delta, a short **dash on the right** of the bar at a stacked buy imbalance
   (left for sell), a gold dash at the bar's **POC**, green / red **bubbles** in three sizes where the
