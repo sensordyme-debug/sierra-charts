@@ -3698,7 +3698,7 @@ namespace nqe
 					if (st.count > 0) sprintf_s(card, sizeof(card), "%s \xB7 %c \xB7 hist %.0f%% n=%d", g.label, grade, 100.0 * st.wins / Max(1, st.wins + st.losses), st.count);
 					else sprintf_s(card, sizeof(card), "%s \xB7 %c", g.label, grade);
 				}
-				else sprintf_s(card, sizeof(card), "%s %s %+.1fR \xB7 %c", g.resolved == 1 ? "WIN" : (g.resolved == -1 ? "LOSS" : "TIMEOUT"), g.resolved == 1 ? "\xFB" : (g.resolved == -1 ? "x" : "~"), g.resultR, grade);
+				else sprintf_s(card, sizeof(card), "%s %+.1fR \xB7 %s \xB7 %c", g.resolved == 1 ? "WIN" : (g.resolved == -1 ? "LOSS" : "TIMEOUT"), g.resultR, kSetupNames[Clamp(g.type, 0, SETUP_COUNT - 1)], grade);
 				F.Font(V.fontPt - 1, true);
 				const int cw = F.TextW(card) + 8, ch = F.fontH + 4;
 				const int cx = Max(F.left, Min(x1, F.right - cw)), cy = g.dir > 0 ? yS + 2 : yS - ch - 2;
