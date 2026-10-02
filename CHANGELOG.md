@@ -54,3 +54,38 @@
 - Conviction candles: body fill by DCS state (`DRAWSTYLE_COLOR_BAR_CANDLE_FILL`), hollow forming bar; optional one-time application of the terminal palette to the chart's Graphics Settings.
 - HUD moved into the fill space (auto-sizes, compact when the space is small): bias badge, gauge, 30-bar sparkline, regime/open/value row, MTF strip, intermarket dots with arrows, order-flow row with event age, levels row, plan line (wrapped), stats, health row, warnings.
 - Removed all `sc.UseTool` drawings (naked POC rays, zones, bubbles, markers, signal lines); these become renderer layers.
+
+## v2 Phase 3 — Level system
+- Level rays from the bar where each level was born to a compact right-edge price pill, colour-coded by family (gold POC/VWAP/IB, cyan VA/liquidity, magenta naked POC, white PDH/PDL/PDC, dim gold extensions). Levels > 4 ATR away fade and become dotted; levels within the location tolerance pulse (solid bold pill). Identical prices merge (`VAH/PDH`), overlapping pills stack with a connector. Added PDC and session OPEN levels, prior-day close, RTH range history (ADR) and session profile history.
+
+## v2 Phase 4 — Docked volume profile
+- Developing RTH profile drawn horizontally in the fill space, each row split bid (red) / ask (green), value-area rows brighter, gold POC line + pill, cyan dotted VAH/VAL; faint ghost of the prior session; optional N-day composite (Auction input *Composite Days*).
+
+## v2 Phase 5 — Zones, bubbles, swings, channel
+- Zones as translucent rectangles extending right until mitigated (then dashed outline fading over ~40 bars) with a corner letter: A absorption, I stacked imbalance, L liquidity, P single prints, F failed-auction supply/demand (new; created at trapped-trader events).
+- Large-trade bubbles sized by percentile with cluster counts; hollow while forming.
+- Swing legs: zigzag with bold leg-delta numbers, leg volume + ticks, divergence `!`; active leg dashed with provisional delta.
+- Regression channel (fit ±2σ, R²) on the active leg, colour by slope, extended into the future space.
+
+## v2 Phase 6 — HUD glass panel
+- Full panel in the fill space: bias badge, −100…+100 gauge with needle and threshold ticks, 30-bar sparkline, open type / value migration / day type guess, MTF strip + leg R², intermarket dots with arrows and SMT or lead/lag note, CVD row with event age, nearest levels with ticks/ATR, session clock (to RTH open / IB end / close, bar countdown) and range vs ADR, plan line, per-setup scoreboard, health row (VAP, depth, TZ, charts connected, draw/calc ms, data delay).
+
+## v2 Phase 7 — Signal cards, grading, annotations
+- Position boxes: green entry→T2, red entry→stop, dotted T1, white entry; live boxes extend right, resolved boxes end at the resolution bar with WIN/LOSS/TIMEOUT and R. Card label includes grade and historical hit rate for the setup.
+- A/B/C grading from confluence (bias strength, location quality, trigger strength, intermarket agreement, regime fit); only A and B drawn/alerted by default (inputs).
+- Event registry with timestamped notes (absorption, imbalance, trapped, exhaustion, CVD divergence, BOS/CHoCH, IB break, SMT, acceptance/rejection, signals), stacked to avoid overlap, fading with age, max N visible.
+- Validation keeps statistics by setup × regime × grade.
+
+## v2 Phase 8 — Projection arrow
+- Dashed forward path from the last closed bar to the next liquidity (signal targets, or pullback→continuation in trends, rotation to POC→edge in balance) with the empirical `P(T1 first)` and n from the matching setup × regime (× grade) bucket; dimmed with `low confidence` under 30 samples; invalidation line; plan line now names location, trigger and invalidation.
+
+## v2 Phase 9 — Footprint Pro + depth heatmap
+- Footprint cells (`bid x ask`, delta heat background, diagonal imbalance borders, stacked highlight, gold POC box, unfinished-auction `u`, delta above / volume below) with automatic fallback to heat blocks and then to plain candles as bar spacing shrinks.
+- Historical market-depth heatmap in the backdrop (bid/ask dominant side, size percentile intensity), only when depth data exists; requests historical depth storage when the layer is on.
+
+## v2 Phase 10 — Signal power
+- New features: `legEff` (delta per tick moved vs typical), `legVol` (leg volume vs prior leg), `pullback` (depth of the counter-leg as a share of the prior leg), `absorbQ` (volume z × (1 − range/ATR) × close position × repeat touches), `auction` (balance → initiative breakout → acceptance/rejection state machine per session, also feeds regime trendiness and the break-and-acceptance trigger), `leadLag` (rolling lagged correlation with YM / mega caps; flags a leader that moved while MES has not). 32 features total; logger writes them plus the signal grade; research pipeline and default weights updated.
+
+## v2 Phase 11 — Performance + docs
+- Renderer draws visible bars only, merges backdrop runs, caches fonts/text sizes per frame, bounds every list; frame times in the HUD health row.
+- `docs/SETUP.md` rewritten (Graphics Settings palette, fill space, two-chart chartbook with linking, chart numbers, presets), new `docs/VISUAL_GUIDE.md`, decisions 26–33.

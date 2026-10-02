@@ -96,3 +96,30 @@ Ambiguities resolved while building, and anything not verifiable without a Sierr
     deploy script copies whatever is saved there.
 25. **Research expectancy** is measured on forward returns with 1 R = the label threshold in ATR;
     the on-chart validation study remains the authority for setup statistics.
+
+## v2 (terminal) decisions
+
+26. **All visual layers are drawn with Sierra's GDI interface** (`sc.Graphics.*` via `sc.p_GDIFunction`)
+    instead of `sc.UseTool` objects. Translucency uses `FillRectangleWithColorTransparent`
+    (Sierra-native, added in version 2910; no msimg32 `AlphaBlend` linking), with an opaque
+    blend-toward-background fallback when the pointer is null. Reasons: visible-only cost, exact
+    z-order (backdrop under candles, overlay above), overlap handling for pills/notes, no drawing
+    bookkeeping across reloads. The VWAP/level history lines remain subgraph lines.
+27. **Transparency convention:** `TransparentLevel` 0 = opaque, 100 = invisible (Sierra's study
+    transparency convention); the helper takes opacity % and converts. Verify visually on the first build.
+28. **Fill space:** `sc.BarIndexToXPixelCoordinate` is used for visible bars; positions beyond the
+    last bar are extrapolated from the last two visible bars' spacing. The HUD/profile/pills need
+    *Fill Space ≥ 40 bars*; the health row says so when the space is too small.
+29. **Region height:** `sc.SetGraphRegionHeightPercentage(ChartNumber, sc.GraphRegion, pct)` is
+    called with the tape study's own 0-based `sc.GraphRegion` (= 1). If Sierra expects 1-based
+    numbers the wrong region resizes once — change the second argument to `sc.GraphRegion + 1`.
+30. **Footprint cells overdraw the chart's candles** (opaque fills) rather than replacing the main
+    graph (`DisplayAsMainPriceGraph`), so the price scale and other studies keep working unchanged.
+31. **Historical depth storage** (`sc.MaintainHistoricalMarketDepthData`) is switched on at runtime
+    only when the Depth Heatmap layer is on and depth levels exist; it takes effect after a chart reload.
+32. **Grades:** confluence score ≥ 4.0 = A, ≥ 3.0 = B, else C (bias 0–1, location 0.5–1, trigger
+    0–1.5, intermarket −0.5–1, regime fit 0.25–1). Grade C signals are logged, never drawn/alerted by default.
+33. **Projection odds** come only from the validation history (setup × regime × grade, falling back
+    to setup totals under 10 samples); "low confidence" below the sample-size input. No modelled probabilities.
+34. **Session clock** uses `sc.GetCurrentDateTime()` (chart time zone, replay-aware) and
+    `sc.GetLatestBarCountdownAsInteger()` for the bar countdown.

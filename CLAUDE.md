@@ -44,9 +44,17 @@ See docs/ARCHITECTURE.md §4 (engines) and the section banners (`// ==== N`) in 
 Then in Sierra Chart: Analysis >> Build Custom Studies DLL >> Remote Build - Release >> NQEdgeSuite.cpp.
 
 ## Phase status
-All nine phases are implemented (see CHANGELOG.md). The suite has been syntax-checked against the
-Sierra headers but not yet built or run inside Sierra Chart; `docs/DECISIONS.md` lists the API
-details to confirm on the first Remote Build.
+v1 (nine engine phases) and v2 (eleven terminal phases: GDI renderer, backdrop/overlay/tape studies,
+presets, levels/pills, docked profile, zones/bubbles/swings/channel, HUD, cards/grades/notes,
+projection, footprint/depth, signal-power features) are implemented — see CHANGELOG.md. v1 was
+built and run in Sierra by the user; v2 is syntax-checked only. `docs/DECISIONS.md` 26–34 list the
+v2 API details to confirm on the first Remote Build. `docs/VISUAL_GUIDE.md` explains every visual.
+
+## v2 rendering rules
+* Draw only `firstVis..lastVis`; anything beyond the last bar is positioned by `Frame::XOf` extrapolation.
+* Opacity helper `Frame::Fill(..., alpha)` takes opacity %; never call the raw transparent fill directly.
+* New layer: add to `enum Layer`, `kLayerNames`, the three `kPresetLayers` rows, a `render::Draw*`
+  function, and a call in `DrawOverlay` (above candles) or `DrawBackdrop` (below).
 
 ## Working on the source
 `src/sierra/NQEdgeSuite.cpp` is organised by `// ==== N` banners. Engines live in `namespace nqe`
