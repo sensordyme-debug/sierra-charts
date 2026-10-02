@@ -137,6 +137,8 @@ namespace nqe
 		float absorbZoneFrac = 0.25f;
 		int exhaustRunBars = 3;
 		float exhaustExtremePct = 15.0f;
+		float exhaustMinVolZ = 0.5f;      // exhaustion needs an above-average volume bar
+		int exhaustCooldownBars = 6;      // and no same-direction exhaustion within this many bars
 		float imbRatioPct = 300.0f;
 		int imbMinVolume = 10;
 		int imbStackLevels = 3;
@@ -200,6 +202,11 @@ namespace nqe
 		int alertsOn = 1;
 		int alertSound = 1;
 		int alertMinGrade = 2;      // 1 = A, 2 = A+B, 3 = all
+		float minStopAtr = 0.6f;    // structural stop widened to at least this
+		float maxStopAtr = 2.5f;    // candidates with a wider stop are rejected
+		int minStopTicks = 6;
+		int ethSignals = 1;         // outside RTH: 0 none, 1 grade A only, 2 all
+		float riskPerTrade = 100.0f; // $ risk behind the size suggestion
 	};
 
 	struct ValParams
@@ -490,7 +497,7 @@ namespace nqe
 	struct Signal
 	{
 		int idx = 0; int type = SETUP_NONE; int dir = 0; float entry = 0, stop = 0, t1 = 0, t2 = 0;
-		float dcs = 0; float rr = 0; char label[96] = ""; int grade = 2;
+		float dcs = 0; float rr = 0; char label[96] = ""; int grade = 2; int size = 0;
 		int lineArrow = 0, lineEntry = 0, lineStop = 0, lineT1 = 0, lineT2 = 0, lineText = 0;
 		// validation (filled by the validation engine)
 		int resolved = 0;          // 0 pending, 1 win (T1), -1 loss, 2 timeout
@@ -502,6 +509,7 @@ namespace nqe
 		std::vector<float> feat;         // F_COUNT per bar (row-major)
 		std::vector<float> dcs, dcsSmooth;
 		std::vector<signed char> barState; // -2..+2
+		std::vector<unsigned char> gPos, gAvail;   // per-bar group bitmasks: group g leans positive / has data
 		std::vector<signed char> signalType, signalDir;
 		Weights weights;
 		std::vector<Signal> signals;
@@ -555,7 +563,8 @@ namespace nqe
 		bool ymAvail = false, tickAvail = false; int smt = 0;
 		float cvdZ = 0; int cvdTrend = 0; char lastEvent[64] = ""; float lastEventPrice = 0;
 		float supPrice = 0, resPrice = 0; int supKind = 0, resKind = 0; float atr = 0; float close = 0;
-		char stateLine[160] = "";
+		char stateLine[160] = ""; char stateLine2[160] = "";
+		int agree = 0, agreeN = 0; bool adrPrev = false; int liveSize = 0;
 		int curSetup = 0; SetupStats curStats; bool statsAvail = false;
 		char vwapText[64] = "";
 		int signalsTotal = 0;
@@ -619,7 +628,7 @@ namespace nqe
 	struct DrawSlot { int line = 0; bool used = false; };
 	struct TermState
 	{
-		static const int HUD_SLOTS = 10, LVL_SLOTS = 6, SIG_SLOTS = 3, SWING_SLOTS = 24, ZONE_SLOTS = 8, BUBBLE_SLOTS = 30, NOTE_SLOTS = 12, PROJ_SLOTS = 3, FIB_SLOTS = 4, CHAN_SLOTS = 3, NUM_SLOTS = 120;
+		static const int HUD_SLOTS = 12, LVL_SLOTS = 6, SIG_SLOTS = 3, SWING_SLOTS = 24, ZONE_SLOTS = 8, BUBBLE_SLOTS = 30, NOTE_SLOTS = 12, PROJ_SLOTS = 3, FIB_SLOTS = 4, CHAN_SLOTS = 3, NUM_SLOTS = 60;
 		struct SigDraw { DrawSlot risk, reward, t1, label; };
 		static const int SLOTS = HUD_SLOTS + 2 * LVL_SLOTS + 4 * SIG_SLOTS + SWING_SLOTS + ZONE_SLOTS + BUBBLE_SLOTS + NOTE_SLOTS + PROJ_SLOTS + 2 * FIB_SLOTS + CHAN_SLOTS + NUM_SLOTS;
 		union
@@ -627,6 +636,7 @@ namespace nqe
 			DrawSlot all[SLOTS];
 			struct { DrawSlot hud[HUD_SLOTS]; DrawSlot lvlLine[LVL_SLOTS]; DrawSlot lvlTag[LVL_SLOTS]; SigDraw sig[SIG_SLOTS]; DrawSlot swing[SWING_SLOTS]; DrawSlot zone[ZONE_SLOTS]; DrawSlot bubble[BUBBLE_SLOTS]; DrawSlot note[NOTE_SLOTS]; DrawSlot proj[PROJ_SLOTS]; DrawSlot fibLine[FIB_SLOTS]; DrawSlot fibTag[FIB_SLOTS]; DrawSlot chan[CHAN_SLOTS]; DrawSlot num[NUM_SLOTS]; };
 		};
+		int regionH = 0, regionW = 0;      // price-region pixel size, captured by the GDI pass
 		TermState() { for (int k = 0; k < SLOTS; ++k) { all[k].line = 0; all[k].used = false; } }
 	};
 
@@ -1360,13 +1370,13 @@ namespace nqe
 				if (A.lastSwingHigh >= 0 && !A.lastHighBroken && A.swings[A.lastSwingHigh].idx < i && c > A.swings[A.lastSwingHigh].price)
 				{
 					A.lastHighBroken = true;
-					if (prevTrend < 0) { A.chochMark[i] = 1; A.lastChochDir = 1; A.lastChochIdx = i; PushEvent(sc, S, i, EV_CHOCH, 1, c, "CHoCH up: swing high broken"); } else { A.bosMark[i] = 1; PushEvent(sc, S, i, EV_BOS, 1, c, "BOS up"); }
+					if (prevTrend < 0) { A.chochMark[i] = 1; A.lastChochDir = 1; A.lastChochIdx = i; PushEvent(sc, S, i, EV_CHOCH, 1, c, "CHoCH up"); } else { A.bosMark[i] = 1; PushEvent(sc, S, i, EV_BOS, 1, c, "BOS up"); }
 					A.lastBosDir = 1; A.lastBosIdx = i;
 				}
 				if (A.lastSwingLow >= 0 && !A.lastLowBroken && A.swings[A.lastSwingLow].idx < i && c < A.swings[A.lastSwingLow].price)
 				{
 					A.lastLowBroken = true;
-					if (prevTrend > 0) { A.chochMark[i] = -1; A.lastChochDir = -1; A.lastChochIdx = i; PushEvent(sc, S, i, EV_CHOCH, -1, c, "CHoCH down: swing low broken"); } else { A.bosMark[i] = -1; PushEvent(sc, S, i, EV_BOS, -1, c, "BOS down"); }
+					if (prevTrend > 0) { A.chochMark[i] = -1; A.lastChochDir = -1; A.lastChochIdx = i; PushEvent(sc, S, i, EV_CHOCH, -1, c, "CHoCH down"); } else { A.bosMark[i] = -1; PushEvent(sc, S, i, EV_BOS, -1, c, "BOS down"); }
 					A.lastBosDir = -1; A.lastBosIdx = i;
 				}
 				// first close beyond the initial balance
@@ -1765,13 +1775,13 @@ namespace nqe
 					{
 						F.lastAbsQ = Clamp1(F.volZ[i] * (1.0f - range / atr) * closePosB * (1.0f + 0.25f * touches) / 2.5f);
 						Zone z; z.bornIdx = i; z.bottom = l; z.top = l + P.absorbZoneFrac * range; z.dir = 1; z.kind = LVL_ABSORB; z.active = true;
-						F.absorbZones.push_back(z); F.absorbMark[i] = 1; F.lastAbsIdx = i; F.lastAbsDir = 1; SetEvent(F, i, l, "Absorption (buyers)"); Note(sc, S, i, EV_ABSORB, 1, l, "absorption: passive buyers");
+						F.absorbZones.push_back(z); F.absorbMark[i] = 1; F.lastAbsIdx = i; F.lastAbsDir = 1; SetEvent(F, i, l, "Absorption (buyers)"); Note(sc, S, i, EV_ABSORB, 1, l, "absorb: buyers");
 					}
 					else if (F.deltaPct[i] >= 0.10f && (h - c) >= 0.4f * range && h >= prevHigh)
 					{
 						F.lastAbsQ = Clamp1(F.volZ[i] * (1.0f - range / atr) * closePosS * (1.0f + 0.25f * touches) / 2.5f);
 						Zone z; z.bornIdx = i; z.top = h; z.bottom = h - P.absorbZoneFrac * range; z.dir = -1; z.kind = LVL_ABSORB; z.active = true;
-						F.absorbZones.push_back(z); F.absorbMark[i] = -1; F.lastAbsIdx = i; F.lastAbsDir = -1; SetEvent(F, i, h, "Absorption (sellers)"); Note(sc, S, i, EV_ABSORB, -1, h, "absorption: passive sellers");
+						F.absorbZones.push_back(z); F.absorbMark[i] = -1; F.lastAbsIdx = i; F.lastAbsDir = -1; SetEvent(F, i, h, "Absorption (sellers)"); Note(sc, S, i, EV_ABSORB, -1, h, "absorb: sellers");
 					}
 					while (static_cast<int>(F.absorbZones.size()) > Max(5, P.maxActiveZones) * 2) { if (F.absorbZones[0].lineNumber) F.deadLines.push_back(F.absorbZones[0].lineNumber); F.absorbZones.erase(F.absorbZones.begin()); }
 				}
@@ -1795,8 +1805,8 @@ namespace nqe
 								bool upRun = c > sc.Close[i - run], downRun = c < sc.Close[i - run];
 								for (int q = 1; q <= run && q <= i; ++q) { if (sc.High[i - q + 1] < sc.High[i - q]) upRun = false; if (sc.Low[i - q + 1] > sc.Low[i - q]) downRun = false; }
 								const double thin = P.exhaustExtremePct / 100.0 * maxLevelVol;
-								if (upRun && lv[m - 1]->Volume <= thin && (m < 3 || lv[m - 2]->Volume <= thin * 1.5)) { F.exhaustMark[i] = -1; F.lastExhIdx = i; F.lastExhDir = -1; SetEvent(F, i, h, "Exhaustion top"); PushMarker(F, i, -1, 3, h); Note(sc, S, i, EV_EXHAUST, -1, h, "exhaustion: thin top"); }
-								else if (downRun && lv[0]->Volume <= thin && (m < 3 || lv[1]->Volume <= thin * 1.5)) { F.exhaustMark[i] = 1; F.lastExhIdx = i; F.lastExhDir = 1; SetEvent(F, i, l, "Exhaustion bottom"); PushMarker(F, i, 1, 3, l); Note(sc, S, i, EV_EXHAUST, 1, l, "exhaustion: thin bottom"); }
+								if (upRun && F.volZ[i] >= P.exhaustMinVolZ && (h - c) >= 0.3f * (h - l) && (F.lastExhDir != -1 || i - F.lastExhIdx > P.exhaustCooldownBars) && lv[m - 1]->Volume <= thin && (m < 3 || lv[m - 2]->Volume <= thin * 1.5)) { F.exhaustMark[i] = -1; F.lastExhIdx = i; F.lastExhDir = -1; SetEvent(F, i, h, "Exhaustion top"); PushMarker(F, i, -1, 3, h); Note(sc, S, i, EV_EXHAUST, -1, h, "exhaust top"); }
+								else if (downRun && F.volZ[i] >= P.exhaustMinVolZ && (c - l) >= 0.3f * (h - l) && (F.lastExhDir != 1 || i - F.lastExhIdx > P.exhaustCooldownBars) && lv[0]->Volume <= thin && (m < 3 || lv[1]->Volume <= thin * 1.5)) { F.exhaustMark[i] = 1; F.lastExhIdx = i; F.lastExhDir = 1; SetEvent(F, i, l, "Exhaustion bottom"); PushMarker(F, i, 1, 3, l); Note(sc, S, i, EV_EXHAUST, 1, l, "exhaust bottom"); }
 							}
 
 							// stacked diagonal imbalances (Sierra Numbers Bars definition)
@@ -1813,13 +1823,13 @@ namespace nqe
 								if (buyRun >= P.imbStackLevels && (q + 1 >= m || !(q + 1 < m && lv[q + 1]->PriceInTicks - lv[q]->PriceInTicks == 1 && lv[q + 1]->AskVolume >= minV && lv[q]->BidVolume >= minV && lv[q + 1]->AskVolume >= ratio * lv[q]->BidVolume)))
 								{
 									Zone z; z.bornIdx = i; z.bottom = (lv[buyStart]->PriceInTicks - 0.5f) * tick; z.top = (lv[q]->PriceInTicks + 0.5f) * tick; z.dir = 1; z.kind = LVL_IMB; z.active = true;
-									F.imbZones.push_back(z); F.imbMark[i] = static_cast<signed char>(F.imbMark[i] == -1 ? 2 : 1); F.lastImbIdx = i; F.lastImbDir = 1; SetEvent(F, i, z.bottom, "Stacked buy imbalance"); Note(sc, S, i, EV_IMB, 1, z.bottom, "stacked buy imbalance");
+									F.imbZones.push_back(z); F.imbMark[i] = static_cast<signed char>(F.imbMark[i] == -1 ? 2 : 1); F.lastImbIdx = i; F.lastImbDir = 1; SetEvent(F, i, z.bottom, "Stacked buy imbalance"); Note(sc, S, i, EV_IMB, 1, z.bottom, "buy imb stack");
 									buyRun = 0;
 								}
 								if (sellRun >= P.imbStackLevels && (q + 1 >= m || !(q + 2 < m && lv[q + 2]->PriceInTicks - lv[q + 1]->PriceInTicks == 1 && lv[q + 1]->BidVolume >= minV && lv[q + 2]->AskVolume >= minV && lv[q + 1]->BidVolume >= ratio * lv[q + 2]->AskVolume)))
 								{
 									Zone z; z.bornIdx = i; z.bottom = (lv[sellStart]->PriceInTicks - 0.5f) * tick; z.top = (lv[q]->PriceInTicks + 0.5f) * tick; z.dir = -1; z.kind = LVL_IMB; z.active = true;
-									F.imbZones.push_back(z); F.imbMark[i] = static_cast<signed char>(F.imbMark[i] == 1 ? 2 : -1); F.lastImbIdx = i; F.lastImbDir = -1; SetEvent(F, i, z.top, "Stacked sell imbalance"); Note(sc, S, i, EV_IMB, -1, z.top, "stacked sell imbalance");
+									F.imbZones.push_back(z); F.imbMark[i] = static_cast<signed char>(F.imbMark[i] == 1 ? 2 : -1); F.lastImbIdx = i; F.lastImbDir = -1; SetEvent(F, i, z.top, "Stacked sell imbalance"); Note(sc, S, i, EV_IMB, -1, z.top, "sell imb stack");
 									sellRun = 0;
 								}
 							}
@@ -2608,6 +2618,25 @@ namespace nqe
 			return true;
 		}
 
+		// contracts for the configured $ risk (0 when the symbol's currency value per tick is unknown)
+		inline int RiskSize(SCStudyInterfaceRef sc, const ChartState& S, float riskPts)
+		{
+			const double cv = sc.CurrencyValuePerTick; const double rk = S.params.dcs.riskPerTrade;
+			if (cv <= 0 || riskPts <= 0 || rk <= 0 || S.tickSize <= 0) return 0;
+			return static_cast<int>(floor(rk / ((riskPts / S.tickSize) * cv)));
+		}
+		// how many feature groups lean in `dir` (from the per-bar group sign bitmasks)
+		inline void GroupAgreement(const DcsState& D, int i, int dir, int& agree, int& total)
+		{
+			agree = 0; total = 0; if (i < 0 || i >= static_cast<int>(D.gAvail.size())) return;
+			for (int g = 0; g < G_COUNT; ++g)
+			{
+				if (!((D.gAvail[i] >> g) & 1)) continue;
+				++total; const bool pos = ((D.gPos[i] >> g) & 1) != 0;
+				if ((dir > 0 && pos) || (dir < 0 && !pos)) ++agree;
+			}
+		}
+
 		struct Candidate { int type; int dir; float stop; float refLevel; int refKind; int score; float trigger; };
 
 		// Confluence grade: bias + location quality + trigger strength + intermarket agreement + regime fit -> A/B/C
@@ -2629,6 +2658,10 @@ namespace nqe
 				for (int k = 0; k < 3; ++k) if (!IsNan(parts[k])) { s += parts[k]; ++n; }
 				if (n == 0) score += 0.5f; else { const float m = s / n; score += (m * cd.dir > 0.1f) ? 1.0f : (m * cd.dir < -0.1f ? -0.5f : 0.25f); }
 			}
+			{
+				int ag = 0, tot = 0; GroupAgreement(S.dcs, i, cd.dir, ag, tot);
+				if (tot >= 3) { const float fr = static_cast<float>(ag) / tot; score += fr >= 0.75f ? 0.5f : (fr < 0.5f ? -0.5f : 0.0f); }
+			}
 			const int reg = R.regime[i];
 			switch (cd.type)
 			{
@@ -2649,6 +2682,11 @@ namespace nqe
 			float stop = cd.stop;
 			if (cd.dir > 0 && stop >= entry) return false;
 			if (cd.dir < 0 && stop <= entry) return false;
+			// stop sanity: a structural stop that is too tight gets run over by noise, one that is too wide kills the R:R
+			const float minRisk = Max(P.minStopAtr * atr, P.minStopTicks * S.tickSize);
+			if (cd.dir > 0 && entry - stop < minRisk) stop = entry - minRisk;
+			if (cd.dir < 0 && stop - entry < minRisk) stop = entry + minRisk;
+			if (fabs(entry - stop) > P.maxStopAtr * atr) return false;
 			const float risk = static_cast<float>(fabs(entry - stop));
 			if (risk < S.tickSize) return false;
 			float t1, t2; int k1, k2;
@@ -2657,7 +2695,7 @@ namespace nqe
 			if (rr < P.minRR) return false;
 			out = Signal();
 			out.idx = i; out.type = cd.type; out.dir = cd.dir; out.entry = entry; out.stop = sc.RoundToTickSize(stop); out.t1 = sc.RoundToTickSize(t1); out.t2 = sc.RoundToTickSize(t2);
-			out.dcs = S.dcs.dcs[i]; out.rr = rr;
+			out.dcs = S.dcs.dcs[i]; out.rr = rr; out.size = RiskSize(sc, S, risk);
 			sprintf_s(out.label, sizeof(out.label), "%s | %s | DCS %+.0f | R:R %.1f | T1 %s", cd.dir > 0 ? "LONG" : "SHORT", kSetupNames[cd.type], out.dcs, rr, LevelName(k1));
 			return true;
 		}
@@ -2670,7 +2708,7 @@ namespace nqe
 		const int n = sc.ArraySize; if (n <= 0) return;
 		DcsState& D = S.dcs; const DcsParams& P = S.params.dcs;
 		if (MaybeReloadWeights(sc, S)) { ResetFrom(S, E_DCS); }
-		Fit(D.feat, n * F_COUNT); Fit(D.dcs, n); Fit(D.dcsSmooth, n); Fit(D.barState, n); Fit(D.signalType, n); Fit(D.signalDir, n);
+		Fit(D.feat, n * F_COUNT); Fit(D.dcs, n); Fit(D.dcsSmooth, n); Fit(D.barState, n); Fit(D.gPos, n); Fit(D.gAvail, n); Fit(D.signalType, n); Fit(D.signalDir, n);
 		if (D.UpToDate(sc)) return;
 		int from = D.computedThrough + 1; if (from < 0) from = 0; if (from > n - 1) from = n - 1;
 		const AuctionState& A = S.auction; const VwapState& V = S.vwap; const FlowState& F = S.flow; const RegimeState& R = S.regime; const InterState& I = S.inter;
@@ -2694,16 +2732,22 @@ namespace nqe
 			f[F_LEG_EFF] = F.fLegEff[i]; f[F_LEG_VOL] = F.fLegVol[i]; f[F_PULLBACK] = F.fPullback[i]; f[F_ABSORB_Q] = F.fAbsorbQ[i]; f[F_AUCTION] = A.auctionF[i]; f[F_LEADLAG] = I.leadLag[i];
 
 			const int reg = Clamp(static_cast<int>(R.regime[i]), 0, 4);
-			double num = 0, den = 0;
+			double num = 0, den = 0; double gs[G_COUNT] = { 0, 0, 0, 0, 0, 0 }; bool ga[G_COUNT] = { false, false, false, false, false, false };
 			for (int k = 0; k < F_COUNT; ++k)
 			{
 				if (IsNan(f[k])) continue;
 				const float g = (reg == RG_NONE) ? 1.0f : W.gate[reg][kFeatureGroup[k]];
 				const float wk = W.w[k] * g;
 				num += wk * f[k]; den += fabs(wk);
+				gs[kFeatureGroup[k]] += wk * f[k]; ga[kFeatureGroup[k]] = true;
 			}
 			const float dcs = den > 0 ? static_cast<float>(Clamp(100.0 * num / den, -100.0, 100.0)) : 0.0f;
 			D.dcs[i] = dcs;
+			{
+				unsigned char pos = 0, av = 0;
+				for (int g = 0; g < G_COUNT; ++g) { if (!ga[g] || fabs(gs[g]) < 1e-6) continue; av |= static_cast<unsigned char>(1 << g); if (gs[g] > 0) pos |= static_cast<unsigned char>(1 << g); }
+				D.gPos[i] = pos; D.gAvail[i] = av;
+			}
 			D.dcsSmooth[i] = (i == 0) ? dcs : D.dcsSmooth[i - 1] + alpha * (dcs - D.dcsSmooth[i - 1]);
 			D.barState[i] = static_cast<signed char>(dcs >= P.strongThr ? 2 : (dcs >= P.weakThr ? 1 : (dcs <= -P.strongThr ? -2 : (dcs <= -P.weakThr ? -1 : 0))));
 			D.signalType[i] = 0; D.signalDir[i] = 0;
@@ -2796,6 +2840,8 @@ namespace nqe
 				const int score = cands[k].score * 100 + static_cast<int>(tmp.rr * 10);
 				if (score > bestScore) { bestScore = score; best = static_cast<int>(k); sig = tmp; sig.grade = GradeSignal(S, i, cands[k], dcs, thr); }
 			}
+			// outside RTH only the configured grades are taken (thin overnight flow produces weaker setups)
+			if (best >= 0 && i < static_cast<int>(S.base.isRth.size()) && !S.base.isRth[i] && (P.ethSignals == 0 || (P.ethSignals == 1 && sig.grade > 1))) best = -1;
 			if (best >= 0)
 			{
 				// no duplicate of the same setup/direction within 3 bars
@@ -3087,13 +3133,15 @@ namespace nqe
 		}
 		H.lastEventIdx = S.flow.lastEventIdx;
 		H.legR2 = static_cast<float>(S.flow.legReg.r2); H.legDir = S.flow.legReg.slope > 0 ? 1 : (S.flow.legReg.slope < 0 ? -1 : 0);
+		GroupAgreement(S.dcs, i, H.dcs >= 0 ? 1 : -1, H.agree, H.agreeN);
 		// day type guess + range vs ADR
 		{
 			const AuctionState& A = S.auction;
 			double adr = 0; int m = 0;
 			for (int k = static_cast<int>(A.rthRanges.size()) - 1; k >= 0 && m < Max(1, S.params.auction.adrDays); --k, ++m) adr += A.rthRanges[k];
 			adr = m > 0 ? adr / m : 0;
-			const float rng = (A.rthHigh > -FLT_MAX && A.rthLow < FLT_MAX) ? A.rthHigh - A.rthLow : 0.0f;
+			float rng = (A.rthHigh > -FLT_MAX && A.rthLow < FLT_MAX) ? A.rthHigh - A.rthLow : 0.0f;
+			H.adrPrev = false; if (rng <= 0 && !A.rthRanges.empty()) { rng = A.rthRanges.back(); H.adrPrev = true; }
 			H.adrPct = adr > 0 ? static_cast<float>(100.0 * rng / adr) : 0.0f;
 			const float ib = (A.ibClosed && A.ibH > A.ibL) ? A.ibH - A.ibL : 0.0f;
 			if (i < static_cast<int>(S.base.isRth.size()) && !S.base.isRth[i]) strcpy_s(H.dayType, sizeof(H.dayType), "ETH");
@@ -3130,19 +3178,38 @@ namespace nqe
 		// plain-English state line
 		const char* vwapS = S.vwap.vwap.size() > static_cast<size_t>(i) && S.vwap.vwap[i] > 0 ? sc.FormatGraphValue(S.vwap.vwap[i], sc.BaseGraphValueFormat).GetChars() : "VWAP";
 		const Signal* live = (!S.dcs.signals.empty() && i - S.dcs.signals.back().idx <= 5) ? &S.dcs.signals.back() : nullptr;
+		H.liveSize = live ? live->size : 0;
 		if (live)
-			sprintf_s(H.stateLine, sizeof(H.stateLine), "%s %s %c: entry %s | invalid %s | T1 %s", live->dir > 0 ? "LONG" : "SHORT", kSetupNames[live->type], live->grade == 1 ? 'A' : (live->grade == 2 ? 'B' : 'C'),
-				sc.FormatGraphValue(live->entry, sc.BaseGraphValueFormat).GetChars(), sc.FormatGraphValue(live->stop, sc.BaseGraphValueFormat).GetChars(), sc.FormatGraphValue(live->t1, sc.BaseGraphValueFormat).GetChars());
+		{
+			sprintf_s(H.stateLine, sizeof(H.stateLine), "%s %s %c: entry %s", live->dir > 0 ? "LONG" : "SHORT", kSetupNames[live->type], live->grade == 1 ? 'A' : (live->grade == 2 ? 'B' : 'C'), sc.FormatGraphValue(live->entry, sc.BaseGraphValueFormat).GetChars());
+			char sz[24] = ""; if (live->size > 0) sprintf_s(sz, sizeof(sz), " | size %dx", live->size);
+			sprintf_s(H.stateLine2, sizeof(H.stateLine2), "stop %s | T1 %s | R:R %.1f%s", sc.FormatGraphValue(live->stop, sc.BaseGraphValueFormat).GetChars(), sc.FormatGraphValue(live->t1, sc.BaseGraphValueFormat).GetChars(), live->rr, sz);
+		}
 		else if (H.regime == RG_TREND_UP)
-			sprintf_s(H.stateLine, sizeof(H.stateLine), "Buy pullback to %s %s on absorption/delta flip | invalid < %s", H.supKind != LVL_NONE ? LevelName(H.supKind) : "VWAP", H.supPrice > 0 ? sc.FormatGraphValue(H.supPrice, sc.BaseGraphValueFormat).GetChars() : vwapS, H.supPrice > 0 ? sc.FormatGraphValue(H.supPrice - H.atr, sc.BaseGraphValueFormat).GetChars() : "?");
+		{
+			sprintf_s(H.stateLine, sizeof(H.stateLine), "Buy pullback to %s %s", H.supKind != LVL_NONE ? LevelName(H.supKind) : "VWAP", H.supPrice > 0 ? sc.FormatGraphValue(H.supPrice, sc.BaseGraphValueFormat).GetChars() : vwapS);
+			sprintf_s(H.stateLine2, sizeof(H.stateLine2), "trigger absorb/delta flip | invalid < %s", H.supPrice > 0 ? sc.FormatGraphValue(H.supPrice - H.atr, sc.BaseGraphValueFormat).GetChars() : "?");
+		}
 		else if (H.regime == RG_TREND_DOWN)
-			sprintf_s(H.stateLine, sizeof(H.stateLine), "Sell pullback to %s %s on absorption/delta flip | invalid > %s", H.resKind != LVL_NONE ? LevelName(H.resKind) : "VWAP", H.resPrice > 0 ? sc.FormatGraphValue(H.resPrice, sc.BaseGraphValueFormat).GetChars() : vwapS, H.resPrice > 0 ? sc.FormatGraphValue(H.resPrice + H.atr, sc.BaseGraphValueFormat).GetChars() : "?");
+		{
+			sprintf_s(H.stateLine, sizeof(H.stateLine), "Sell pullback to %s %s", H.resKind != LVL_NONE ? LevelName(H.resKind) : "VWAP", H.resPrice > 0 ? sc.FormatGraphValue(H.resPrice, sc.BaseGraphValueFormat).GetChars() : vwapS);
+			sprintf_s(H.stateLine2, sizeof(H.stateLine2), "trigger absorb/delta flip | invalid > %s", H.resPrice > 0 ? sc.FormatGraphValue(H.resPrice + H.atr, sc.BaseGraphValueFormat).GetChars() : "?");
+		}
 		else if (H.regime == RG_BALANCE)
-			sprintf_s(H.stateLine, sizeof(H.stateLine), "Fade %s %s / %s %s on absorption | tgt POC | invalid: acceptance", H.resKind != LVL_NONE ? LevelName(H.resKind) : "VAH", H.resPrice > 0 ? sc.FormatGraphValue(H.resPrice, sc.BaseGraphValueFormat).GetChars() : "", H.supKind != LVL_NONE ? LevelName(H.supKind) : "VAL", H.supPrice > 0 ? sc.FormatGraphValue(H.supPrice, sc.BaseGraphValueFormat).GetChars() : "");
+		{
+			sprintf_s(H.stateLine, sizeof(H.stateLine), "Fade %s %s / %s %s", H.resKind != LVL_NONE ? LevelName(H.resKind) : "VAH", H.resPrice > 0 ? sc.FormatGraphValue(H.resPrice, sc.BaseGraphValueFormat).GetChars() : "", H.supKind != LVL_NONE ? LevelName(H.supKind) : "VAL", H.supPrice > 0 ? sc.FormatGraphValue(H.supPrice, sc.BaseGraphValueFormat).GetChars() : "");
+			strcpy_s(H.stateLine2, sizeof(H.stateLine2), "trigger absorb/exhaust | tgt POC | inv. acceptance");
+		}
 		else if (H.regime == RG_CHOP)
-			sprintf_s(H.stateLine, sizeof(H.stateLine), "Chop: stand aside | need DCS beyond %+.0f + regime change", thr);
+		{
+			strcpy_s(H.stateLine, sizeof(H.stateLine), "Volatile chop: stand aside");
+			sprintf_s(H.stateLine2, sizeof(H.stateLine2), "need DCS beyond %+.0f and a regime change", thr);
+		}
 		else
-			sprintf_s(H.stateLine, sizeof(H.stateLine), "Warming up (need swings, value area and session data)");
+		{
+			strcpy_s(H.stateLine, sizeof(H.stateLine), "Warming up");
+			strcpy_s(H.stateLine2, sizeof(H.stateLine2), "need swings, value area and session data");
+		}
 	}
 
 	namespace render
@@ -3329,7 +3396,7 @@ namespace nqe
 			}
 			// ghost prior session
 			if (V.layer[L_GHOST] && !A.prevProf.empty())
-				Painter::Draw(F, A.prevProf, x0, W, tpl, false, T.dim, 16, 16, INT_MIN, INT_MAX, false, dockR);
+			{ const int ga = A.profVol.empty() ? 34 : 16; Painter::Draw(F, A.prevProf, x0, W, tpl, false, T.dim, ga, ga, INT_MIN, INT_MAX, false, dockR); }
 			// developing session, split by aggressor, value area brighter
 			if (!A.profVol.empty())
 			{
@@ -4043,21 +4110,23 @@ SCSFExport scsf_NQEdge_FeatureLogger(SCStudyInterfaceRef sc)
 
 // --- 9. NQ Edge Terminal: the one study ---------------------------------------
 // Draws only in the price region with Sierra-native objects managed by line number (deleted and
-// re-adjusted on every update). The docked profile and the tape strip use GDI.
+// re-adjusted on every update). The docked profile and the calculated-values strip use GDI.
 enum TermLayer { TL_CANDLES = 0, TL_BAND, TL_LEVELS, TL_SIGNALS, TL_HUD, TL_PROFILE, TL_ZONES, TL_BUBBLES, TL_SWING, TL_NOTES, TL_PROJ, TL_TAPE, TL_FIB, TL_NUMBERS, TL_CHANNEL, TL_COUNT };
-static const char* kTermLayerNames[TL_COUNT] = { "Bias Candles", "VWAP + 1 Sigma Band", "Nearest Levels (pills)", "Signal Arrows + Boxes", "HUD", "Volume Profile (docked right)", "Zones", "Order-Flow Bubbles", "Swing Delta Numbers", "Order-Flow Notes", "Projection Arrow", "Calculated-Values Strip", "Fib Levels (last leg)", "Delta / Volume Per Bar", "Regression Channel" };
+static const char* kTermLayerNames[TL_COUNT] = { "Bias Candles", "VWAP + 1 Sigma Band", "Nearest Levels (pills)", "Signal Arrows + Boxes", "HUD", "Volume Profile (docked right)", "Zones", "Order-Flow Bubbles", "Swing Delta Numbers", "Event Log + Markers", "Projection Arrow", "Calculated-Values Strip", "Fib Levels (last leg)", "Delta Per Bar", "Regression Channel" };
 static const unsigned char kTermPreset[2][TL_COUNT] =
 {
 	{ 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },   // CLEAN
 	{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 },   // PRO
 };
+static const char* kOpenShort[8] = { "--", "Open-Drive up", "Open-Drive down", "Test-Drive up", "Test-Drive down", "Reject-Reverse up", "Reject-Reverse down", "Open-Auction" };
 enum TermInput
 {
 	TI_PRESET = 0, TI_RTH_START, TI_RTH_END, TI_ATR_LEN, TI_VA_PCT, TI_IB_MIN, TI_SWING_N, TI_SWING_ATR, TI_IMB_RATIO, TI_IMB_STACK, TI_ABS_Z,
 	TI_C_YM, TI_C_ES, TI_C_TICK, TI_C_MEGA1, TI_C_MEGA2, TI_C_MEGA3,
 	TI_WEIGHTS, TI_THR, TI_STRONG, TI_WEAK, TI_S1, TI_S2, TI_S3, TI_S4, TI_S5, TI_MIN_GRADE, TI_ALERTS, TI_SOUND, TI_LOG, TI_VWAP_ANCHOR,
+	TI_RISK, TI_ETH, TI_MIN_STOP, TI_MAX_STOP, TI_MIN_RR,
 	TI_LAYER0,                                   // TL_COUNT tri-state inputs follow
-	TI_FONT = TI_LAYER0 + TL_COUNT, TI_NUM_BARS, TI_PROFILE_W, TI_BAND_ALPHA,
+	TI_FONT = TI_LAYER0 + TL_COUNT, TI_NUM_BARS, TI_PROFILE_W, TI_BAND_STYLE, TI_BAND_ALPHA,
 	TI_COL_BULL, TI_COL_BEAR, TI_COL_NEUTRAL, TI_COL_VWAP, TI_COL_LEVEL, TI_COL_LONG, TI_COL_SHORT, TI_COL_TEXT, TI_COL_PANEL, TI_COL_DIM, TI_COUNT
 };
 enum TermSubgraph
@@ -4119,7 +4188,6 @@ namespace term
 			slots[k].used = false;
 		}
 	}
-
 	inline void SlotKeep(DrawSlot* slots, int n) { for (int k = 0; k < n; ++k) if (slots[k].line != 0) slots[k].used = true; }
 
 	inline int LevelBornIdx(const ChartState& S, int kind, int i)
@@ -4136,17 +4204,19 @@ namespace term
 		}
 	}
 
-	// GDI: the docked profile (right edge of the fill space) and the calculated-values strip (bottom of the price region)
+	// GDI: records the region's pixel size (the study sizes HUD rows and pill gaps from it), then draws the
+	// docked profile (right edge of the fill space) and the calculated-values strip (bottom of the price region)
 	void DrawTerminalGDI(HWND WindowHandle, HDC DeviceContext, SCStudyInterfaceRef sc)
 	{
 		std::lock_guard<std::recursive_mutex> lock(g_mutex);
 		ChartState* Sp = Peek(sc.ChartNumber); if (!Sp || sc.ArraySize <= 0 || sc.Graphics.FillRectangle == nullptr) return;
 		ChartState& S = *Sp; const VisualConfig& V = S.vis;
+		render::Frame F(sc, S, sc.GraphRegion);
+		S.term.regionH = Max(0, F.bottom - F.top); S.term.regionW = Max(0, F.right - F.left);
 		if (!V.layer[L_PROFILE] && !V.layer[L_TAPE]) return;
 		const double t0 = render_entry::NowMs();
 		if (sc.Graphics.SetBackgroundMode) sc.Graphics.SetBackgroundMode(TRANSPARENT);
 		if (sc.Graphics.SetTextAlign) sc.Graphics.SetTextAlign(TA_LEFT | TA_TOP | TA_NOUPDATECP);
-		render::Frame F(sc, S, sc.GraphRegion);
 		F.Clip(F.left, F.top, F.right, F.bottom);
 		if (V.layer[L_PROFILE]) render::DrawProfile(F);
 		if (V.layer[L_TAPE])
@@ -4166,7 +4236,7 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 	if (sc.SetDefaults)
 	{
 		sc.GraphName = "NQ Edge Terminal";
-		sc.StudyDescription = "The whole NQ Edge system in one study, drawn only in the price region. PRO preset: bias candles, VWAP band, nearest-level pills, signal boxes, HUD, docked volume profile, swing-delta and per-bar delta/volume numbers, regression channel, fib levels of the last leg, order-flow notes, projection arrow, calculated-values strip. CLEAN keeps only the first five. Every layer is switchable.";
+		sc.StudyDescription = "The whole NQ Edge system in one study, drawn only in the price region. PRO preset: bias candles, VWAP band, nearest-level pills, signal boxes with $-risk size, HUD, docked volume profile, swing-delta and per-bar delta numbers, regression channel, fib levels of the last leg, event log with markers, projection arrow, calculated-values strip. CLEAN keeps only the first five. Every layer is switchable.";
 		sc.GraphRegion = 0; sc.AutoLoop = 0; sc.CalculationPrecedence = VERY_LOW_PREC_LEVEL; sc.ValueFormat = VALUEFORMAT_INHERITED; sc.ScaleRangeType = SCALE_SAMEASREGION; sc.DrawZeros = 0;
 		sc.MaintainVolumeAtPriceData = 1;
 		const char* names[TS_COUNT] = { "Bias Candle", "Forming Bar", "VWAP", "VWAP +1 SD", "VWAP -1 SD", "Long Signal", "Short Signal",
@@ -4175,8 +4245,8 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 		sc.Subgraph[TS_CANDLE].DrawStyle = DRAWSTYLE_COLOR_BAR; sc.Subgraph[TS_CANDLE].PrimaryColor = RGB(138, 147, 166);
 		sc.Subgraph[TS_CANDLE_FORMING].DrawStyle = DRAWSTYLE_COLOR_BAR_HOLLOW; sc.Subgraph[TS_CANDLE_FORMING].PrimaryColor = RGB(138, 147, 166);
 		sc.Subgraph[TS_VWAP].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[TS_VWAP].LineWidth = 2; sc.Subgraph[TS_VWAP].PrimaryColor = RGB(255, 200, 87);
-		sc.Subgraph[TS_BAND_TOP].DrawStyle = DRAWSTYLE_TRANSPARENT_FILL_TOP; sc.Subgraph[TS_BAND_TOP].PrimaryColor = RGB(255, 200, 87);
-		sc.Subgraph[TS_BAND_BOT].DrawStyle = DRAWSTYLE_TRANSPARENT_FILL_BOTTOM; sc.Subgraph[TS_BAND_BOT].PrimaryColor = RGB(255, 200, 87);
+		sc.Subgraph[TS_BAND_TOP].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[TS_BAND_TOP].LineStyle = LINESTYLE_DOT; sc.Subgraph[TS_BAND_TOP].PrimaryColor = RGB(255, 200, 87);
+		sc.Subgraph[TS_BAND_BOT].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[TS_BAND_BOT].LineStyle = LINESTYLE_DOT; sc.Subgraph[TS_BAND_BOT].PrimaryColor = RGB(255, 200, 87);
 		sc.Subgraph[TS_ARROW_UP].DrawStyle = DRAWSTYLE_ARROW_UP; sc.Subgraph[TS_ARROW_UP].LineWidth = 3; sc.Subgraph[TS_ARROW_UP].PrimaryColor = RGB(0, 200, 150);
 		sc.Subgraph[TS_ARROW_DN].DrawStyle = DRAWSTYLE_ARROW_DOWN; sc.Subgraph[TS_ARROW_DN].LineWidth = 3; sc.Subgraph[TS_ARROW_DN].PrimaryColor = RGB(255, 77, 94);
 
@@ -4211,15 +4281,21 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 		sc.Input[TI_SOUND].Name = "Alert Sound Number"; sc.Input[TI_SOUND].SetAlertSoundNumber(1);
 		NQE_YESNO_INPUT(TI_LOG, "Feature Logging (CSV in Data folder)", 1);
 		sc.Input[TI_VWAP_ANCHOR].Name = "VWAP Anchor"; sc.Input[TI_VWAP_ANCHOR].SetCustomInputStrings("Trading Day Start (18:00);RTH Open"); sc.Input[TI_VWAP_ANCHOR].SetCustomInputIndex(0);
+		NQE_FLT_INPUT(TI_RISK, "Risk Per Trade ($, size suggestion)", 100.0, 0.0, 1000000.0);
+		sc.Input[TI_ETH].Name = "Signals Outside RTH"; sc.Input[TI_ETH].SetCustomInputStrings("Off;Grade A only;All"); sc.Input[TI_ETH].SetCustomInputIndex(1);
+		NQE_FLT_INPUT(TI_MIN_STOP, "Setup: Min Stop (ATR)", 0.6, 0.1, 3.0);
+		NQE_FLT_INPUT(TI_MAX_STOP, "Setup: Max Stop (ATR)", 2.5, 0.5, 10.0);
+		NQE_FLT_INPUT(TI_MIN_RR, "Setup: Min R:R To T1", 1.0, 0.5, 5.0);
 		for (int k = 0; k < TL_COUNT; ++k)
 		{
 			SCString nm; nm.Format("Layer: %s", kTermLayerNames[k]);
 			sc.Input[TI_LAYER0 + k].Name = nm; sc.Input[TI_LAYER0 + k].SetCustomInputStrings("Preset default;On;Off"); sc.Input[TI_LAYER0 + k].SetCustomInputIndex(0);
 		}
 		NQE_INT_INPUT(TI_FONT, "HUD Font Size (pt)", 9, 7, 20);
-		NQE_INT_INPUT(TI_NUM_BARS, "Delta/Volume Numbers: Last N Bars", 30, 5, 60);
+		NQE_INT_INPUT(TI_NUM_BARS, "Delta Per Bar: Last N Bars", 30, 5, 60);
 		NQE_INT_INPUT(TI_PROFILE_W, "Profile Width (% of fill space)", 25, 10, 60);
-		NQE_INT_INPUT(TI_BAND_ALPHA, "VWAP Band Transparency %", 88, 50, 98);
+		sc.Input[TI_BAND_STYLE].Name = "VWAP Band Style"; sc.Input[TI_BAND_STYLE].SetCustomInputStrings("Dotted lines;Filled;Off"); sc.Input[TI_BAND_STYLE].SetCustomInputIndex(0);
+		NQE_INT_INPUT(TI_BAND_ALPHA, "VWAP Band Fill Transparency %", 90, 50, 98);
 		NQE_COLOR_INPUT(TI_COL_BULL, "Color: Bull", 0, 200, 150);
 		NQE_COLOR_INPUT(TI_COL_BEAR, "Color: Bear", 255, 77, 94);
 		NQE_COLOR_INPUT(TI_COL_NEUTRAL, "Color: Neutral", 110, 118, 134);
@@ -4258,16 +4334,19 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 		ip.chartMega[0] = sc.Input[TI_C_MEGA1].GetChartNumber(); ip.chartMega[1] = sc.Input[TI_C_MEGA2].GetChartNumber(); ip.chartMega[2] = sc.Input[TI_C_MEGA3].GetChartNumber(); SetParams(S, E_INTER, S.params.inter, ip);
 		DcsParams dp{}; strncpy_s(dp.weightsFile, sizeof(dp.weightsFile), sc.Input[TI_WEIGHTS].GetString(), _TRUNCATE); dp.signalThr = sc.Input[TI_THR].GetFloat(); dp.strongThr = sc.Input[TI_STRONG].GetFloat(); dp.weakThr = sc.Input[TI_WEAK].GetFloat();
 		for (int k = 1; k < SETUP_COUNT; ++k) dp.setupOn[k] = sc.Input[TI_S1 + k - 1].GetYesNo();
-		dp.alertsOn = sc.Input[TI_ALERTS].GetYesNo(); dp.alertSound = sc.Input[TI_SOUND].GetAlertSoundNumber(); dp.alertMinGrade = sc.Input[TI_MIN_GRADE].GetIndex() + 1; SetParams(S, E_DCS, S.params.dcs, dp);
+		dp.alertsOn = sc.Input[TI_ALERTS].GetYesNo(); dp.alertSound = sc.Input[TI_SOUND].GetAlertSoundNumber(); dp.alertMinGrade = sc.Input[TI_MIN_GRADE].GetIndex() + 1;
+		dp.riskPerTrade = sc.Input[TI_RISK].GetFloat(); dp.ethSignals = sc.Input[TI_ETH].GetIndex(); dp.minStopAtr = sc.Input[TI_MIN_STOP].GetFloat(); dp.maxStopAtr = sc.Input[TI_MAX_STOP].GetFloat(); dp.minRR = sc.Input[TI_MIN_RR].GetFloat();
+		SetParams(S, E_DCS, S.params.dcs, dp);
 		ValParams vlp{}; SetParams(S, E_VAL, S.params.val, vlp);
 		LogParams lp{}; lp.enabled = sc.Input[TI_LOG].GetYesNo(); SetParams(S, E_LOG, S.params.log, lp);
 	}
 	// ---- layers: preset defaults with per-layer overrides ----
 	const int preset = Clamp(static_cast<int>(sc.Input[TI_PRESET].GetIndex()), 0, 1);
+	const bool pro = preset == 1;
 	bool on[TL_COUNT];
 	for (int k = 0; k < TL_COUNT; ++k) { const int tri = sc.Input[TI_LAYER0 + k].GetIndex(); on[k] = tri == 1 ? true : (tri == 2 ? false : kTermPreset[preset][k] != 0); }
 	VisualConfig& V = S.vis;
-	V.preset = preset == 1 ? PRESET_COMMAND : PRESET_CLEAN; V.diagnostics = false; V.fontPt = sc.Input[TI_FONT].GetInt(); V.minGrade = sc.Input[TI_MIN_GRADE].GetIndex() + 1; V.tapeRows = 63; V.maxNotes = 8;
+	V.preset = pro ? PRESET_COMMAND : PRESET_CLEAN; V.diagnostics = false; V.fontPt = sc.Input[TI_FONT].GetInt(); V.minGrade = sc.Input[TI_MIN_GRADE].GetIndex() + 1; V.tapeRows = 63; V.maxNotes = 6;
 	for (int k = 0; k < L_COUNT; ++k) V.layer[k] = false;
 	V.layer[L_CANDLES] = on[TL_CANDLES]; V.layer[L_LEVELS] = on[TL_LEVELS]; V.layer[L_CARDS] = on[TL_SIGNALS]; V.layer[L_HUD] = on[TL_HUD];
 	V.layer[L_PROFILE] = on[TL_PROFILE]; V.layer[L_GHOST] = on[TL_PROFILE]; V.layer[L_ZONES] = on[TL_ZONES]; V.layer[L_BUBBLES] = on[TL_BUBBLES];
@@ -4298,9 +4377,12 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 
 	// ---- subgraphs: candles, VWAP + band, arrows, hidden helpers ----
 	const bool candles = on[TL_CANDLES], band = on[TL_BAND], signals = on[TL_SIGNALS];
+	const int bandStyle = (!band) ? 2 : Clamp(static_cast<int>(sc.Input[TI_BAND_STYLE].GetIndex()), 0, 2);   // 0 dotted lines, 1 fill, 2 off
 	sc.Subgraph[TS_CANDLE].DrawStyle = candles ? DRAWSTYLE_COLOR_BAR : DRAWSTYLE_IGNORE; sc.Subgraph[TS_CANDLE_FORMING].DrawStyle = candles ? DRAWSTYLE_COLOR_BAR_HOLLOW : DRAWSTYLE_IGNORE;
 	sc.Subgraph[TS_VWAP].DrawStyle = band ? DRAWSTYLE_LINE : DRAWSTYLE_IGNORE; sc.Subgraph[TS_VWAP].PrimaryColor = cVwap;
-	sc.Subgraph[TS_BAND_TOP].DrawStyle = band ? DRAWSTYLE_TRANSPARENT_FILL_TOP : DRAWSTYLE_IGNORE; sc.Subgraph[TS_BAND_BOT].DrawStyle = band ? DRAWSTYLE_TRANSPARENT_FILL_BOTTOM : DRAWSTYLE_IGNORE;
+	sc.Subgraph[TS_BAND_TOP].DrawStyle = bandStyle == 2 ? DRAWSTYLE_IGNORE : (bandStyle == 1 ? DRAWSTYLE_TRANSPARENT_FILL_TOP : DRAWSTYLE_LINE);
+	sc.Subgraph[TS_BAND_BOT].DrawStyle = bandStyle == 2 ? DRAWSTYLE_IGNORE : (bandStyle == 1 ? DRAWSTYLE_TRANSPARENT_FILL_BOTTOM : DRAWSTYLE_LINE);
+	sc.Subgraph[TS_BAND_TOP].LineStyle = sc.Subgraph[TS_BAND_BOT].LineStyle = LINESTYLE_DOT; sc.Subgraph[TS_BAND_TOP].LineWidth = sc.Subgraph[TS_BAND_BOT].LineWidth = 1;
 	sc.Subgraph[TS_BAND_TOP].PrimaryColor = sc.Subgraph[TS_BAND_BOT].PrimaryColor = cVwap;
 	sc.Subgraph[TS_ARROW_UP].DrawStyle = signals ? DRAWSTYLE_ARROW_UP : DRAWSTYLE_IGNORE; sc.Subgraph[TS_ARROW_DN].DrawStyle = signals ? DRAWSTYLE_ARROW_DOWN : DRAWSTYLE_IGNORE;
 	sc.Subgraph[TS_ARROW_UP].PrimaryColor = cLong; sc.Subgraph[TS_ARROW_DN].PrimaryColor = cShort;
@@ -4338,22 +4420,27 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 	// ---- managed drawings (delete + redraw by line number every update) ----
 	TermState& T = S.term;
 	const int fillBars = static_cast<int>(sc.NumFillSpaceBars);
-	// fill-space layout: HUD text from +2 bars, tag pills in the middle, docked profile on the right
 	const int profBars = on[TL_PROFILE] ? Max(4, fillBars * V.profileWidthPct / 100) : 0;
-	const int tagIdx = n - 1 + Max(3, fillBars - profBars - 10);
+	// pixel geometry: bar spacing and the region height (from the GDI pass) size the pills and the HUD rows
+	const int barPx = sc.ChartBarSpacing > 0 ? static_cast<int>(sc.ChartBarSpacing) : 8;
+	const float charPx = 0.62f * 1.33f * static_cast<float>(fontPt);
+	const int pillEnd = n - 1 + Max(4, fillBars - profBars - 1);                                          // pills are right-aligned here (left of the profile)
+	const int pillCol1 = pillEnd - Max(6, static_cast<int>(charPx * 13.0f / barPx) + 1);                  // second column when two pills would overlap
+	const int lineEnd = Max(n, pillCol1 - 2);
+	double visHi = 0, visLo = 0; if (sc.GetGraphVisibleHighAndLow != nullptr) sc.GetGraphVisibleHighAndLow(visHi, visLo);
+	const double visRange = visHi > visLo ? visHi - visLo : 0.0;
+	const float pillH = visRange > 0 ? static_cast<float>(T.regionH > 0 ? (1.33 * 1.5 * fontPt) * visRange / T.regionH : 0.024 * visRange) : 0.0f;   // pill height in price units
+	const float pitch = T.regionH > 0 ? Clamp(100.0f * (1.33f * 1.45f * fontPt) / static_cast<float>(T.regionH), 1.2f, 4.0f) : 3.2f;              // HUD row pitch in % of the region
+	const double relX = -2.0;                                                                              // HUD / log anchor: 2 bars right of the last bar
 	// heavy per-bar layers are redrawn when a bar closes, the layer set changes or the engines were rebuilt
 	int& lastN = sc.GetPersistentInt(2); int& lastMask = sc.GetPersistentInt(3);
 	int mask = preset << 20; for (int k = 0; k < TL_COUNT; ++k) if (on[k]) mask |= 1 << k;
 	const bool heavy = lastN != n || lastMask != mask || sc.IsFullRecalculation != 0 || start == 0;
 	lastN = n; lastMask = mask;
-	std::vector<float> pillPrices;
-	const int lineEnd = Max(n, tagIdx - 1);
 	std::vector<dcs_detail::Lv> lv; dcs_detail::GatherLevels(sc, S, Max(0, lastClosed), lv);
-	// where is price inside the visible scale? (HUD goes to the opposite half so it never sits on the level pills)
-	double visHi = 0, visLo = 0; if (sc.GetGraphVisibleHighAndLow != nullptr) sc.GetGraphVisibleHighAndLow(visHi, visLo);
-	const bool hudTop = !(visHi > visLo && (close - visLo) / (visHi - visLo) > 0.55);
+	std::vector<float> pillPrices;
 
-	// nearest levels: 2+2 (CLEAN) or 3+3 (PRO), equal prices merged, VWAP bands and zones excluded
+	// nearest levels: 2+2 (CLEAN) or 3+3 (PRO), equal prices merged, VWAP bands and zones excluded; right-aligned pills in two columns
 	if (on[TL_LEVELS] && lastClosed >= 0)
 	{
 		struct L4 { float price; int kind; char text[40]; };
@@ -4369,23 +4456,64 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 			L4 c; c.price = lv[k].price; c.kind = kind; strcpy_s(c.text, sizeof(c.text), dcs_detail::LevelName(kind)); cand.push_back(c);
 		}
 		std::sort(cand.begin(), cand.end(), [](const L4& a, const L4& b) { return a.price < b.price; });
-		const int per = preset == 1 ? 3 : 2;
+		const int per = pro ? 3 : 2;
 		int pick[TermState::LVL_SLOTS]; int np = 0;
 		int above = -1, below = -1;
 		for (size_t q = 0; q < cand.size(); ++q) { if (cand[q].price > close && above < 0) above = static_cast<int>(q); if (cand[q].price <= close) below = static_cast<int>(q); }
 		for (int k = 0; k < per && above >= 0 && above + k < static_cast<int>(cand.size()) && np < TermState::LVL_SLOTS; ++k) pick[np++] = above + k;
 		for (int k = 0; k < per && below >= 0 && below - k >= 0 && np < TermState::LVL_SLOTS; ++k) pick[np++] = below - k;
+		std::sort(pick, pick + np);   // ascending price, so a pill that would sit on the previous one moves one column left
 		const float tol = S.params.dcs.levelTolAtr * atr;
+		float lastCol0 = -FLT_MAX;
 		for (int k = 0; k < TermState::LVL_SLOTS; ++k)
 		{
 			if (k >= np) continue;
 			const L4& c = cand[pick[k]];
 			const bool isNear = fabs(c.price - close) <= tol;
 			const int born = Max(0, LevelBornIdx(S, c.kind, lastClosed));
-			SlotLine(sc, T.lvlLine[k], born, lineEnd, c.price, c.price, cLevel, 1, isNear ? LINESTYLE_SOLID : LINESTYLE_DOT);
 			sprintf_s(buf, sizeof(buf), " %s %s ", c.text, PXS(c.price));
-			SlotText(sc, T.lvlTag[k], tagIdx, 0, c.price, false, buf, cPanel, Max(7, fontPt - 1), isNear, isNear ? cText : cLevel, true, DT_LEFT | DT_VCENTER);
+			const int w = Max(4, static_cast<int>(charPx * static_cast<float>(strlen(buf)) / barPx) + 1);
+			const bool col1 = (c.price - lastCol0) < pillH;
+			if (!col1) lastCol0 = c.price;
+			const int anchor = col1 ? pillCol1 : pillEnd;
+			SlotLine(sc, T.lvlLine[k], born, Max(n, anchor - w), c.price, c.price, cLevel, 1, isNear ? LINESTYLE_SOLID : LINESTYLE_DOT);
+			SlotText(sc, T.lvlTag[k], anchor, 0, c.price, false, buf, cPanel, Max(7, fontPt - 1), isNear, isNear ? cText : cLevel, true, DT_RIGHT | DT_VCENTER);
 			pillPrices.push_back(c.price);
+		}
+	}
+
+	// HUD geometry: the text block goes to whichever end (top / bottom) holds fewer level pills; ties go away from price
+	const int nl = pro ? 12 : 7;
+	const float pillPitch = pitch * 1.7f;
+	const float hudTotal = pillPitch + pitch * static_cast<float>(nl - 1);
+	const float hudBase = on[TL_TAPE] ? 14.0f : 3.0f;
+	int topHits = 0, botHits = 0;
+	for (size_t q = 0; q < pillPrices.size() && visRange > 0; ++q)
+	{
+		const float y = static_cast<float>(100.0 * (pillPrices[q] - visLo) / visRange);
+		if (y >= 96.0f - hudTotal) ++topHits;
+		if (y <= hudBase + hudTotal + 1.0f) ++botHits;
+	}
+	const float priceY = visRange > 0 ? static_cast<float>(100.0 * (close - visLo) / visRange) : 50.0f;
+	const bool hudTop = on[TL_HUD] ? (topHits != botHits ? topHits < botHits : priceY <= 55.0f) : true;
+	const float hudY0 = hudTop ? 97.0f : Min(97.0f, hudBase + hudTotal);
+	const float hudPLo = visRange > 0 ? static_cast<float>(visLo + visRange * (hudY0 - hudTotal) / 100.0) : 0.0f, hudPHi = visRange > 0 ? static_cast<float>(visLo + visRange * hudY0 / 100.0) : 0.0f;
+
+	// fib retracements of the last completed leg; a tag is skipped where a level pill or the HUD already sits
+	if (on[TL_FIB] && !FL.legs.empty())
+	{
+		const FlowState::Leg& L2 = FL.legs.back();
+		static const float r[TermState::FIB_SLOTS] = { 0.382f, 0.5f, 0.618f, 0.786f };
+		for (int k = 0; k < TermState::FIB_SLOTS; ++k)
+		{
+			const float price = L2.toPrice - (L2.toPrice - L2.fromPrice) * r[k];
+			SlotLine(sc, T.fibLine[k], L2.toIdx, lineEnd, price, price, cVwap, 1, LINESTYLE_DOT);
+			bool clash = on[TL_HUD] && visRange > 0 && price >= hudPLo - pillH && price <= hudPHi + pillH;
+			for (size_t q = 0; q < pillPrices.size() && !clash; ++q) if (fabs(pillPrices[q] - price) < Max(pillH, 0.3f * atr)) clash = true;
+			if (clash) continue;
+			sprintf_s(buf, sizeof(buf), " %.1f%% %s ", r[k] * 100, PXS(price));
+			SlotText(sc, T.fibTag[k], pillEnd, 0, price, false, buf, cPanel, Max(7, fontPt - 2), false, cVwap, true, DT_RIGHT | DT_VCENTER);
+			pillPrices.push_back(price);
 		}
 	}
 
@@ -4406,84 +4534,15 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 			SlotRect(sc, sd.reward, g.idx, endIdx, Max(g.entry, g.t2), Min(g.entry, g.t2), cLong, 85, nullptr);
 			SlotLine(sc, sd.t1, g.idx, endIdx, g.t1, g.t1, cLong, 1, LINESTYLE_DOT);
 			const char grade = g.grade == 1 ? 'A' : (g.grade == 2 ? 'B' : 'C');
-			if (live) sprintf_s(buf, sizeof(buf), "%s %c | %s | DCS %+.0f | R:R %.1f | stop %s T1 %s", g.dir > 0 ? "LONG" : "SHORT", grade, kSetupNames[Clamp(g.type, 0, SETUP_COUNT - 1)], g.dcs, g.rr, PXS(g.stop), PXS(g.t1));
+			char sz[16] = ""; if (g.size > 0) sprintf_s(sz, sizeof(sz), " | %dx", g.size);
+			if (live) sprintf_s(buf, sizeof(buf), "%s %c | %s | R:R %.1f | stop %s%s", g.dir > 0 ? "LONG" : "SHORT", grade, kSetupNames[Clamp(g.type, 0, SETUP_COUNT - 1)], g.rr, PXS(g.stop), sz);
 			else sprintf_s(buf, sizeof(buf), "%s %+.1fR | %s %c", g.resolved == 1 ? "WIN" : (g.resolved == -1 ? "LOSS" : "TIMEOUT"), g.resultR, kSetupNames[Clamp(g.type, 0, SETUP_COUNT - 1)], grade);
 			const uint32_t lc = live ? (g.dir > 0 ? cLong : cShort) : (g.resolved == 1 ? cLong : (g.resolved == -1 ? cShort : cDim));
-			SlotText(sc, sd.label, endIdx + (live ? 1 : 0), 0, g.stop, false, buf, lc, Max(7, fontPt - 1), live, 0, false, DT_LEFT | (g.dir > 0 ? DT_TOP : DT_BOTTOM));
+			SlotText(sc, sd.label, live ? g.idx : endIdx + 1, 0, live ? (g.dir > 0 ? g.t2 : g.stop) : g.stop, false, buf, lc, Max(7, fontPt - 1), live, 0, false, DT_LEFT | (live ? DT_BOTTOM : (g.dir > 0 ? DT_TOP : DT_BOTTOM)));
 		}
 	}
 
-	// HUD: text lines in the empty space right of the last bar; top or bottom half, away from the level pills
-	if (on[TL_HUD])
-	{
-		struct HudLine { char text[200]; uint32_t color; bool bold; bool pill; uint32_t back; int pt; };
-		std::vector<HudLine> lines; lines.reserve(TermState::HUD_SLOTS);
-		HudLine L;
-		// 1. bias pill + score
-		L.pill = true; L.bold = true; L.pt = fontPt + 3; L.color = cPanel; L.back = H.bias > 0 ? cBull : (H.bias < 0 ? cBear : cNeu);
-		sprintf_s(L.text, sizeof(L.text), " %s  DCS %+.0f %s ", H.bias > 0 ? "LONG" : (H.bias < 0 ? "SHORT" : "NEUTRAL"), H.dcs, H.dcsTrend > 5 ? "^" : (H.dcsTrend < -5 ? "v" : "=")); lines.push_back(L);
-		// 2. regime / open / value / day type
-		L.pill = false; L.bold = false; L.pt = fontPt; L.back = 0; L.color = H.regime == RG_TREND_UP ? cBull : (H.regime == RG_TREND_DOWN ? cBear : cText);
-		sprintf_s(L.text, sizeof(L.text), "%s | %s | %s | %s", kRegimeNames[Clamp(H.regime, 0, 4)], kOpenTypeNames[Clamp(H.openType, 0, 7)], H.valueMig > 0.5f ? "value higher" : (H.valueMig < -0.5f ? "value lower" : "value overlap"), H.dayType); lines.push_back(L);
-		// 3. plan
-		L.bold = true; L.color = cVwap; strncpy_s(L.text, sizeof(L.text), H.stateLine[0] ? H.stateLine : "Warming up...", _TRUNCATE); lines.push_back(L);
-		// 4. MTF + leg quality + SMT
-		{
-			static const char* nm[4] = { "1m", "5m", "15m", "60m" };
-			char mt[120] = "MTF "; for (int k = 0; k < 4; ++k) { char c[16]; sprintf_s(c, sizeof(c), " %s%s", nm[k], !H.mtfAvail[k] ? "." : (H.mtf[k] > 0 ? "+" : (H.mtf[k] < 0 ? "-" : "="))); strcat_s(mt, sizeof(mt), c); }
-			char ex[64]; sprintf_s(ex, sizeof(ex), "  | leg R2 %.2f%s%s", H.legR2, H.smt != 0 ? (H.smt > 0 ? " | SMT+" : " | SMT-") : "", H.leadLag[0] ? " | " : ""); strcat_s(mt, sizeof(mt), ex); if (H.leadLag[0]) strcat_s(mt, sizeof(mt), H.leadLag);
-			L.bold = false; L.color = cText; strncpy_s(L.text, sizeof(L.text), mt, _TRUNCATE); lines.push_back(L);
-		}
-		// 5. order flow (PRO)
-		if (preset == 1)
-		{
-			const float dl = lastClosed >= 0 ? FL.delta[lastClosed] : 0.0f; const float dp = lastClosed >= 0 ? FL.deltaPct[lastClosed] : 0.0f;
-			char d[16]; render::Abbrev(dl, d, sizeof(d));
-			if (H.lastEvent[0]) sprintf_s(L.text, sizeof(L.text), "CVD %s z%+.1f | bar delta %s%s (%+.0f%%) | %s @ %s %db ago", H.cvdTrend > 0 ? "^" : (H.cvdTrend < 0 ? "v" : "="), H.cvdZ, dl > 0 ? "+" : "", d, dp * 100, H.lastEvent, PXS(H.lastEventPrice), Max(0, lastClosed - H.lastEventIdx));
-			else sprintf_s(L.text, sizeof(L.text), "CVD %s z%+.1f | bar delta %s%s (%+.0f%%)", H.cvdTrend > 0 ? "^" : (H.cvdTrend < 0 ? "v" : "="), H.cvdZ, dl > 0 ? "+" : "", d, dp * 100);
-			L.color = H.cvdTrend > 0 ? cBull : (H.cvdTrend < 0 ? cBear : cText); lines.push_back(L);
-		}
-		// 6. nearest levels + range
-		if (H.resPrice > 0 && H.supPrice > 0) sprintf_s(L.text, sizeof(L.text), "R %s %s +%dt | S %s %s -%dt | range %.0f%% ADR", dcs_detail::LevelName(H.resKind), PXS(H.resPrice), static_cast<int>((H.resPrice - close) / tick + 0.5f), dcs_detail::LevelName(H.supKind), PXS(H.supPrice), static_cast<int>((close - H.supPrice) / tick + 0.5f), H.adrPct);
-		else sprintf_s(L.text, sizeof(L.text), "Levels: waiting for session data");
-		L.color = cLevel; lines.push_back(L);
-		// 7. scoreboard (PRO)
-		if (preset == 1)
-		{
-			const SetupStats& st = S.val.stats[Clamp(H.curSetup, 0, SETUP_COUNT - 1)];
-			if (st.count > 0) sprintf_s(L.text, sizeof(L.text), "%s: hist %.0f%% | avg %+.2fR | n=%d%s | %d signals total", kSetupNames[Clamp(H.curSetup, 0, SETUP_COUNT - 1)], 100.0 * st.wins / Max(1, st.wins + st.losses), st.sumR / st.count, st.count, st.count < S.params.val.minSample ? " (small n)" : "", H.signalsTotal);
-			else sprintf_s(L.text, sizeof(L.text), "Scoreboard: no resolved signals yet (%d logged)", H.signalsTotal);
-			L.color = cDim; lines.push_back(L);
-		}
-		// 8. session clock (PRO)
-		if (preset == 1)
-		{
-			const int tod = sc.GetCurrentDateTime().GetTimeInSeconds(); const BaseParams& BP = S.params.base; const int ibEnd = BP.rthStartSec + S.params.auction.ibMinutes * 60;
-			int secs; const char* what;
-			if (tod < BP.rthStartSec) { secs = BP.rthStartSec - tod; what = "to RTH open"; } else if (tod < ibEnd) { secs = ibEnd - tod; what = "to IB end"; } else if (tod < BP.rthEndSec) { secs = BP.rthEndSec - tod; what = "to close"; } else { secs = 86400 - tod + BP.rthStartSec; what = "to RTH open"; }
-			const int cd = sc.GetLatestBarCountdownAsInteger != nullptr ? sc.GetLatestBarCountdownAsInteger() : 0;
-			sprintf_s(L.text, sizeof(L.text), "%dh%02dm %s | bar %d:%02d | %s", secs / 3600, (secs % 3600) / 60, what, cd / 60, cd % 60, sc.Symbol.GetChars());
-			L.color = cDim; lines.push_back(L);
-		}
-		// 9. health or first warning
-		if (S.warn.text[0]) { const char* e = strchr(S.warn.text, '\n'); const size_t len = static_cast<size_t>((e ? e : S.warn.text + strlen(S.warn.text)) - S.warn.text); strncpy_s(L.text, sizeof(L.text), S.warn.text, Min(len, sizeof(L.text) - 1)); L.color = cVwap; }
-		else { sprintf_s(L.text, sizeof(L.text), "%s | %s | mkt %d/%d | %.1f ms%s", S.warn.vapOff ? "VAP off" : "VAP on", S.warn.noDepth ? "depth off" : "depth on", H.interConnected, H.interConfigured, H.updateMs, fillBars >= 25 ? "" : " | set Fill Space >= 40 bars"); L.color = cDim; L.pt = Max(7, fontPt - 1); }
-		lines.push_back(L);
-
-		const double relX = -2.0;
-		const float step = Max(3.2f, 0.32f * fontPt);
-		const int nl = Min(static_cast<int>(lines.size()), TermState::HUD_SLOTS);
-		const float total = step * 1.9f + step * (nl - 1);
-		const float y0 = hudTop ? 97.0f : Min(97.0f, (on[TL_TAPE] ? 15.0f : 3.0f) + total);
-		for (int k = 0; k < nl; ++k)
-		{
-			const HudLine& ln = lines[k];
-			const float y = k == 0 ? y0 : y0 - step * 1.9f - step * (k - 1);
-			SlotText(sc, T.hud[k], -1, relX, y, true, ln.text, ln.color, ln.pt, ln.bold, ln.back, ln.pill, DT_LEFT | DT_TOP);
-		}
-	}
-
-	// optional layers (native objects, bounded, within 2 ATR of price unless structural)
+	// swing-delta numbers at confirmed pivots (no connecting lines)
 	const float numOff = on[TL_NUMBERS] ? 0.2f : 0.0f;
 	if (on[TL_SWING] && !FL.legs.empty() && !heavy) SlotKeep(T.swing, TermState::SWING_SLOTS);
 	else if (on[TL_SWING] && !FL.legs.empty())
@@ -4498,19 +4557,20 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 			SlotText(sc, T.swing[slot++], L2.toIdx, 0, L2.up ? L2.toPrice + (0.2f + numOff) * atr : L2.toPrice - (0.2f + numOff) * atr, false, buf, L2.delta >= 0 ? cBull : cBear, fontPt + 1, true, 0, false, DT_CENTER | (L2.up ? DT_BOTTOM : DT_TOP));
 		}
 	}
-	if (on[TL_NUMBERS] && sc.ChartBarSpacing >= 9 && lastClosed >= 0 && !heavy) SlotKeep(T.num, TermState::NUM_SLOTS);
-	else if (on[TL_NUMBERS] && sc.ChartBarSpacing >= 9 && lastClosed >= 0)
+	// per-bar delta numbers (volume lives in the strip); only when bars are wide enough to read them
+	if (on[TL_NUMBERS] && barPx >= 12 && lastClosed >= 0 && !heavy) SlotKeep(T.num, TermState::NUM_SLOTS);
+	else if (on[TL_NUMBERS] && barPx >= 12 && lastClosed >= 0)
 	{
-		const int N = Min(TermState::NUM_SLOTS / 2, sc.Input[TI_NUM_BARS].GetInt());
+		const int N = Min(TermState::NUM_SLOTS, sc.Input[TI_NUM_BARS].GetInt());
 		int slot = 0;
-		for (int i = Max(0, lastClosed - N + 1); i <= lastClosed && slot + 1 < TermState::NUM_SLOTS; ++i)
+		for (int i = Max(0, lastClosed - N + 1); i <= lastClosed && slot < TermState::NUM_SLOTS; ++i)
 		{
-			const float dl = FL.delta[i]; char d[16]; render::Abbrev(dl, d, sizeof(d)); char vv[16]; render::Abbrev(sc.Volume[i], vv, sizeof(vv));
+			const float dl = FL.delta[i]; char d[16]; render::Abbrev(dl, d, sizeof(d));
 			sprintf_s(buf, sizeof(buf), "%s%s", dl > 0 ? "+" : "", d);
-			SlotText(sc, T.num[slot++], i, 0, sc.High[i] + 0.1f * atr, false, buf, dl >= 0 ? cBull : cBear, Max(6, fontPt - 2), false, 0, false, DT_CENTER | DT_BOTTOM);
-			SlotText(sc, T.num[slot++], i, 0, sc.Low[i] - 0.1f * atr, false, vv, cDim, Max(6, fontPt - 2), false, 0, false, DT_CENTER | DT_TOP);
+			SlotText(sc, T.num[slot++], i, 0, sc.High[i] + 0.08f * atr, false, buf, dl >= 0 ? cBull : cBear, Max(6, fontPt - 2), false, 0, false, DT_CENTER | DT_BOTTOM);
 		}
 	}
+	// regression channel of the active leg
 	if (on[TL_CHANNEL] && FL.legReg.startIdx >= 0 && FL.legReg.sigma > 0 && lastClosed - FL.legReg.startIdx >= 5 && !heavy) SlotKeep(T.chan, TermState::CHAN_SLOTS);
 	else if (on[TL_CHANNEL] && FL.legReg.startIdx >= 0 && FL.legReg.sigma > 0 && lastClosed - FL.legReg.startIdx >= 5)
 	{
@@ -4521,22 +4581,7 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 		SlotLine(sc, T.chan[1], R.startIdx, lastClosed + ext, yA + k2, yB + k2, cc, 1, LINESTYLE_DOT);
 		SlotLine(sc, T.chan[2], R.startIdx, lastClosed + ext, yA - k2, yB - k2, cc, 1, LINESTYLE_DOT);
 	}
-	if (on[TL_FIB] && !FL.legs.empty())
-	{
-		// retracements of the last completed leg; a tag is skipped where a level pill already sits
-		const FlowState::Leg& L2 = FL.legs.back();
-		static const float r[TermState::FIB_SLOTS] = { 0.382f, 0.5f, 0.618f, 0.786f };
-		for (int k = 0; k < TermState::FIB_SLOTS; ++k)
-		{
-			const float price = L2.toPrice - (L2.toPrice - L2.fromPrice) * r[k];
-			SlotLine(sc, T.fibLine[k], L2.toIdx, lineEnd, price, price, cVwap, 1, LINESTYLE_DOT);
-			bool clash = false; for (size_t q = 0; q < pillPrices.size(); ++q) if (fabs(pillPrices[q] - price) < 0.3f * atr) clash = true;
-			if (clash) continue;
-			sprintf_s(buf, sizeof(buf), " %.1f%% %s ", r[k] * 100, PXS(price));
-			SlotText(sc, T.fibTag[k], tagIdx, 0, price, false, buf, cPanel, Max(7, fontPt - 2), false, cVwap, true, DT_LEFT | DT_VCENTER);
-			pillPrices.push_back(price);
-		}
-	}
+	// zones within 2 ATR
 	if (on[TL_ZONES] && !heavy) SlotKeep(T.zone, TermState::ZONE_SLOTS);
 	else if (on[TL_ZONES])
 	{
@@ -4551,6 +4596,7 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 				SlotRect(sc, T.zone[slot++], Z.bornIdx, lineEnd, Z.top, Z.bottom, Z.dir > 0 ? cBull : (Z.dir < 0 ? cBear : cLevel), 82, letters[s]);
 			}
 	}
+	// large-trade bubbles
 	if (on[TL_BUBBLES] && !FL.bubbles.empty() && !heavy) SlotKeep(T.bubble, TermState::BUBBLE_SLOTS);
 	else if (on[TL_BUBBLES] && !FL.bubbles.empty())
 	{
@@ -4564,22 +4610,33 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 			SlotMarker(sc, T.bubble[slot++], b.idx, b.price, MARKER_POINT, 4 + static_cast<int>(8.0 * sqrt(b.size / mx)), b.dir > 0 ? cBull : cBear);
 		}
 	}
-	if (on[TL_NOTES] && !S.events.empty() && !heavy) SlotKeep(T.note, TermState::NOTE_SLOTS);
-	else if (on[TL_NOTES] && !S.events.empty())
+	// event log: the last 6 distinct order-flow / structure events as a list at the end opposite the HUD, each with a dash marker at its price
+	const int LOGN = TermState::NOTE_SLOTS / 2;
+	if (on[TL_NOTES] && !heavy) SlotKeep(T.note, TermState::NOTE_SLOTS);
+	else if (on[TL_NOTES])
 	{
-		int slot = 0; std::vector<std::pair<int, float> > placed;
-		for (int k = static_cast<int>(S.events.size()) - 1; k >= 0 && slot < TermState::NOTE_SLOTS; --k)
+		const Event* pick[TermState::NOTE_SLOTS / 2]; int np = 0;
+		for (int k = static_cast<int>(S.events.size()) - 1; k >= 0 && np < LOGN; --k)
 		{
 			const Event& e = S.events[k];
-			if (lastClosed - e.idx > 150) break;
-			if (fabs(e.price - close) > 2.5f * atr) continue;
-			float yv = e.dir > 0 ? sc.Low[e.idx] - (0.45f + numOff) * atr : sc.High[e.idx] + (0.45f + numOff) * atr;
-			for (int tries = 0; tries < 6; ++tries) { bool hit = false; for (size_t p = 0; p < placed.size(); ++p) if (abs(placed[p].first - e.idx) <= 12 && fabs(placed[p].second - yv) < 0.4f * atr) { yv += (e.dir > 0 ? -0.4f : 0.4f) * atr; hit = true; } if (!hit) break; }
-			placed.push_back(std::make_pair(e.idx, yv));
-			sprintf_s(buf, sizeof(buf), "%s %s", e.time, e.text);
-			SlotText(sc, T.note[slot++], e.idx, 0, yv, false, buf, e.dir > 0 ? cBull : (e.dir < 0 ? cBear : cLevel), Max(7, fontPt - 2), false, 0, false, DT_LEFT | (e.dir > 0 ? DT_TOP : DT_BOTTOM));
+			if (e.kind == EV_SIGNAL) continue;
+			if (lastClosed - e.idx > 240) break;
+			bool dup = false; for (int q = 0; q < np; ++q) if (pick[q]->kind == e.kind && pick[q]->dir == e.dir && pick[q]->idx - e.idx <= 6) { dup = true; break; }
+			if (dup) continue;
+			pick[np++] = &e;
+		}
+		for (int q = 0; q < np; ++q)
+		{
+			const Event& e = *pick[q];
+			const int ago = lastClosed - e.idx;
+			if (ago <= 0) sprintf_s(buf, sizeof(buf), "%s %s", e.time, e.text); else sprintf_s(buf, sizeof(buf), "%s %s (%db)", e.time, e.text, ago);
+			const uint32_t col = e.dir > 0 ? cBull : (e.dir < 0 ? cBear : cLevel);
+			const float y = hudTop ? hudBase + pitch * static_cast<float>(LOGN - q) : 97.0f - pitch * static_cast<float>(q);
+			SlotText(sc, T.note[q], -1, relX, y, true, buf, col, Max(7, fontPt - 1), q == 0, 0, false, DT_LEFT | DT_TOP);
+			if (fabs(e.price - close) <= 3.0f * atr) SlotMarker(sc, T.note[LOGN + q], e.idx, e.price, MARKER_DASH, 8, col);
 		}
 	}
+	// projection: expected path from the last bar into the fill space with the empirical odds
 	if (on[TL_PROJ] && lastClosed >= 0 && (H.regime == RG_TREND_UP || H.regime == RG_TREND_DOWN || H.regime == RG_BALANCE))
 	{
 		float w1 = 0, w2 = 0; int dir = 0; int setup = SETUP_NONE;
@@ -4595,9 +4652,89 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 			int nn = 0, wins = 0;
 			for (int g = 0; g < 3; ++g) { if (live && (g + 1) != live->grade) continue; const SetupStats& st = S.val.stats3[setup][Clamp(H.regime, 0, 4)][g]; nn += st.wins + st.losses; wins += st.wins; }
 			if (nn < 10) { const SetupStats& st = S.val.stats[setup]; nn = st.wins + st.losses; wins = st.wins; }
-			if (nn > 0) sprintf_s(buf, sizeof(buf), "%s P(T1) %.0f%% n=%d%s", live ? "signal" : (H.regime == RG_BALANCE ? "rotation" : "pullback+go"), 100.0 * wins / Max(1, nn), nn, nn < S.params.val.minSample ? " (low conf.)" : "");
-			else sprintf_s(buf, sizeof(buf), "%s | no history yet", live ? "signal" : (H.regime == RG_BALANCE ? "rotation" : "pullback+go"));
+			const char* what = live ? "signal" : (H.regime == RG_BALANCE ? "rotation" : "pullback+go");
+			if (nn > 0) sprintf_s(buf, sizeof(buf), "%s P(T1) %.0f%% n=%d%s", what, 100.0 * wins / Max(1, nn), nn, nn < S.params.val.minSample ? " (low conf.)" : "");
+			else sprintf_s(buf, sizeof(buf), "%s | no history yet", what);
 			SlotText(sc, T.proj[2], n - 1 + stepB, 0, w1, false, buf, nn >= S.params.val.minSample ? cText : cDim, Max(7, fontPt - 1), false, 0, false, DT_LEFT | (dir > 0 ? DT_BOTTOM : DT_TOP));
+		}
+	}
+
+	// HUD: compact lines (about 48 characters) in the empty space right of the last bar
+	if (on[TL_HUD])
+	{
+		struct HudLine { char text[160]; uint32_t color; bool bold; bool pill; uint32_t back; int pt; };
+		HudLine lines[TermState::HUD_SLOTS]; int nl2 = 0;
+		HudLine L; L.pill = false; L.bold = false; L.pt = fontPt; L.back = 0; L.color = cText; L.text[0] = 0;
+		#define HUD_PUSH() { if (nl2 < TermState::HUD_SLOTS) lines[nl2++] = L; L.pill = false; L.bold = false; L.pt = fontPt; L.back = 0; L.color = cText; }
+		// 1 bias pill + score trend
+		L.pill = true; L.bold = true; L.pt = fontPt + 3; L.color = cPanel; L.back = H.bias > 0 ? cBull : (H.bias < 0 ? cBear : cNeu);
+		sprintf_s(L.text, sizeof(L.text), " %s  DCS %+.0f %s ", H.bias > 0 ? "LONG" : (H.bias < 0 ? "SHORT" : "NEUTRAL"), H.dcs, H.dcsTrend > 5 ? "^" : (H.dcsTrend < -5 ? "v" : "=")); HUD_PUSH();
+		// 2 regime | open type | value migration
+		L.color = H.regime == RG_TREND_UP ? cBull : (H.regime == RG_TREND_DOWN ? cBear : cText);
+		sprintf_s(L.text, sizeof(L.text), "%s | %s | %s", kRegimeNames[Clamp(H.regime, 0, 4)], kOpenShort[Clamp(H.openType, 0, 7)], H.valueMig > 0.5f ? "value higher" : (H.valueMig < -0.5f ? "value lower" : "value overlap")); HUD_PUSH();
+		// 3 (PRO) day type | group agreement | range vs ADR
+		if (pro)
+		{
+			sprintf_s(L.text, sizeof(L.text), "%s | %d/%d groups agree | %s%.0f%% ADR", H.dayType[0] ? H.dayType : "--", H.agree, H.agreeN, H.adrPrev ? "prev RTH " : "range ", H.adrPct);
+			L.color = H.agreeN > 0 && H.agree * 4 >= H.agreeN * 3 ? (H.dcs >= 0 ? cBull : cBear) : cDim; HUD_PUSH();
+		}
+		// 4-5 plan (two lines)
+		L.bold = true; L.color = cVwap; strncpy_s(L.text, sizeof(L.text), H.stateLine[0] ? H.stateLine : "Warming up", _TRUNCATE); HUD_PUSH();
+		L.color = cVwap; strncpy_s(L.text, sizeof(L.text), H.stateLine2[0] ? H.stateLine2 : "", _TRUNCATE); HUD_PUSH();
+		// 6 MTF strip | leg quality | SMT
+		{
+			static const char* nm[4] = { "1m", "5m", "15m", "60m" };
+			char mt[120] = "MTF"; for (int k = 0; k < 4; ++k) { char c[16]; sprintf_s(c, sizeof(c), " %s%s", nm[k], !H.mtfAvail[k] ? "." : (H.mtf[k] > 0 ? "+" : (H.mtf[k] < 0 ? "-" : "="))); strcat_s(mt, sizeof(mt), c); }
+			char ex[48]; sprintf_s(ex, sizeof(ex), " | leg R2 %.2f%s", H.legR2, H.smt != 0 ? (H.smt > 0 ? " | SMT+" : " | SMT-") : ""); strcat_s(mt, sizeof(mt), ex);
+			strncpy_s(L.text, sizeof(L.text), mt, _TRUNCATE); HUD_PUSH();
+		}
+		// 7 (PRO) order flow: CVD trend / z, bar delta, lead-lag
+		if (pro)
+		{
+			const float dl = lastClosed >= 0 ? FL.delta[lastClosed] : 0.0f; const float dp = lastClosed >= 0 ? FL.deltaPct[lastClosed] : 0.0f;
+			char d[16]; render::Abbrev(dl, d, sizeof(d));
+			sprintf_s(L.text, sizeof(L.text), "CVD %s z%+.1f | delta %s%s (%+.0f%%)", H.cvdTrend > 0 ? "^" : (H.cvdTrend < 0 ? "v" : "="), H.cvdZ, dl > 0 ? "+" : "", d, dp * 100);
+			if (H.leadLag[0] && strlen(L.text) + strlen(H.leadLag) + 3 <= 50) { strcat_s(L.text, sizeof(L.text), " | "); strcat_s(L.text, sizeof(L.text), H.leadLag); }
+			L.color = H.cvdTrend > 0 ? cBull : (H.cvdTrend < 0 ? cBear : cText); HUD_PUSH();
+		}
+		// 8 nearest structural levels
+		if (H.resPrice > 0 && H.supPrice > 0) sprintf_s(L.text, sizeof(L.text), "R %s %s +%dt | S %s %s -%dt", dcs_detail::LevelName(H.resKind), PXS(H.resPrice), static_cast<int>((H.resPrice - close) / tick + 0.5f), dcs_detail::LevelName(H.supKind), PXS(H.supPrice), static_cast<int>((close - H.supPrice) / tick + 0.5f));
+		else strcpy_s(L.text, sizeof(L.text), "Levels: waiting for session data");
+		L.color = cLevel; HUD_PUSH();
+		// 9 (PRO) last event
+		if (pro)
+		{
+			const Event* le = nullptr; for (int k = static_cast<int>(S.events.size()) - 1; k >= 0 && !le; --k) if (S.events[k].kind != EV_SIGNAL) le = &S.events[k];
+			if (le) sprintf_s(L.text, sizeof(L.text), "last: %s %s (%db)", le->time, le->text, Max(0, lastClosed - le->idx)); else strcpy_s(L.text, sizeof(L.text), "last event: none yet");
+			L.color = le ? (le->dir > 0 ? cBull : (le->dir < 0 ? cBear : cText)) : cDim; HUD_PUSH();
+		}
+		// 10 (PRO) scoreboard for the current setup
+		if (pro)
+		{
+			const SetupStats& st = S.val.stats[Clamp(H.curSetup, 0, SETUP_COUNT - 1)];
+			if (st.count > 0) sprintf_s(L.text, sizeof(L.text), "%s: %.0f%% win | %+.2fR | n=%d%s", kSetupNames[Clamp(H.curSetup, 0, SETUP_COUNT - 1)], 100.0 * st.wins / Max(1, st.wins + st.losses), st.sumR / st.count, st.count, st.count < S.params.val.minSample ? " (small n)" : "");
+			else sprintf_s(L.text, sizeof(L.text), "Scoreboard: no resolved signals yet (%d logged)", H.signalsTotal);
+			L.color = cDim; HUD_PUSH();
+		}
+		// 11 (PRO) session clock | bar countdown | symbol
+		if (pro)
+		{
+			const int tod = sc.GetCurrentDateTime().GetTimeInSeconds(); const BaseParams& BP = S.params.base; const int ibEnd = BP.rthStartSec + S.params.auction.ibMinutes * 60;
+			int secs; const char* what;
+			if (tod < BP.rthStartSec) { secs = BP.rthStartSec - tod; what = "to RTH open"; } else if (tod < ibEnd) { secs = ibEnd - tod; what = "to IB end"; } else if (tod < BP.rthEndSec) { secs = BP.rthEndSec - tod; what = "to close"; } else { secs = 86400 - tod + BP.rthStartSec; what = "to RTH open"; }
+			const int cd = sc.GetLatestBarCountdownAsInteger != nullptr ? sc.GetLatestBarCountdownAsInteger() : 0;
+			sprintf_s(L.text, sizeof(L.text), "%dh%02dm %s | bar %d:%02d | %s", secs / 3600, (secs % 3600) / 60, what, cd / 60, cd % 60, sc.Symbol.GetChars());
+			L.color = cDim; HUD_PUSH();
+		}
+		// 12 health or the first warning
+		if (S.warn.text[0]) { const char* e = strchr(S.warn.text, '\n'); size_t len = static_cast<size_t>((e ? e : S.warn.text + strlen(S.warn.text)) - S.warn.text); if (len > 52) len = 52; strncpy_s(L.text, sizeof(L.text), S.warn.text, len); L.color = cVwap; }
+		else { sprintf_s(L.text, sizeof(L.text), "%s | %s | mkt %d/%d | %.1f ms%s", S.warn.vapOff ? "VAP off" : "VAP on", S.warn.noDepth ? "depth off" : "depth on", H.interConnected, H.interConfigured, H.updateMs, fillBars >= 40 ? "" : " | Fill Space >= 40"); L.color = cDim; L.pt = Max(7, fontPt - 1); }
+		HUD_PUSH();
+		#undef HUD_PUSH
+		for (int k = 0; k < nl2; ++k)
+		{
+			const float y = k == 0 ? hudY0 : hudY0 - pillPitch - pitch * static_cast<float>(k - 1);
+			SlotText(sc, T.hud[k], -1, relX, y, true, lines[k].text, lines[k].color, lines[k].pt, lines[k].bold, lines[k].back, lines[k].pill, DT_LEFT | DT_TOP);
 		}
 	}
 	SlotFlush(sc, T.all, TermState::SLOTS, false);
@@ -4614,6 +4751,7 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 			DW.lastAlertIdx = g.idx;
 			SCString msg; msg.Format("NQ Edge %s @ %s stop %s T1 %s T2 %s", g.label, sc.FormatGraphValue(g.entry, sc.BaseGraphValueFormat).GetChars(),
 				sc.FormatGraphValue(g.stop, sc.BaseGraphValueFormat).GetChars(), sc.FormatGraphValue(g.t1, sc.BaseGraphValueFormat).GetChars(), sc.FormatGraphValue(g.t2, sc.BaseGraphValueFormat).GetChars());
+			if (g.size > 0) { SCString sz; sz.Format(" size %dx", g.size); msg += sz; }
 			const int snd = sc.Input[TI_SOUND].GetAlertSoundNumber();
 			if (snd > 0) sc.SetAlert(snd - 1, g.idx, msg); else sc.AddAlertLine(msg, 1);
 		}

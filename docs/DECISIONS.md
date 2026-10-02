@@ -174,3 +174,35 @@ Ambiguities resolved while building, and anything not verifiable without a Sierr
 Unverified without a Sierra build: that `GetGraphVisibleHighAndLow` reports the price region's scale when
 called from the Terminal (region 0); that GDI output is painted after drawing objects (otherwise pills may
 cover the profile, which is harmless); `ChartBarSpacing` being in pixels.
+
+## v4.1 decisions
+
+49. **Pills are right-aligned text drawings** (`TextAlignment = DT_RIGHT | DT_VCENTER`) anchored one bar left of
+    the docked profile, so they never run under it; a pill whose price is within one pill height of the previous
+    (ascending) pill is anchored one pill width further left. Pill height in price = font px × 1.5 × visible range /
+    region px. *Unverified:* that Sierra places right-aligned text to the left of its anchor (if not, pills extend
+    into the profile and the fix is `DT_LEFT` with `anchor − width`).
+50. **HUD row pitch** = font px × 1.45 as a percentage of the region height captured by the GDI pass
+    (`TermState::regionH`), clamped to 1.2–4 %; 3.2 % until the first paint. The block goes to the end (top /
+    bottom) with fewer level pills inside its band; ties go to the end away from price. The event log takes the
+    other end.
+51. **Event log instead of on-chart notes.** Six newest non-signal events, same kind + direction within six bars
+    collapsed into the newest, each with a `MARKER_DASH` at its price. Notes across candles broke the "labels never
+    on a candle" rule and the exhaustion stream made them unreadable.
+52. **VWAP band default = dotted lines.** A filled ±1σ band of a trading-day-anchored VWAP spans most of the chart on
+    a trend day (σ ≈ 20 points on the 2026-10-02 session); the fill remains an option.
+53. **Exhaustion de-noising**: volume z ≥ `exhaustMinVolZ` (0.5), the close must retrace ≥ 30 % of the bar range
+    from the extreme, and no same-direction exhaustion within `exhaustCooldownBars` (6). The feature `F_EXHAUST`
+    and the value-edge trigger use the same mark, so they also fire less.
+54. **Stop sanity**: `minRisk = max(minStopAtr × ATR, minStopTicks × tick)` widens a structural stop; a stop wider
+    than `maxStopAtr × ATR` rejects the candidate. The validation engine resolves against the widened stop, so the
+    statistics describe the trade as shown.
+55. **Group agreement** is computed from the gated, weighted feature sums per group (bit set when the group's sum is
+    positive); it affects the grade (±0.5) and the HUD only, never the score itself, so the learned weights stay the
+    single source of the DCS.
+56. **Signals outside RTH default to grade A only.** Overnight MES/MNQ flow is thin; B-grade fades there were the
+    bulk of the v4 overnight signals.
+57. **Size suggestion** uses `sc.CurrencyValuePerTick`; 0 (hidden) when Sierra does not report it. The number is a
+    suggestion for the configured $ risk, not an order.
+58. **ADR line outside RTH** uses the last completed RTH range (`prev RTH …`) because `rthHigh/Low` reset at the
+    session roll.

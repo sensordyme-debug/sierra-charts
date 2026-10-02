@@ -50,11 +50,13 @@ projection, footprint/depth, signal-power features) are implemented — see CHAN
 built and run in Sierra by the user; v2 is syntax-checked only. `docs/DECISIONS.md` 26–34 list the
 v2 API details to confirm on the first Remote Build. `docs/VISUAL_GUIDE.md` explains every visual.
 
-## v4 (current): one study, PRO preset
+## v4.1 (current): one study, PRO preset
 `scsf_NQEdge_Terminal` is the only study the trader adds. It sets every engine's parameters from its
 own inputs (`S.terminalPresent` makes the engine studies passive) and draws with Sierra drawing
 objects managed by line number (`term::Slot*` helpers, `TermState` slots, `SlotFlush` each update,
-`SlotKeep` for heavy layers between bar closes). Presets PRO (default: everything) and CLEAN (five
+`SlotKeep` for heavy layers between bar closes; the GDI pass stores the region pixel size in
+`TermState::regionH` so HUD row pitch and pill gaps are pixel-aware). Pills are right-aligned at the
+docked profile's edge; notes are an event log (`S.events`, deduped) at the end opposite the HUD. Presets PRO (default: everything) and CLEAN (five
 layers); `kTermPreset` rows + tri-state `Layer:` inputs decide `on[TL_*]`. GDI is used only for the
 docked profile and the tape strip (`DrawTerminalGDI`). The v2 GDI overlay/backdrop/tape studies were
 removed; `render::Frame`, `DrawProfile` and `DrawTape` remain. New Terminal layer: add a `TL_*` entry,

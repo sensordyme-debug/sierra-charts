@@ -118,3 +118,25 @@
 - Performance: heavy per-bar layers are redrawn only when a bar closes, the layer set changes or the engines were rebuilt
   (`SlotKeep`); HUD, pills and signal boxes every update. Slot table grows to ~250 managed drawings.
 - Docs: VISUAL_GUIDE (PRO screenshot description), SETUP (fill space 40–60, bar spacing, re-add after upgrade), DECISIONS 41–48.
+
+## v4.1 — readability fixes from the first PRO screenshot + signal quality
+- Pills are right-aligned against the docked profile (`DT_RIGHT`), a pill that would overlap the previous one moves one column
+  left; pill height and HUD row pitch come from the real region height (captured by the GDI pass in `TermState::regionH`).
+- HUD rewritten as 12 compact lines (≈ 48 chars) placed at the end of the chart with fewer level pills; the plan is two lines;
+  new lines: day type + feature-group agreement + range vs ADR, last event, scoreboard, clock. CLEAN = 7 lines.
+- Scattered notes replaced by a six-line event log at the opposite end (newest first, duplicates within 6 bars collapsed) with
+  dash markers at the event price. Event texts shortened (`sell imb stack`, `exhaust top`, `absorb: buyers`, `CHoCH down`).
+- VWAP band default = dotted ±1σ lines; *VWAP Band Style* input (dotted / filled / off); fill transparency 90 %.
+- Delta Per Bar shows delta only (volume stays in the strip), needs bar spacing ≥ 12 px.
+- Exhaustion events need an above-average volume bar (z ≥ 0.5), a close back ≥ 30 % of the bar range, and a 6-bar
+  same-direction cooldown — the "thin top / thin bottom" spam is gone.
+- Stop sanity in `BuildSignal`: the structural stop is widened to at least max(0.6 ATR, 6 ticks); stops wider than 2.5 ATR
+  reject the candidate. Inputs *Setup: Min Stop / Max Stop (ATR)*, *Min R:R To T1*.
+- Feature-group agreement: per-bar bitmask of the sign of each weighted group; the grade gains +0.5 when ≥ 75 % of the groups
+  lean with the trade and loses 0.5 under 50 %; the HUD shows `k/n groups agree`.
+- *Signals Outside RTH*: Off / Grade A only (default) / All.
+- $-risk sizing: *Risk Per Trade ($)* → contracts = floor(risk / (stop ticks × currency value per tick)); shown on signal
+  labels (`3x`), in the plan (`size 3x`) and in alerts.
+- HUD range line falls back to the prior RTH range outside RTH (`prev RTH 118% ADR`) instead of `0%`.
+- Ghost profile drawn brighter when there is no developing session profile (pre-open / after the close).
+- Docs: VISUAL_GUIDE, SETUP, DECISIONS 49–58, CLAUDE.md.
