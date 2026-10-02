@@ -224,3 +224,22 @@ cover the profile, which is harmless); `ChartBarSpacing` being in pixels.
     end + 1 if on price's half. The event log keeps taking the end opposite the HUD's centre.
 63. **Neutral candles** use two shades (up / down bar) so an evening session with a flat score still reads as price action;
     both are colour inputs. The conviction colours are unchanged.
+
+## v4.3 decisions
+
+64. **Trading day from an input, not from Sierra.** `B.tradingDay = date + (time ≥ dayStart ? 1 : 0)`. The 1-minute chart
+    showed `GetTradingDayDate` changing at 20:12 ET (the overnight high became the 20:12 bar's high and the trading-day VWAP
+    restarted there). The cause is in the chart's session settings, which the engine should not depend on; `0` restores the
+    Sierra behaviour.
+65. **Flow series = subgraph-only studies** sharing the engines through the registry. Flow Candles draws every marker with a
+    subgraph draw style (diamond, triangle, X, plus, left/right price-bar dash, dash, point, value-on-high/low), so it has no
+    drawing objects, no GDI and nothing to clean up; the panels are readers. Flow Candles sets base / swing / flow parameters
+    only while the Terminal is absent; the diagnostic Order Flow study also sets flow parameters, so the two should not be on
+    the same chart (the last one to run wins and the other's change resets the engine).
+66. **Bubble size classes** are relative to the largest print in the lookback (≥ 66 % = L, ≥ 33 % = M), one bubble per bar
+    per class (the first found, which is the newest).
+67. **Panels use regions 1 and 2** (`GraphRegion` set in defaults) with `SCALE_AUTO`; the v3 "no extra regions" rule applied
+    to the Terminal, these panels are added on purpose.
+
+Unverified without a Sierra build: `DRAWSTYLE_VALUE_ON_HIGH/LOW` honour per-bar `DataColor` (otherwise delta numbers are a
+single colour); `DRAWSTYLE_RIGHT/LEFT_PRICE_BAR_DASH` draw at the subgraph value (used for the imbalance zone price).

@@ -157,3 +157,18 @@
 - Per-bar delta numbers are staggered (odd bars one text height higher) under 26 px spacing and suppressed when the footprint
   prints them; neutral candles are shaded lighter for up bars and darker for down bars (two colour inputs).
 - Docs: VISUAL_GUIDE, SETUP, DECISIONS 59–63.
+
+## v4.3 — Flow series for the companion charts + trading-day boundary fix
+- **NQ Edge Flow Candles** (`scsf_NQEdge_FlowCandles`, price region, any chart): candles coloured by a delta gradient (brighter on
+  volume z ≥ 1.5; modes delta gradient / delta sign / up-down / off), absorption diamonds, exhaustion triangles, trapped-trader
+  crosses, CVD-divergence plus marks, stacked-imbalance side dashes at the zone price, the bar's POC dash, buy/sell bubbles in
+  three sizes (largest print in the lookback = L), delta number above and volume below the bar (`DRAWSTYLE_VALUE_ON_HIGH/LOW`),
+  optional alert on absorption / trap / divergence. Sets the base, swing and flow parameters when the Terminal is absent.
+- **NQ Edge Flow CVD** (own panel): cumulative delta coloured by direction with magenta divergence dots. Reader only.
+- **NQ Edge Flow Delta** (own panel): delta histogram (gold on absorption bars, magenta on trapped bars), pressure line
+  (EMA of delta), background shade on high-volume bars. Reader only.
+- **Trading-day boundary** is now an input (*Session: Trading Day Start*, 18:00 default) on the Terminal and Flow Candles:
+  the trading day rolls at that time instead of Sierra's `GetTradingDayDate`, which flipped at 20:12 on the user's chart and
+  restarted the trading-day VWAP, the overnight range and the profiles mid-evening.
+- Health line shows the region height the GDI pass captured (`reg 1203px`) to diagnose HUD row pitch.
+- Docs: VISUAL_GUIDE (Flow series), SETUP §8, DECISIONS 64–67.

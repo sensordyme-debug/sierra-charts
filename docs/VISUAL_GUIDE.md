@@ -1,4 +1,4 @@
-# NQ Edge Terminal — Visual guide (v4.2, PRO by default)
+# NQ Edge Terminal — Visual guide (v4.3, PRO by default)
 
 Palette: bull `#00C896` green, bear `#FF4D5E` red, neutral `#6E7686` gray, VWAP/fib gold `#FFC857`,
 levels cyan `#3EC6FF`, text `#E6EAF2`, dim `#788091`. Every colour is an input.
@@ -108,3 +108,22 @@ and a seven-line HUD (lines 1, 2, 4, 5, 6, 8 and 12 above). Nothing else.
   bar closes; the HUD, pills and signal boxes every update. All drawings are managed by line number:
   adjusted in place, deleted when stale, all removed when the study is removed. Decisions, statistics
   and colours use closed bars only; the forming bar is hollow.
+
+## The Flow series (for the other charts)
+
+Three light studies that share the NQ Edge engines but draw only with subgraphs, meant for the
+companion charts (other NQ timeframes, ES, YM, the mega caps) where the full Terminal is too much.
+
+- **NQ Edge Flow Candles** (price region). Every bar is coloured by its **delta gradient**: deep green
+  when buyers hit the ask hard, deep red when sellers hit the bid, gray when delta is small; bars on
+  high volume (z ≥ 1.5) are brighter. Around the bars: a **diamond** under a bar where passive buyers
+  absorbed (above it for sellers), a gold **triangle** at an exhausted top or bottom, a red **X** above
+  a bar that trapped longs (green below for trapped shorts), a magenta **plus** where price made a new
+  swing extreme on weaker delta, a short **dash on the right** of the bar at a stacked buy imbalance
+  (left for sell), a gold dash at the bar's **POC**, green / red **bubbles** in three sizes where the
+  largest prints of the last 200 bars went through, the **delta number** above every bar and,
+  optionally, the volume below. An optional alert fires on absorption, trap or divergence.
+- **NQ Edge Flow CVD** (own panel). The session cumulative delta, green while rising and red while
+  falling, with a magenta dot on the bar that confirmed a CVD divergence.
+- **NQ Edge Flow Delta** (own panel). The per-bar delta histogram, gold on absorption bars and magenta
+  on trapped bars, a pressure line (10-bar EMA of delta) and a faint background on high-volume bars.

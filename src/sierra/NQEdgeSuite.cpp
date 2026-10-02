@@ -10,7 +10,10 @@
 //    6. NQ Edge: Directional Conviction Score scsf_NQEdge_DCS
 //    7. NQ Edge: Signal Validation            scsf_NQEdge_Validation
 //    8. NQ Edge: Feature Logger               scsf_NQEdge_FeatureLogger
-//    9. NQ Edge Terminal (the one study)      scsf_NQEdge_Terminal   <- add only this one
+//    9. NQ Edge Terminal (the one study)      scsf_NQEdge_Terminal   <- the main chart needs only this
+//   10. NQ Edge Flow Candles                 scsf_NQEdge_FlowCandles  (companion charts: order-flow candlesticks)
+//   11. NQ Edge Flow CVD                     scsf_NQEdge_FlowCVD      (own panel)
+//   12. NQ Edge Flow Delta                   scsf_NQEdge_FlowDelta    (own panel)
 //
 //  Architecture (docs/ARCHITECTURE.md): every study shares one per-chart ChartState held in a
 //  DLL-global registry. Engines are lazy and idempotent (EnsureBase/EnsureAuction/...), so the
@@ -100,6 +103,7 @@ namespace nqe
 		int rthStartSec = 9 * 3600 + 30 * 60;
 		int rthEndSec = 16 * 3600;
 		int atrLength = 14;
+		int dayStartSec = 18 * 3600;   // trading-day boundary (evening open); 0 = Sierra's trading day date
 	};
 
 	struct AuctionParams
@@ -882,7 +886,9 @@ namespace nqe
 			if (B.atr[i] <= 0) B.atr[i] = Max(S.tickSize, tr);
 
 			const SCDateTime& dt = sc.BaseDateTimeIn[i];
-			B.tradingDay[i] = sc.GetTradingDayDate(dt);
+			// trading day = calendar date, rolled to the next date once the evening session has started (independent of the chart's
+			// session settings; Sierra's GetTradingDayDate switched mid-evening on the user's chart)
+			B.tradingDay[i] = P.dayStartSec > 0 ? (dt.GetDate() + (dt.GetTimeInSeconds() >= P.dayStartSec ? 1 : 0)) : sc.GetTradingDayDate(dt);
 			const int tod = dt.GetTimeInSeconds();
 			const bool rth = (P.rthStartSec < P.rthEndSec) ? (tod >= P.rthStartSec && tod < P.rthEndSec) : (tod >= P.rthStartSec || tod < P.rthEndSec);
 			B.isRth[i] = rth ? 1 : 0;
@@ -4227,7 +4233,7 @@ static const unsigned char kTermPreset[2][TL_COUNT] =
 static const char* kOpenShort[8] = { "--", "Open-Drive up", "Open-Drive down", "Test-Drive up", "Test-Drive down", "Reject-Reverse up", "Reject-Reverse down", "Open-Auction" };
 enum TermInput
 {
-	TI_PRESET = 0, TI_RTH_START, TI_RTH_END, TI_ATR_LEN, TI_VA_PCT, TI_IB_MIN, TI_SWING_N, TI_SWING_ATR, TI_IMB_RATIO, TI_IMB_STACK, TI_ABS_Z,
+	TI_PRESET = 0, TI_RTH_START, TI_RTH_END, TI_DAY_START, TI_ATR_LEN, TI_VA_PCT, TI_IB_MIN, TI_SWING_N, TI_SWING_ATR, TI_IMB_RATIO, TI_IMB_STACK, TI_ABS_Z,
 	TI_C_YM, TI_C_ES, TI_C_TICK, TI_C_MEGA1, TI_C_MEGA2, TI_C_MEGA3,
 	TI_WEIGHTS, TI_THR, TI_STRONG, TI_WEAK, TI_S1, TI_S2, TI_S3, TI_S4, TI_S5, TI_MIN_GRADE, TI_ALERTS, TI_SOUND, TI_LOG, TI_VWAP_ANCHOR,
 	TI_RISK, TI_ETH, TI_MIN_STOP, TI_MAX_STOP, TI_MIN_RR,
@@ -4360,6 +4366,7 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 		sc.Input[TI_PRESET].Name = "Preset"; sc.Input[TI_PRESET].SetCustomInputStrings("CLEAN;PRO"); sc.Input[TI_PRESET].SetCustomInputIndex(1);
 		sc.Input[TI_RTH_START].Name = "Session: RTH Start"; sc.Input[TI_RTH_START].SetTime(HMS_TIME(9, 30, 0));
 		sc.Input[TI_RTH_END].Name = "Session: RTH End"; sc.Input[TI_RTH_END].SetTime(HMS_TIME(16, 0, 0));
+		sc.Input[TI_DAY_START].Name = "Session: Trading Day Start (evening open)"; sc.Input[TI_DAY_START].SetTime(HMS_TIME(18, 0, 0));
 		NQE_INT_INPUT(TI_ATR_LEN, "Session: ATR Length", 14, 2, 500);
 		NQE_FLT_INPUT(TI_VA_PCT, "Profile: Value Area %", 70.0, 50.0, 95.0);
 		NQE_INT_INPUT(TI_IB_MIN, "Profile: Initial Balance Minutes", 60, 5, 240);
@@ -4433,7 +4440,7 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 
 	// ---- parameters: exposed inputs override the engine defaults ----
 	{
-		BaseParams bp{}; bp.rthStartSec = sc.Input[TI_RTH_START].GetTime(); bp.rthEndSec = sc.Input[TI_RTH_END].GetTime(); bp.atrLength = sc.Input[TI_ATR_LEN].GetInt(); SetParams(S, E_BASE, S.params.base, bp);
+		BaseParams bp{}; bp.rthStartSec = sc.Input[TI_RTH_START].GetTime(); bp.rthEndSec = sc.Input[TI_RTH_END].GetTime(); bp.dayStartSec = sc.Input[TI_DAY_START].GetTime(); bp.atrLength = sc.Input[TI_ATR_LEN].GetInt(); SetParams(S, E_BASE, S.params.base, bp);
 		AuctionParams ap{}; ap.valueAreaPct = sc.Input[TI_VA_PCT].GetFloat(); ap.ibMinutes = sc.Input[TI_IB_MIN].GetInt(); ap.swingStrength = sc.Input[TI_SWING_N].GetInt(); ap.swingMinAtr = sc.Input[TI_SWING_ATR].GetFloat(); SetParams(S, E_AUCTION, S.params.auction, ap);
 		VwapParams vp{}; vp.anchor = sc.Input[TI_VWAP_ANCHOR].GetIndex() == 0 ? 1 : 0; SetParams(S, E_VWAP, S.params.vwap, vp);
 		FlowParams fp{}; fp.imbRatioPct = sc.Input[TI_IMB_RATIO].GetFloat(); fp.imbStackLevels = sc.Input[TI_IMB_STACK].GetInt(); fp.absorbVolZ = sc.Input[TI_ABS_Z].GetFloat(); SetParams(S, E_FLOW, S.params.flow, fp);
@@ -4875,7 +4882,7 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 		else
 		{
 			char fs[40] = ""; if (fillBars < fillNeeded) sprintf_s(fs, sizeof(fs), " | Fill Space >= %d", fillNeeded);
-			sprintf_s(L.text, sizeof(L.text), "%s | %s | mkt %d/%d | %.1f ms%s", S.warn.vapOff ? "VAP off" : "VAP on", S.warn.noDepth ? "depth off" : "depth on", H.interConnected, H.interConfigured, H.updateMs, fs); L.color = cDim; L.pt = Max(7, hudPt - 1);
+			sprintf_s(L.text, sizeof(L.text), "%s | %s | mkt %d/%d | %.1f ms | reg %dpx%s", S.warn.vapOff ? "VAP off" : "VAP on", S.warn.noDepth ? "depth off" : "depth on", H.interConnected, H.interConfigured, H.updateMs, T.regionH, fs); L.color = cDim; L.pt = Max(7, hudPt - 1);
 		}
 		HUD_PUSH();
 		#undef HUD_PUSH
@@ -4903,5 +4910,287 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 			const int snd = sc.Input[TI_SOUND].GetAlertSoundNumber();
 			if (snd > 0) sc.SetAlert(snd - 1, g.idx, msg); else sc.AddAlertLine(msg, 1);
 		}
+	}
+}
+
+// --- 10. NQ Edge Flow series: order-flow candlesticks + CVD / delta panels (any chart) ------------
+// Light studies for the companion charts. They run the base / auction / VWAP / flow engines only (no DCS, no HUD) and
+// draw with subgraphs, so there are no drawing objects to manage and nothing to clean up. Engine parameters come from
+// the Terminal when it is on the same chart, otherwise from Flow Candles' inputs; the two panels are pure readers.
+enum FlowCandleInput
+{
+	FCI_RTH_START = 0, FCI_RTH_END, FCI_DAY_START, FCI_ATR_LEN, FCI_SWING_N, FCI_CVD_RESET, FCI_ABS_Z, FCI_IMB_RATIO, FCI_IMB_STACK, FCI_LT_PCT, FCI_LT_MIN,
+	FCI_COLOR_MODE, FCI_SHOW_ABS, FCI_SHOW_EXH, FCI_SHOW_TRAP, FCI_SHOW_DIV, FCI_SHOW_IMB, FCI_SHOW_POC, FCI_SHOW_BUBBLES, FCI_BUBBLE_BARS, FCI_SHOW_DELTA, FCI_SHOW_VOL,
+	FCI_ALERT, FCI_SOUND,
+	FCI_C_BULL, FCI_C_BEAR, FCI_C_NEU, FCI_C_GOLD, FCI_C_MAGENTA, FCI_C_DIM, FCI_COUNT
+};
+enum FlowCandleSubgraph
+{
+	FCS_CANDLE = 0, FCS_FORMING, FCS_ABS_BUY, FCS_ABS_SELL, FCS_EXH_TOP, FCS_EXH_BOT, FCS_TRAP_LONGS, FCS_TRAP_SHORTS, FCS_DIV_UP, FCS_DIV_DN,
+	FCS_IMB_BUY, FCS_IMB_SELL, FCS_POC, FCS_BUB_BUY_S, FCS_BUB_BUY_M, FCS_BUB_BUY_L, FCS_BUB_SELL_S, FCS_BUB_SELL_M, FCS_BUB_SELL_L,
+	FCS_DELTA_TXT, FCS_VOL_TXT, FCS_H_DELTA_PCT, FCS_H_VOLZ, FCS_H_CVD, FCS_COUNT
+};
+
+SCSFExport scsf_NQEdge_FlowCandles(SCStudyInterfaceRef sc)
+{
+	using namespace nqe;
+	if (sc.SetDefaults)
+	{
+		sc.GraphName = "NQ Edge Flow Candles";
+		sc.StudyDescription = "Order-flow candlesticks for any chart: bars coloured by a delta gradient (brighter on high volume), absorption diamonds, exhaustion triangles, trapped-trader crosses, CVD-divergence marks, stacked-imbalance dashes, the bar's POC, buy/sell bubbles in three sizes, delta and volume numbers, optional alerts. Shares the NQ Edge engines with the Terminal when both are on the chart.";
+		sc.GraphRegion = 0; sc.AutoLoop = 0; sc.CalculationPrecedence = LOW_PREC_LEVEL; sc.ValueFormat = 0; sc.ScaleRangeType = SCALE_SAMEASREGION; sc.DrawZeros = 0; sc.MaintainVolumeAtPriceData = 1;
+		const char* names[FCS_COUNT] = { "Flow Candle", "Forming Bar", "Absorption (buyers)", "Absorption (sellers)", "Exhaustion Top", "Exhaustion Bottom", "Trapped Longs", "Trapped Shorts", "CVD Divergence Up", "CVD Divergence Down",
+			"Imbalance Stack (buy)", "Imbalance Stack (sell)", "Bar POC", "Buy Bubble S", "Buy Bubble M", "Buy Bubble L", "Sell Bubble S", "Sell Bubble M", "Sell Bubble L", "Delta", "Volume", "h.Delta %", "h.Volume Z", "h.CVD" };
+		for (int k = 0; k < FCS_COUNT; ++k) { sc.Subgraph[k].Name = names[k]; sc.Subgraph[k].DrawStyle = DRAWSTYLE_IGNORE; sc.Subgraph[k].DrawZeros = 0; sc.Subgraph[k].LineWidth = 1; }
+		sc.Subgraph[FCS_CANDLE].DrawStyle = DRAWSTYLE_COLOR_BAR; sc.Subgraph[FCS_CANDLE].PrimaryColor = RGB(138, 147, 166);
+		sc.Subgraph[FCS_FORMING].DrawStyle = DRAWSTYLE_COLOR_BAR_HOLLOW; sc.Subgraph[FCS_FORMING].PrimaryColor = RGB(138, 147, 166);
+		sc.Subgraph[FCS_ABS_BUY].DrawStyle = DRAWSTYLE_DIAMOND; sc.Subgraph[FCS_ABS_BUY].LineWidth = 6; sc.Subgraph[FCS_ABS_BUY].PrimaryColor = RGB(0, 200, 150);
+		sc.Subgraph[FCS_ABS_SELL].DrawStyle = DRAWSTYLE_DIAMOND; sc.Subgraph[FCS_ABS_SELL].LineWidth = 6; sc.Subgraph[FCS_ABS_SELL].PrimaryColor = RGB(255, 77, 94);
+		sc.Subgraph[FCS_EXH_TOP].DrawStyle = DRAWSTYLE_TRIANGLE_DOWN; sc.Subgraph[FCS_EXH_TOP].LineWidth = 5; sc.Subgraph[FCS_EXH_TOP].PrimaryColor = RGB(255, 200, 87);
+		sc.Subgraph[FCS_EXH_BOT].DrawStyle = DRAWSTYLE_TRIANGLE_UP; sc.Subgraph[FCS_EXH_BOT].LineWidth = 5; sc.Subgraph[FCS_EXH_BOT].PrimaryColor = RGB(255, 200, 87);
+		sc.Subgraph[FCS_TRAP_LONGS].DrawStyle = DRAWSTYLE_X; sc.Subgraph[FCS_TRAP_LONGS].LineWidth = 5; sc.Subgraph[FCS_TRAP_LONGS].PrimaryColor = RGB(255, 77, 94);
+		sc.Subgraph[FCS_TRAP_SHORTS].DrawStyle = DRAWSTYLE_X; sc.Subgraph[FCS_TRAP_SHORTS].LineWidth = 5; sc.Subgraph[FCS_TRAP_SHORTS].PrimaryColor = RGB(0, 200, 150);
+		sc.Subgraph[FCS_DIV_UP].DrawStyle = DRAWSTYLE_PLUS; sc.Subgraph[FCS_DIV_UP].LineWidth = 6; sc.Subgraph[FCS_DIV_UP].PrimaryColor = RGB(214, 93, 255);
+		sc.Subgraph[FCS_DIV_DN].DrawStyle = DRAWSTYLE_PLUS; sc.Subgraph[FCS_DIV_DN].LineWidth = 6; sc.Subgraph[FCS_DIV_DN].PrimaryColor = RGB(214, 93, 255);
+		sc.Subgraph[FCS_IMB_BUY].DrawStyle = DRAWSTYLE_RIGHT_PRICE_BAR_DASH; sc.Subgraph[FCS_IMB_BUY].LineWidth = 2; sc.Subgraph[FCS_IMB_BUY].PrimaryColor = RGB(0, 200, 150);
+		sc.Subgraph[FCS_IMB_SELL].DrawStyle = DRAWSTYLE_LEFT_PRICE_BAR_DASH; sc.Subgraph[FCS_IMB_SELL].LineWidth = 2; sc.Subgraph[FCS_IMB_SELL].PrimaryColor = RGB(255, 77, 94);
+		sc.Subgraph[FCS_POC].DrawStyle = DRAWSTYLE_DASH; sc.Subgraph[FCS_POC].LineWidth = 2; sc.Subgraph[FCS_POC].PrimaryColor = RGB(255, 200, 87);
+		const int bubW[3] = { 4, 7, 10 };
+		for (int k = 0; k < 3; ++k)
+		{
+			sc.Subgraph[FCS_BUB_BUY_S + k].DrawStyle = DRAWSTYLE_POINT; sc.Subgraph[FCS_BUB_BUY_S + k].LineWidth = bubW[k]; sc.Subgraph[FCS_BUB_BUY_S + k].PrimaryColor = RGB(0, 200, 150);
+			sc.Subgraph[FCS_BUB_SELL_S + k].DrawStyle = DRAWSTYLE_POINT; sc.Subgraph[FCS_BUB_SELL_S + k].LineWidth = bubW[k]; sc.Subgraph[FCS_BUB_SELL_S + k].PrimaryColor = RGB(255, 77, 94);
+		}
+		sc.Subgraph[FCS_DELTA_TXT].DrawStyle = DRAWSTYLE_VALUE_ON_HIGH; sc.Subgraph[FCS_DELTA_TXT].PrimaryColor = RGB(0, 200, 150);
+		sc.Subgraph[FCS_VOL_TXT].DrawStyle = DRAWSTYLE_VALUE_ON_LOW; sc.Subgraph[FCS_VOL_TXT].PrimaryColor = RGB(120, 128, 145);
+
+		sc.Input[FCI_RTH_START].Name = "Session: RTH Start"; sc.Input[FCI_RTH_START].SetTime(HMS_TIME(9, 30, 0));
+		sc.Input[FCI_RTH_END].Name = "Session: RTH End"; sc.Input[FCI_RTH_END].SetTime(HMS_TIME(16, 0, 0));
+		sc.Input[FCI_DAY_START].Name = "Session: Trading Day Start (evening open)"; sc.Input[FCI_DAY_START].SetTime(HMS_TIME(18, 0, 0));
+		NQE_INT_INPUT(FCI_ATR_LEN, "Session: ATR Length", 14, 2, 500);
+		NQE_INT_INPUT(FCI_SWING_N, "Structure: Swing Strength Bars", 5, 2, 50);
+		sc.Input[FCI_CVD_RESET].Name = "CVD Reset"; sc.Input[FCI_CVD_RESET].SetCustomInputStrings("RTH Open;Trading Day Start;Never"); sc.Input[FCI_CVD_RESET].SetCustomInputIndex(0);
+		NQE_FLT_INPUT(FCI_ABS_Z, "Flow: Absorption Volume Z >=", 2.0, 0.5, 10.0);
+		NQE_FLT_INPUT(FCI_IMB_RATIO, "Flow: Imbalance Ratio %", 300.0, 150.0, 2000.0);
+		NQE_INT_INPUT(FCI_IMB_STACK, "Flow: Stacked Levels >=", 3, 2, 20);
+		NQE_FLT_INPUT(FCI_LT_PCT, "Bubbles: Large Trade Percentile", 99.0, 80.0, 99.99);
+		NQE_INT_INPUT(FCI_LT_MIN, "Bubbles: Min Trade Size", 20, 1, 100000);
+		sc.Input[FCI_COLOR_MODE].Name = "Candle Colour"; sc.Input[FCI_COLOR_MODE].SetCustomInputStrings("Delta gradient (brighter on volume);Delta sign;Up / down;Off"); sc.Input[FCI_COLOR_MODE].SetCustomInputIndex(0);
+		NQE_YESNO_INPUT(FCI_SHOW_ABS, "Show: Absorption Diamonds", 1);
+		NQE_YESNO_INPUT(FCI_SHOW_EXH, "Show: Exhaustion Triangles", 1);
+		NQE_YESNO_INPUT(FCI_SHOW_TRAP, "Show: Trapped-Trader Crosses", 1);
+		NQE_YESNO_INPUT(FCI_SHOW_DIV, "Show: CVD Divergence Marks", 1);
+		NQE_YESNO_INPUT(FCI_SHOW_IMB, "Show: Stacked Imbalance Dashes", 1);
+		NQE_YESNO_INPUT(FCI_SHOW_POC, "Show: Bar POC Dash", 1);
+		NQE_YESNO_INPUT(FCI_SHOW_BUBBLES, "Show: Large-Trade Bubbles", 1);
+		NQE_INT_INPUT(FCI_BUBBLE_BARS, "Bubbles: Lookback Bars", 200, 20, 2000);
+		NQE_YESNO_INPUT(FCI_SHOW_DELTA, "Show: Delta Number Above Bar", 1);
+		NQE_YESNO_INPUT(FCI_SHOW_VOL, "Show: Volume Number Below Bar", 0);
+		NQE_YESNO_INPUT(FCI_ALERT, "Alert On Absorption / Trap / Divergence", 0);
+		sc.Input[FCI_SOUND].Name = "Alert Sound Number"; sc.Input[FCI_SOUND].SetAlertSoundNumber(2);
+		NQE_COLOR_INPUT(FCI_C_BULL, "Color: Bull", 0, 200, 150);
+		NQE_COLOR_INPUT(FCI_C_BEAR, "Color: Bear", 255, 77, 94);
+		NQE_COLOR_INPUT(FCI_C_NEU, "Color: Neutral", 110, 118, 134);
+		NQE_COLOR_INPUT(FCI_C_GOLD, "Color: Exhaustion / POC", 255, 200, 87);
+		NQE_COLOR_INPUT(FCI_C_MAGENTA, "Color: Divergence", 214, 93, 255);
+		NQE_COLOR_INPUT(FCI_C_DIM, "Color: Volume Number", 120, 128, 145);
+		return;
+	}
+	if (sc.LastCallToFunction) { Release(sc, -1); return; }
+	std::lock_guard<std::recursive_mutex> lock(g_mutex);
+	ChartState& S = Acquire(sc);
+	if (sc.MaintainVolumeAtPriceData == 0) { sc.MaintainVolumeAtPriceData = 1; sc.FlagToReloadChartData = 1; }
+	if (!S.terminalPresent)
+	{
+		BaseParams bp{}; bp.rthStartSec = sc.Input[FCI_RTH_START].GetTime(); bp.rthEndSec = sc.Input[FCI_RTH_END].GetTime(); bp.dayStartSec = sc.Input[FCI_DAY_START].GetTime(); bp.atrLength = sc.Input[FCI_ATR_LEN].GetInt(); SetParams(S, E_BASE, S.params.base, bp);
+		AuctionParams ap{}; ap.swingStrength = sc.Input[FCI_SWING_N].GetInt(); SetParams(S, E_AUCTION, S.params.auction, ap);
+		FlowParams fp{}; fp.cvdReset = sc.Input[FCI_CVD_RESET].GetIndex(); fp.absorbVolZ = sc.Input[FCI_ABS_Z].GetFloat(); fp.imbRatioPct = sc.Input[FCI_IMB_RATIO].GetFloat(); fp.imbStackLevels = sc.Input[FCI_IMB_STACK].GetInt();
+		fp.largePercentile = sc.Input[FCI_LT_PCT].GetFloat(); fp.largeMinSize = sc.Input[FCI_LT_MIN].GetInt(); SetParams(S, E_FLOW, S.params.flow, fp);
+		if (sc.IsFullRecalculation && sc.UpdateStartIndex == 0) ResetFrom(S, E_BASE);
+	}
+	CheckDataStamp(sc, S);
+	EnsureFlow(sc, S);
+	const int n = sc.ArraySize; if (n <= 0) return;
+	const FlowState& F = S.flow;
+	const uint32_t cBull = sc.Input[FCI_C_BULL].GetColor(), cBear = sc.Input[FCI_C_BEAR].GetColor(), cNeu = sc.Input[FCI_C_NEU].GetColor(), cGold = sc.Input[FCI_C_GOLD].GetColor(), cMag = sc.Input[FCI_C_MAGENTA].GetColor(), cDim = sc.Input[FCI_C_DIM].GetColor();
+	sc.Subgraph[FCS_ABS_BUY].PrimaryColor = cBull; sc.Subgraph[FCS_ABS_SELL].PrimaryColor = cBear; sc.Subgraph[FCS_EXH_TOP].PrimaryColor = sc.Subgraph[FCS_EXH_BOT].PrimaryColor = cGold;
+	sc.Subgraph[FCS_TRAP_LONGS].PrimaryColor = cBear; sc.Subgraph[FCS_TRAP_SHORTS].PrimaryColor = cBull; sc.Subgraph[FCS_DIV_UP].PrimaryColor = sc.Subgraph[FCS_DIV_DN].PrimaryColor = cMag;
+	sc.Subgraph[FCS_IMB_BUY].PrimaryColor = cBull; sc.Subgraph[FCS_IMB_SELL].PrimaryColor = cBear; sc.Subgraph[FCS_POC].PrimaryColor = cGold; sc.Subgraph[FCS_VOL_TXT].PrimaryColor = cDim;
+	for (int k = 0; k < 3; ++k) { sc.Subgraph[FCS_BUB_BUY_S + k].PrimaryColor = cBull; sc.Subgraph[FCS_BUB_SELL_S + k].PrimaryColor = cBear; }
+	const int mode = sc.Input[FCI_COLOR_MODE].GetIndex();
+	const bool showAbs = sc.Input[FCI_SHOW_ABS].GetYesNo() != 0, showExh = sc.Input[FCI_SHOW_EXH].GetYesNo() != 0, showTrap = sc.Input[FCI_SHOW_TRAP].GetYesNo() != 0, showDiv = sc.Input[FCI_SHOW_DIV].GetYesNo() != 0;
+	const bool showImb = sc.Input[FCI_SHOW_IMB].GetYesNo() != 0, showPoc = sc.Input[FCI_SHOW_POC].GetYesNo() != 0, showBub = sc.Input[FCI_SHOW_BUBBLES].GetYesNo() != 0, showDelta = sc.Input[FCI_SHOW_DELTA].GetYesNo() != 0, showVol = sc.Input[FCI_SHOW_VOL].GetYesNo() != 0;
+	sc.Subgraph[FCS_CANDLE].DrawStyle = mode == 3 ? DRAWSTYLE_IGNORE : DRAWSTYLE_COLOR_BAR; sc.Subgraph[FCS_FORMING].DrawStyle = mode == 3 ? DRAWSTYLE_IGNORE : DRAWSTYLE_COLOR_BAR_HOLLOW;
+	sc.Subgraph[FCS_DELTA_TXT].DrawStyle = showDelta ? DRAWSTYLE_VALUE_ON_HIGH : DRAWSTYLE_IGNORE; sc.Subgraph[FCS_VOL_TXT].DrawStyle = showVol ? DRAWSTYLE_VALUE_ON_LOW : DRAWSTYLE_IGNORE;
+	int& gen = sc.GetPersistentInt(11);
+	int start = Min(sc.UpdateStartIndex, S.flow.dirtyFrom); S.flow.dirtyFrom = INT_MAX;
+	if (gen != S.flow.generation) { start = 0; gen = S.flow.generation; }
+	if (start < 0) start = 0;
+	const bool haveVap = sc.VolumeAtPriceForBars != nullptr;
+	const int nVap = haveVap ? static_cast<int>(sc.VolumeAtPriceForBars->GetNumberOfBars()) : 0;
+	for (int i = Max(0, start - 1); i < n; ++i)
+	{
+		for (int k = 0; k < FCS_COUNT; ++k) sc.Subgraph[k][i] = 0;
+		const bool forming = (i == n - 1);
+		const float dp = F.deltaPct[i], vz = F.volZ[i], atr = AtrAt(S, i);
+		uint32_t cc = cNeu;
+		if (mode == 0) { const float t = Min(1.0f, static_cast<float>(fabs(dp)) / 0.35f); cc = render::Blend(cNeu, dp >= 0 ? cBull : cBear, 0.25f + 0.75f * t); if (vz >= 1.5f) cc = render::Blend(cc, RGB(255, 255, 255), 0.18f); }
+		else if (mode == 1) cc = dp >= 0.05f ? cBull : (dp <= -0.05f ? cBear : cNeu);
+		else if (mode == 2) cc = sc.Close[i] >= sc.Open[i] ? cBull : cBear;
+		sc.Subgraph[FCS_CANDLE][i] = forming ? 0.0f : 1.0f; sc.Subgraph[FCS_CANDLE].DataColor[i] = cc;
+		sc.Subgraph[FCS_FORMING][i] = forming ? 1.0f : 0.0f; sc.Subgraph[FCS_FORMING].DataColor[i] = cc;
+		if (showAbs) { if (F.absorbMark[i] == 1) sc.Subgraph[FCS_ABS_BUY][i] = sc.Low[i] - 0.2f * atr; else if (F.absorbMark[i] == -1) sc.Subgraph[FCS_ABS_SELL][i] = sc.High[i] + 0.2f * atr; }
+		if (showExh) { if (F.exhaustMark[i] == -1) sc.Subgraph[FCS_EXH_TOP][i] = sc.High[i] + 0.35f * atr; else if (F.exhaustMark[i] == 1) sc.Subgraph[FCS_EXH_BOT][i] = sc.Low[i] - 0.35f * atr; }
+		if (showTrap) { if (F.trapMark[i] == -1) sc.Subgraph[FCS_TRAP_LONGS][i] = sc.High[i] + 0.5f * atr; else if (F.trapMark[i] == 1) sc.Subgraph[FCS_TRAP_SHORTS][i] = sc.Low[i] - 0.5f * atr; }
+		if (showDiv) { if (F.divMark[i] == -1) sc.Subgraph[FCS_DIV_DN][i] = sc.High[i] + 0.65f * atr; else if (F.divMark[i] == 1) sc.Subgraph[FCS_DIV_UP][i] = sc.Low[i] - 0.65f * atr; }
+		if (showImb && F.imbMark[i] != 0)
+		{
+			float buyAt = sc.Low[i], sellAt = sc.High[i];
+			for (int z = static_cast<int>(F.imbZones.size()) - 1; z >= 0 && F.imbZones[z].bornIdx >= i; --z) if (F.imbZones[z].bornIdx == i) { if (F.imbZones[z].dir > 0) buyAt = F.imbZones[z].bottom; else sellAt = F.imbZones[z].top; }
+			if (F.imbMark[i] == 1 || F.imbMark[i] == 2) sc.Subgraph[FCS_IMB_BUY][i] = buyAt;
+			if (F.imbMark[i] == -1 || F.imbMark[i] == 2) sc.Subgraph[FCS_IMB_SELL][i] = sellAt;
+		}
+		if (showPoc && haveVap && i < nVap)
+		{
+			const int cnt = sc.VolumeAtPriceForBars->GetSizeAtBarIndex(i);
+			double best = 0; int bestTicks = 0;
+			for (int q = 0; q < cnt; ++q) { const s_VolumeAtPriceV2* pp = nullptr; if (sc.VolumeAtPriceForBars->GetVAPElementAtIndex(i, q, &pp) && pp && static_cast<double>(pp->Volume) > best) { best = static_cast<double>(pp->Volume); bestTicks = pp->PriceInTicks; } }
+			if (best > 0) sc.Subgraph[FCS_POC][i] = bestTicks * S.tickSize;
+		}
+		if (showDelta) { sc.Subgraph[FCS_DELTA_TXT][i] = F.delta[i]; sc.Subgraph[FCS_DELTA_TXT].DataColor[i] = F.delta[i] >= 0 ? cBull : cBear; }
+		if (showVol) sc.Subgraph[FCS_VOL_TXT][i] = sc.Volume[i];
+		sc.Subgraph[FCS_H_DELTA_PCT][i] = dp * 100.0f; sc.Subgraph[FCS_H_VOLZ][i] = vz; sc.Subgraph[FCS_H_CVD][i] = F.cvd[i];
+	}
+	// bubbles: three size classes against the largest print in the lookback; re-laid over the lookback window every update
+	if (showBub)
+	{
+		const int look = sc.Input[FCI_BUBBLE_BARS].GetInt();
+		const int from = Max(0, n - look);
+		for (int i = Max(from, Max(0, start - 1) < from ? from : 0); i < n; ++i) for (int k = 0; k < 6; ++k) sc.Subgraph[FCS_BUB_BUY_S + k][i] = 0;
+		double mx = 0; for (int q = static_cast<int>(F.bubbles.size()) - 1; q >= 0 && F.bubbles[q].idx >= from; --q) mx = Max(mx, F.bubbles[q].size);
+		for (int q = static_cast<int>(F.bubbles.size()) - 1; q >= 0 && F.bubbles[q].idx >= from; --q)
+		{
+			const Bubble& b = F.bubbles[q]; if (b.idx < 0 || b.idx >= n || mx <= 0) continue;
+			const double r = b.size / mx; const int cls = r >= 0.66 ? 2 : (r >= 0.33 ? 1 : 0);
+			const int sg = (b.dir > 0 ? FCS_BUB_BUY_S : FCS_BUB_SELL_S) + cls;
+			if (sc.Subgraph[sg][b.idx] == 0) sc.Subgraph[sg][b.idx] = b.price;
+		}
+	}
+	// alerts: the newest closed bar only, real time only
+	if (sc.Input[FCI_ALERT].GetYesNo() && n >= 2 && !sc.IsFullRecalculation && sc.DownloadingHistoricalData == 0 && !sc.IsReplayRunning())
+	{
+		const int i = n - 2; int& last = sc.GetPersistentInt(12);
+		if (last != i && (F.absorbMark[i] != 0 || F.trapMark[i] != 0 || F.divMark[i] != 0))
+		{
+			last = i;
+			SCString msg; msg.Format("NQ Edge Flow %s: %s%s%s @ %s", sc.Symbol.GetChars(), F.absorbMark[i] > 0 ? "absorption (buyers) " : (F.absorbMark[i] < 0 ? "absorption (sellers) " : ""),
+				F.trapMark[i] < 0 ? "trapped longs " : (F.trapMark[i] > 0 ? "trapped shorts " : ""), F.divMark[i] < 0 ? "CVD divergence (bearish)" : (F.divMark[i] > 0 ? "CVD divergence (bullish)" : ""), sc.FormatGraphValue(sc.Close[i], sc.BaseGraphValueFormat).GetChars());
+			const int snd = sc.Input[FCI_SOUND].GetAlertSoundNumber();
+			if (snd > 0) sc.SetAlert(snd - 1, i, msg); else sc.AddAlertLine(msg, 1);
+		}
+	}
+}
+
+// ---- Flow CVD panel: session cumulative delta with divergence dots ----
+enum FlowCvdInput { FVI_SHOW_DIV = 0, FVI_C_UP, FVI_C_DN, FVI_C_DIV, FVI_C_ZERO, FVI_COUNT };
+enum FlowCvdSubgraph { FVS_CVD = 0, FVS_DIV_BEAR, FVS_DIV_BULL, FVS_ZERO, FVS_H_CVDZ, FVS_COUNT };
+
+SCSFExport scsf_NQEdge_FlowCVD(SCStudyInterfaceRef sc)
+{
+	using namespace nqe;
+	if (sc.SetDefaults)
+	{
+		sc.GraphName = "NQ Edge Flow CVD";
+		sc.StudyDescription = "Cumulative delta (reset per RTH session / trading day / never, set on Flow Candles or the Terminal) in its own panel, coloured by direction, with magenta dots where price made a new swing extreme on weaker delta (CVD divergence). Reader only: shares the engines of the other NQ Edge studies on the chart.";
+		sc.GraphRegion = 1; sc.AutoLoop = 0; sc.CalculationPrecedence = LOW_PREC_LEVEL; sc.ValueFormat = 0; sc.ScaleRangeType = SCALE_AUTO; sc.DrawZeros = 0; sc.MaintainVolumeAtPriceData = 1;
+		const char* names[FVS_COUNT] = { "CVD", "Divergence (bearish)", "Divergence (bullish)", "Zero", "h.CVD Z" };
+		for (int k = 0; k < FVS_COUNT; ++k) { sc.Subgraph[k].Name = names[k]; sc.Subgraph[k].DrawStyle = DRAWSTYLE_IGNORE; sc.Subgraph[k].DrawZeros = 0; sc.Subgraph[k].LineWidth = 1; }
+		sc.Subgraph[FVS_CVD].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[FVS_CVD].LineWidth = 2; sc.Subgraph[FVS_CVD].PrimaryColor = RGB(0, 200, 150); sc.Subgraph[FVS_CVD].DrawZeros = 1;
+		sc.Subgraph[FVS_DIV_BEAR].DrawStyle = DRAWSTYLE_POINT; sc.Subgraph[FVS_DIV_BEAR].LineWidth = 8; sc.Subgraph[FVS_DIV_BEAR].PrimaryColor = RGB(214, 93, 255);
+		sc.Subgraph[FVS_DIV_BULL].DrawStyle = DRAWSTYLE_POINT; sc.Subgraph[FVS_DIV_BULL].LineWidth = 8; sc.Subgraph[FVS_DIV_BULL].PrimaryColor = RGB(214, 93, 255);
+		sc.Subgraph[FVS_ZERO].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[FVS_ZERO].LineWidth = 1; sc.Subgraph[FVS_ZERO].PrimaryColor = RGB(60, 66, 80); sc.Subgraph[FVS_ZERO].DrawZeros = 1;
+		NQE_YESNO_INPUT(FVI_SHOW_DIV, "Show Divergence Dots", 1);
+		NQE_COLOR_INPUT(FVI_C_UP, "Color: CVD Rising", 0, 200, 150);
+		NQE_COLOR_INPUT(FVI_C_DN, "Color: CVD Falling", 255, 77, 94);
+		NQE_COLOR_INPUT(FVI_C_DIV, "Color: Divergence", 214, 93, 255);
+		NQE_COLOR_INPUT(FVI_C_ZERO, "Color: Zero Line", 60, 66, 80);
+		return;
+	}
+	if (sc.LastCallToFunction) { Release(sc, -1); return; }
+	std::lock_guard<std::recursive_mutex> lock(g_mutex);
+	ChartState& S = Acquire(sc);
+	if (sc.MaintainVolumeAtPriceData == 0) { sc.MaintainVolumeAtPriceData = 1; sc.FlagToReloadChartData = 1; }
+	CheckDataStamp(sc, S);
+	EnsureFlow(sc, S);
+	const int n = sc.ArraySize; if (n <= 0) return;
+	const FlowState& F = S.flow;
+	const uint32_t cUp = sc.Input[FVI_C_UP].GetColor(), cDn = sc.Input[FVI_C_DN].GetColor(), cDiv = sc.Input[FVI_C_DIV].GetColor();
+	sc.Subgraph[FVS_DIV_BEAR].PrimaryColor = sc.Subgraph[FVS_DIV_BULL].PrimaryColor = cDiv; sc.Subgraph[FVS_ZERO].PrimaryColor = sc.Input[FVI_C_ZERO].GetColor();
+	const bool showDiv = sc.Input[FVI_SHOW_DIV].GetYesNo() != 0;
+	int& gen = sc.GetPersistentInt(11);
+	int start = Min(sc.UpdateStartIndex, S.flow.dirtyFrom);
+	if (gen != S.flow.generation) { start = 0; gen = S.flow.generation; }
+	if (start < 0) start = 0;
+	for (int i = Max(0, start - 1); i < n; ++i)
+	{
+		sc.Subgraph[FVS_CVD][i] = F.cvd[i]; sc.Subgraph[FVS_CVD].DataColor[i] = (i > 0 && F.cvd[i] < F.cvd[i - 1]) ? cDn : cUp;
+		sc.Subgraph[FVS_DIV_BEAR][i] = (showDiv && F.divMark[i] == -1) ? F.cvd[i] : 0.0f;
+		sc.Subgraph[FVS_DIV_BULL][i] = (showDiv && F.divMark[i] == 1) ? F.cvd[i] : 0.0f;
+		sc.Subgraph[FVS_ZERO][i] = 0; sc.Subgraph[FVS_H_CVDZ][i] = F.cvdZ[i];
+	}
+}
+
+// ---- Flow Delta panel: delta histogram with absorption highlight, pressure line, high-volume shading ----
+enum FlowDeltaInput { FDI_PRESS_LEN = 0, FDI_VOLZ_HI, FDI_C_UP, FDI_C_DN, FDI_C_ABS, FDI_C_TRAP, FDI_C_PRESS, FDI_C_HI, FDI_COUNT };
+enum FlowDeltaSubgraph { FDS_BG = 0, FDS_DELTA, FDS_PRESSURE, FDS_ZERO, FDS_H_VOLZ, FDS_COUNT };
+
+SCSFExport scsf_NQEdge_FlowDelta(SCStudyInterfaceRef sc)
+{
+	using namespace nqe;
+	if (sc.SetDefaults)
+	{
+		sc.GraphName = "NQ Edge Flow Delta";
+		sc.StudyDescription = "Per-bar delta histogram in its own panel: green / red by sign, gold on absorption bars, magenta on trapped-trader bars; a pressure line (EMA of delta); background shading on bars whose volume z-score is above the threshold. Reader only: shares the engines of the other NQ Edge studies on the chart.";
+		sc.GraphRegion = 2; sc.AutoLoop = 0; sc.CalculationPrecedence = LOW_PREC_LEVEL; sc.ValueFormat = 0; sc.ScaleRangeType = SCALE_AUTO; sc.DrawZeros = 0; sc.MaintainVolumeAtPriceData = 1;
+		const char* names[FDS_COUNT] = { "High-Volume Shade", "Delta", "Pressure (EMA of delta)", "Zero", "h.Volume Z" };
+		for (int k = 0; k < FDS_COUNT; ++k) { sc.Subgraph[k].Name = names[k]; sc.Subgraph[k].DrawStyle = DRAWSTYLE_IGNORE; sc.Subgraph[k].DrawZeros = 0; sc.Subgraph[k].LineWidth = 1; }
+		sc.Subgraph[FDS_BG].DrawStyle = DRAWSTYLE_BACKGROUND; sc.Subgraph[FDS_BG].PrimaryColor = RGB(34, 40, 56);
+		sc.Subgraph[FDS_DELTA].DrawStyle = DRAWSTYLE_BAR; sc.Subgraph[FDS_DELTA].LineWidth = 2; sc.Subgraph[FDS_DELTA].PrimaryColor = RGB(0, 200, 150);
+		sc.Subgraph[FDS_PRESSURE].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[FDS_PRESSURE].LineWidth = 2; sc.Subgraph[FDS_PRESSURE].PrimaryColor = RGB(255, 200, 87); sc.Subgraph[FDS_PRESSURE].DrawZeros = 1;
+		sc.Subgraph[FDS_ZERO].DrawStyle = DRAWSTYLE_LINE; sc.Subgraph[FDS_ZERO].PrimaryColor = RGB(60, 66, 80); sc.Subgraph[FDS_ZERO].DrawZeros = 1;
+		NQE_INT_INPUT(FDI_PRESS_LEN, "Pressure EMA Length", 10, 2, 200);
+		NQE_FLT_INPUT(FDI_VOLZ_HI, "Shade Bars With Volume Z >=", 1.5, 0.5, 6.0);
+		NQE_COLOR_INPUT(FDI_C_UP, "Color: Positive Delta", 0, 200, 150);
+		NQE_COLOR_INPUT(FDI_C_DN, "Color: Negative Delta", 255, 77, 94);
+		NQE_COLOR_INPUT(FDI_C_ABS, "Color: Absorption Bar", 255, 200, 87);
+		NQE_COLOR_INPUT(FDI_C_TRAP, "Color: Trapped Bar", 214, 93, 255);
+		NQE_COLOR_INPUT(FDI_C_PRESS, "Color: Pressure Line", 230, 234, 242);
+		NQE_COLOR_INPUT(FDI_C_HI, "Color: High-Volume Shade", 34, 40, 56);
+		return;
+	}
+	if (sc.LastCallToFunction) { Release(sc, -1); return; }
+	std::lock_guard<std::recursive_mutex> lock(g_mutex);
+	ChartState& S = Acquire(sc);
+	if (sc.MaintainVolumeAtPriceData == 0) { sc.MaintainVolumeAtPriceData = 1; sc.FlagToReloadChartData = 1; }
+	CheckDataStamp(sc, S);
+	EnsureFlow(sc, S);
+	const int n = sc.ArraySize; if (n <= 0) return;
+	const FlowState& F = S.flow;
+	const uint32_t cUp = sc.Input[FDI_C_UP].GetColor(), cDn = sc.Input[FDI_C_DN].GetColor(), cAbs = sc.Input[FDI_C_ABS].GetColor(), cTrap = sc.Input[FDI_C_TRAP].GetColor(), cPress = sc.Input[FDI_C_PRESS].GetColor(), cHi = sc.Input[FDI_C_HI].GetColor();
+	sc.Subgraph[FDS_PRESSURE].PrimaryColor = cPress; sc.Subgraph[FDS_BG].PrimaryColor = cHi;
+	const float hiZ = sc.Input[FDI_VOLZ_HI].GetFloat();
+	const float alpha = 2.0f / (Max(2, sc.Input[FDI_PRESS_LEN].GetInt()) + 1.0f);
+	int& gen = sc.GetPersistentInt(11);
+	int start = Min(sc.UpdateStartIndex, S.flow.dirtyFrom);
+	if (gen != S.flow.generation) { start = 0; gen = S.flow.generation; }
+	if (start < 0) start = 0;
+	for (int i = Max(0, start - 1); i < n; ++i)
+	{
+		const float d = F.delta[i];
+		sc.Subgraph[FDS_DELTA][i] = d;
+		sc.Subgraph[FDS_DELTA].DataColor[i] = F.absorbMark[i] != 0 ? cAbs : (F.trapMark[i] != 0 ? cTrap : (d >= 0 ? cUp : cDn));
+		sc.Subgraph[FDS_PRESSURE][i] = (i == 0) ? d : sc.Subgraph[FDS_PRESSURE][i - 1] + alpha * (d - sc.Subgraph[FDS_PRESSURE][i - 1]);
+		sc.Subgraph[FDS_BG][i] = F.volZ[i] >= hiZ ? 1.0f : 0.0f; sc.Subgraph[FDS_BG].DataColor[i] = cHi;
+		sc.Subgraph[FDS_ZERO][i] = 0; sc.Subgraph[FDS_H_VOLZ][i] = F.volZ[i];
 	}
 }

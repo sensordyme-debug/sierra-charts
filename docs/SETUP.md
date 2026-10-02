@@ -1,4 +1,4 @@
-# Setup (Sierra Chart) — v4.2: one study, PRO preset
+# Setup (Sierra Chart) — v4.3: one study, PRO preset, Flow series for the other charts
 
 ## 1. Settings the suite needs (the HUD's last line warns when they are wrong)
 
@@ -30,6 +30,9 @@ Then set, in the Terminal's inputs:
   bars of the other charts in the chartbook (open `YMZ26-CBOT`, `TICK-NYSE`, `AAPL`, `AMZN-NQTV` as 1-minute
   charts, tile them small or hide them). Leave the rest at 0. Until these are set the HUD shows `mkt 0/0`
   and the intermarket group is simply absent from the score and from the group count.
+- *Session: Trading Day Start* — 18:00 for CME equity futures in New York time. The trading-day VWAP,
+  the overnight range and the prior-day profile roll at this time (the suite no longer relies on the
+  chart's session settings for it).
 - *Risk Per Trade ($)* — the dollar risk behind the size suggestion (`3x` on signal labels, `size 3x` in
   the plan and the alert). It uses Sierra's currency value per tick for the symbol; if Sierra reports
   none, no size is shown.
@@ -67,3 +70,12 @@ compiled-in weights are a reasonable prior, the learned ones are fitted to your 
 The engine studies (Auction/Structure, VWAP, Order Flow, Regime + MTF, Intermarket, DCS, Validation,
 Feature Logger) can still be added for their subgraphs and extra inputs. While the Terminal is on the
 chart they do not change parameters; the Terminal's inputs win.
+
+## 8. Companion charts: the Flow series
+
+On every other chart (another NQ timeframe, ES, YM, the mega caps) add **NQ Edge Flow Candles**
+(price region) and, if you want the panels, **NQ Edge Flow CVD** and **NQ Edge Flow Delta** (they
+open their own regions). Flow Candles carries the session, swing and order-flow inputs for that chart;
+the panels read the same engines. Do not add the diagnostic *Order Flow Engine* study to a chart that
+has Flow Candles (both set the flow parameters). On the main chart the Terminal owns the parameters and
+Flow Candles simply draws alongside it.
