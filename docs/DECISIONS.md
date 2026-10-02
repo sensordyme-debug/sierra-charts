@@ -148,3 +148,29 @@ Ambiguities resolved while building, and anything not verifiable without a Sierr
     with `DRAWSTYLE_COLOR_BAR_HOLLOW` for the forming bar.
 40. **Opt-in GDI layers** (profile, tape) call `SetBackgroundMode(TRANSPARENT)` first; all other layers
     are native objects so nothing can leave stale pixels behind.
+
+## v4 (PRO preset) decisions
+
+41. **PRO is the default preset; layers are tri-state** (*Preset default / On / Off*) so switching presets
+    never discards a per-layer override and CLEAN remains one click away.
+42. **HUD placement** uses `sc.GetGraphVisibleHighAndLow` to put the text block in the half of the visible
+    scale that price is not in (price above 55 % → HUD at the bottom), so it does not cover the level pills
+    that sit at price. When the tape strip is on the bottom block starts at 15 % instead of 3 %. If the call
+    returns 0/0 the HUD stays at the top.
+43. **Heavy layers redraw per bar, light layers per update.** Per-bar numbers, swing numbers, zones, bubbles,
+    notes, fibs and the channel depend only on closed bars, so they are redrawn when `ArraySize` changes, the
+    layer mask changes, a full recalculation runs or the subgraph start index is 0; between those updates
+    `SlotKeep` marks their objects as used so the flush keeps them. HUD, pills and signal boxes redraw each update.
+44. **Docked profile is right-aligned** at the fill-space edge by GDI (`profileDockRight`), and the pill column
+    sits `fillBars − profileBars − 10` bars right of the last bar because the GDI pass paints over drawings.
+45. **Per-bar numbers** appear only when `sc.ChartBarSpacing ≥ 9` px (two text objects per bar, last N ≤ 60 bars).
+46. **ASCII separators only.** `\xB7` (middle dot) rendered as `□` in the chart font on the user's chart (v3.1
+    screenshot); every HUD/label string now uses ` | `.
+47. **HUD nearest R/S excludes VWAP bands and transient zones** (absorption, imbalance, failed) to match the
+    drawn level set; the plan line inherits the same levels.
+48. **Fib levels** are retracements of the last *completed* leg (confirmed pivot to confirmed pivot), drawn from
+    the pivot bar to the pill column; a fib tag is skipped within 0.3 ATR of a level pill.
+
+Unverified without a Sierra build: that `GetGraphVisibleHighAndLow` reports the price region's scale when
+called from the Terminal (region 0); that GDI output is painted after drawing objects (otherwise pills may
+cover the profile, which is harmless); `ChartBarSpacing` being in pixels.

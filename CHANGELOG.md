@@ -102,3 +102,19 @@
 - HUD text anchored 2 bars right of the last bar (a negative `BeginDateTime` counts bars into the fill space; the old value pushed the text under the price scale).
 - VWAP anchor input on the Terminal, default trading-day start, so the gold line and band show overnight.
 - Time-zone warning now based on the chart's UTC offset (no false positive).
+
+## v4 — PRO preset (the "power" look, still readable)
+- Terminal: *Preset* input (PRO default, CLEAN) and tri-state *Layer:* inputs (Preset default / On / Off) for 15 layers.
+- New layers: Fib Levels of the last completed leg (38.2/50/61.8/78.6, dotted gold, pills in the tag column, tags yield to level pills),
+  Delta / Volume Per Bar (last N bars, hidden when bar spacing < 9 px), Regression Channel of the active leg (midline + dotted ±2σ,
+  extended into the fill space). Swing-delta numbers, zones, bubbles, notes, projection, docked profile and tape are PRO defaults.
+- Levels: 3 above / 3 below in PRO (2+2 in CLEAN); pills placed left of the docked profile; the profile now docks at the right edge
+  of the fill space (bars grow leftward, POC pill on its left).
+- HUD: 9 lines in PRO (adds order-flow, scoreboard and session-clock lines), placed in the half of the chart away from price so it
+  never covers the level pills, and above the tape strip when at the bottom. Nearest R/S and the plan line now use structural
+  levels only (VWAP bands / zones excluded). Plan lines shortened to one HUD width.
+- Text: all `·` separators replaced by ASCII `|` (the middle dot rendered as a box in the chart font).
+- VWAP band transparency is an input (88 % default, re-applied when changed).
+- Performance: heavy per-bar layers are redrawn only when a bar closes, the layer set changes or the engines were rebuilt
+  (`SlotKeep`); HUD, pills and signal boxes every update. Slot table grows to ~250 managed drawings.
+- Docs: VISUAL_GUIDE (PRO screenshot description), SETUP (fill space 40–60, bar spacing, re-add after upgrade), DECISIONS 41–48.

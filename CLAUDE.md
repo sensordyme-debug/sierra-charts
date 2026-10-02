@@ -50,12 +50,16 @@ projection, footprint/depth, signal-power features) are implemented — see CHAN
 built and run in Sierra by the user; v2 is syntax-checked only. `docs/DECISIONS.md` 26–34 list the
 v2 API details to confirm on the first Remote Build. `docs/VISUAL_GUIDE.md` explains every visual.
 
-## v3 (current): one study
+## v4 (current): one study, PRO preset
 `scsf_NQEdge_Terminal` is the only study the trader adds. It sets every engine's parameters from its
-own inputs (`S.terminalPresent` makes the engine studies passive), draws CLEAN by default with
-Sierra drawing objects managed by line number (`term::Slot*` helpers, `TermState` slots flushed each
-update), and uses GDI only for the opt-in profile/tape layers. The v2 GDI overlay/backdrop/tape
-studies were removed; `render::Frame`, `DrawProfile` and `DrawTape` remain for those layers.
+own inputs (`S.terminalPresent` makes the engine studies passive) and draws with Sierra drawing
+objects managed by line number (`term::Slot*` helpers, `TermState` slots, `SlotFlush` each update,
+`SlotKeep` for heavy layers between bar closes). Presets PRO (default: everything) and CLEAN (five
+layers); `kTermPreset` rows + tri-state `Layer:` inputs decide `on[TL_*]`. GDI is used only for the
+docked profile and the tape strip (`DrawTerminalGDI`). The v2 GDI overlay/backdrop/tape studies were
+removed; `render::Frame`, `DrawProfile` and `DrawTape` remain. New Terminal layer: add a `TL_*` entry,
+its name in `kTermLayerNames`, both `kTermPreset` rows, slots in `TermState`, and a draw block that
+either redraws (when `heavy`) or `SlotKeep`s.
 
 ## v2 rendering rules (apply to the remaining GDI layers)
 * Draw only `firstVis..lastVis`; anything beyond the last bar is positioned by `Frame::XOf` extrapolation.
