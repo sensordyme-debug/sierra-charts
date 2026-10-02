@@ -351,7 +351,7 @@ namespace nqe
 		int acceptRun = 0;                          // consecutive closes on one side (signed)
 	};
 
-	struct Bubble { int idx; float price; double size; int dir; bool live; int lineNumber; };
+	struct Bubble { int idx; float price; double size; int dir; bool live; int lineNumber; int count; };
 
 	struct FlowState : EngineCommon
 	{
@@ -377,6 +377,12 @@ namespace nqe
 		int lastTrapIdx = -1000, lastTrapDir = 0, lastDivIdx = -1000, lastDivDir = 0; float lastDivPrice = 0;
 		struct Marker { int idx; int dir; int kind; float price; int lineNumber; };
 		std::vector<Marker> markers;
+		// swing legs (between confirmed swings) + the active leg and its regression channel
+		struct Leg { int fromIdx, toIdx; float fromPrice, toPrice; double delta, volume; int ticks; bool up; bool divergence; };
+		std::vector<Leg> legs; Leg active; bool activeValid = false; size_t legsSwingCount = 0;
+		struct LegReg { int startIdx = -1; double slope = 0, intercept = 0, sigma = 0, r2 = 0; } legReg;
+		std::vector<double> deltaPre;               // prefix sum of delta over closed bars
+		std::vector<Zone> failedZones;              // supply/demand left by failed auctions (trapped traders)
 		std::vector<int> deadLines;
 		float lastEventPrice = 0; int lastEventIdx = -1; char lastEventText[64] = "";
 	};
@@ -544,7 +550,7 @@ namespace nqe
 		char vwapText[64] = "";
 		int signalsTotal = 0;
 		double updateMs = 0, maxUpdateMs = 0; int fullCalcMs = 0; int bars = 0;
-		char dayType[24] = ""; char leadLag[32] = ""; int lastEventIdx = -1; float adrPct = 0; int interConnected = 0, interConfigured = 0;
+		char dayType[24] = ""; char leadLag[32] = ""; int lastEventIdx = -1; float adrPct = 0; int interConnected = 0, interConfigured = 0; float legR2 = 0; int legDir = 0;
 	};
 
 	// ==== 14 Terminal renderer (GDI) ============================================
@@ -712,6 +718,7 @@ namespace nqe
 			for (size_t k = 0; k < S.flow.bubbles.size(); ++k) if (S.flow.bubbles[k].lineNumber) S.flow.deadLines.push_back(S.flow.bubbles[k].lineNumber);
 			for (size_t k = 0; k < S.flow.markers.size(); ++k) if (S.flow.markers[k].lineNumber) S.flow.deadLines.push_back(S.flow.markers[k].lineNumber);
 			S.flow.absorbZones.clear(); S.flow.imbZones.clear(); S.flow.bubbles.clear(); S.flow.markers.clear();
+			S.flow.legs.clear(); S.flow.activeValid = false; S.flow.legsSwingCount = 0; S.flow.legReg = FlowState::LegReg(); S.flow.failedZones.clear();
 			S.flow.tradeSizes.clear(); S.flow.lastTsSequence = 0; S.flow.liveSampleCount = 0; S.flow.liveThreshold = 0;
 			S.flow.levelAvgSizes.clear(); S.flow.ltSampleCount = 0; S.flow.ltThreshold = 0; S.flow.lastProcessedSwing = -1; S.flow.pendingBreakouts.clear();
 			S.flow.lastAbsIdx = S.flow.lastExhIdx = S.flow.lastImbIdx = S.flow.lastTrapIdx = S.flow.lastDivIdx = -1000;
@@ -1575,7 +1582,7 @@ namespace nqe
 		Fit(F.delta, n); Fit(F.deltaPct, n); Fit(F.cvd, n); Fit(F.cvdZ, n); Fit(F.volZ, n);
 		Fit(F.fAbsorb, n); Fit(F.fExhaust, n); Fit(F.fImb, n); Fit(F.fTrapped, n); Fit(F.fCvdDiv, n); Fit(F.fLarge, n);
 		Fit(F.absorbMark, n); Fit(F.exhaustMark, n); Fit(F.imbMark, n); Fit(F.trapMark, n); Fit(F.divMark, n);
-		Fit(F.volPre1, n); Fit(F.volPre2, n); Fit(F.dzPre1, n); Fit(F.dzPre2, n); Fit(F.cvdDz, n);
+		Fit(F.volPre1, n); Fit(F.volPre2, n); Fit(F.dzPre1, n); Fit(F.dzPre2, n); Fit(F.cvdDz, n); Fit(F.deltaPre, n);
 		if (F.UpToDate(sc)) return;
 		int from = F.computedThrough + 1; if (from < 0) from = 0; if (from > n - 1) from = n - 1;
 		const int L = Max(5, P.volZLength);
@@ -1618,9 +1625,9 @@ namespace nqe
 					for (int q = static_cast<int>(F.bubbles.size()) - 1; q >= 0 && q >= static_cast<int>(F.bubbles.size()) - 20; --q)
 					{
 						Bubble& bq = F.bubbles[q];
-						if (bq.idx == bi && bq.live && bq.dir == dir && fabs(bq.price - price) < 0.5f * tick) { bq.size += size; merged = true; break; }
+						if (bq.idx == bi && bq.live && bq.dir == dir && fabs(bq.price - price) < 0.5f * tick) { bq.size += size; ++bq.count; merged = true; break; }
 					}
-					if (!merged) { Bubble bb; bb.idx = bi; bb.price = price; bb.size = size; bb.dir = dir; bb.live = true; bb.lineNumber = 0; F.bubbles.push_back(bb); }
+					if (!merged) { Bubble bb; bb.idx = bi; bb.price = price; bb.size = size; bb.dir = dir; bb.live = true; bb.lineNumber = 0; bb.count = 1; F.bubbles.push_back(bb); }
 				}
 			}
 		}
@@ -1658,6 +1665,7 @@ namespace nqe
 			}
 			if (closed)
 			{
+				F.deltaPre[i] = (i > 0 ? F.deltaPre[i - 1] : 0.0) + delta;
 				F.volPre1[i] = (i > 0 ? F.volPre1[i - 1] : 0.0) + vol; F.volPre2[i] = (i > 0 ? F.volPre2[i - 1] : 0.0) + vol * vol;
 				F.dzPre1[i] = (i > 0 ? F.dzPre1[i - 1] : 0.0) + dz; F.dzPre2[i] = (i > 0 ? F.dzPre2[i - 1] : 0.0) + dz * dz;
 			}
@@ -1752,7 +1760,7 @@ namespace nqe
 									if (lv[q]->NumberOfTrades == 0) continue;
 									const double avg = lv[q]->Volume / lv[q]->NumberOfTrades;
 									if (avg < F.ltThreshold || avg < P.largeMinSize) continue;
-									Bubble bb; bb.idx = i; bb.price = lv[q]->PriceInTicks * tick; bb.size = lv[q]->Volume; bb.dir = lv[q]->AskVolume >= lv[q]->BidVolume ? 1 : -1; bb.live = false; bb.lineNumber = 0;
+									Bubble bb; bb.idx = i; bb.price = lv[q]->PriceInTicks * tick; bb.size = lv[q]->Volume; bb.dir = lv[q]->AskVolume >= lv[q]->BidVolume ? 1 : -1; bb.live = false; bb.lineNumber = 0; bb.count = Max(1, static_cast<int>(lv[q]->NumberOfTrades));
 									F.bubbles.push_back(bb);
 								}
 							}
@@ -1764,6 +1772,7 @@ namespace nqe
 				// zones die when traded through
 				for (size_t z = 0; z < F.absorbZones.size(); ++z) { Zone& Z = F.absorbZones[z]; if (Z.active && i > Z.bornIdx && ((Z.dir > 0 && c < Z.bottom) || (Z.dir < 0 && c > Z.top))) { Z.active = false; Z.deadIdx = i; } }
 				for (size_t z = 0; z < F.imbZones.size(); ++z) { Zone& Z = F.imbZones[z]; if (Z.active && i > Z.bornIdx && ((Z.dir > 0 && c < Z.bottom) || (Z.dir < 0 && c > Z.top))) { Z.active = false; Z.deadIdx = i; } }
+				for (size_t z = 0; z < F.failedZones.size(); ++z) { Zone& Z = F.failedZones[z]; if (Z.active && i > Z.bornIdx && ((Z.dir > 0 && c < Z.bottom) || (Z.dir < 0 && c > Z.top))) { Z.active = false; Z.deadIdx = i; } }
 
 				// trapped traders: strong-delta breakout fully reversed within K bars
 				{
@@ -1773,8 +1782,19 @@ namespace nqe
 						FlowState::Breakout& bo = F.pendingBreakouts[q];
 						bool done = false;
 						if (i - bo.idx > P.trapReversalBars) done = true;
-						else if (bo.dir > 0 && c < bo.extreme) { F.trapMark[i] = -1; F.lastTrapIdx = i; F.lastTrapDir = -1; SetEvent(F, i, bo.extreme, "Trapped longs"); PushMarker(F, i, -1, 2, h); done = true; }
-						else if (bo.dir < 0 && c > bo.extreme) { F.trapMark[i] = 1; F.lastTrapIdx = i; F.lastTrapDir = 1; SetEvent(F, i, bo.extreme, "Trapped shorts"); PushMarker(F, i, 1, 2, l); done = true; }
+						else if (bo.dir > 0 && c < bo.extreme)
+						{
+							F.trapMark[i] = -1; F.lastTrapIdx = i; F.lastTrapDir = -1; SetEvent(F, i, bo.extreme, "Trapped longs"); PushMarker(F, i, -1, 2, h); done = true;
+							float hh = -FLT_MAX; for (int q = bo.idx; q <= i; ++q) hh = Max(hh, sc.High[q]);
+							Zone z; z.bornIdx = i; z.top = hh; z.bottom = Max(bo.extreme, hh - 0.35f * atr); z.dir = -1; z.kind = LVL_FAILED; z.active = true; F.failedZones.push_back(z);
+						}
+						else if (bo.dir < 0 && c > bo.extreme)
+						{
+							F.trapMark[i] = 1; F.lastTrapIdx = i; F.lastTrapDir = 1; SetEvent(F, i, bo.extreme, "Trapped shorts"); PushMarker(F, i, 1, 2, l); done = true;
+							float ll = FLT_MAX; for (int q = bo.idx; q <= i; ++q) ll = Min(ll, sc.Low[q]);
+							Zone z; z.bornIdx = i; z.bottom = ll; z.top = Min(bo.extreme, ll + 0.35f * atr); z.dir = 1; z.kind = LVL_FAILED; z.active = true; F.failedZones.push_back(z);
+						}
+						while (static_cast<int>(F.failedZones.size()) > Max(5, P.maxActiveZones)) F.failedZones.erase(F.failedZones.begin());
 						if (done) F.pendingBreakouts.erase(F.pendingBreakouts.begin() + q); else ++q;
 					}
 					if (i - LB >= 0)
@@ -1822,6 +1842,57 @@ namespace nqe
 					if (bb.dir > 0) buy += bb.size; else sell += bb.size;
 				}
 				F.fLarge[i] = (buy + sell) > 0 ? static_cast<float>((buy - sell) / (buy + sell)) : 0.0f;
+			}
+		}
+		// ---- swing legs (rebuilt when the swing list changes) + active leg + regression ----
+		{
+			const int lc = n - 2;
+			if (A.swings.size() != F.legsSwingCount && lc >= 0)
+			{
+				F.legsSwingCount = A.swings.size(); F.legs.clear();
+				const int first = Max(1, static_cast<int>(A.swings.size()) - 80);
+				for (int k = first; k < static_cast<int>(A.swings.size()); ++k)
+				{
+					const Swing& a = A.swings[k - 1]; const Swing& b = A.swings[k];
+					if (b.confirmIdx > lc || b.idx <= a.idx) continue;
+					FlowState::Leg L; L.fromIdx = a.idx; L.toIdx = b.idx; L.fromPrice = a.price; L.toPrice = b.price;
+					L.delta = F.deltaPre[Min(b.idx, lc)] - F.deltaPre[a.idx]; L.volume = F.volPre1[Min(b.idx, lc)] - F.volPre1[a.idx];
+					L.ticks = static_cast<int>(fabs(b.price - a.price) / Max(tick, 1e-6f) + 0.5f); L.up = b.price > a.price; L.divergence = false;
+					if (F.legs.size() >= 2)
+					{
+						const FlowState::Leg& prev = F.legs[F.legs.size() - 2];   // same direction leg
+						if (prev.up == L.up && ((L.up && L.toPrice > prev.toPrice && L.delta < prev.delta) || (!L.up && L.toPrice < prev.toPrice && L.delta > prev.delta))) L.divergence = true;
+					}
+					F.legs.push_back(L);
+				}
+			}
+			F.activeValid = false; F.legReg = FlowState::LegReg();
+			if (!A.swings.empty() && lc >= 0)
+			{
+				const Swing& a = A.swings.back();
+				if (a.idx < lc)
+				{
+					FlowState::Leg& L = F.active;
+					L.fromIdx = a.idx; L.toIdx = lc; L.fromPrice = a.price; L.toPrice = sc.Close[lc];
+					L.delta = F.deltaPre[lc] - F.deltaPre[a.idx]; L.volume = F.volPre1[lc] - F.volPre1[a.idx];
+					L.ticks = static_cast<int>(fabs(L.toPrice - L.fromPrice) / Max(tick, 1e-6f) + 0.5f); L.up = L.toPrice > L.fromPrice; L.divergence = false;
+					F.activeValid = true;
+					// linear regression of closes over the active leg (capped)
+					const int s0 = Max(a.idx, lc - 500), m = lc - s0 + 1;
+					if (m >= 5)
+					{
+						double sx = 0, sy = 0, sxx = 0, sxy = 0;
+						for (int q = 0; q < m; ++q) { const double y = sc.Close[s0 + q]; sx += q; sy += y; sxx += static_cast<double>(q) * q; sxy += q * y; }
+						const double den = m * sxx - sx * sx;
+						if (den > 0)
+						{
+							const double slope = (m * sxy - sx * sy) / den, icpt = (sy - slope * sx) / m;
+							double ssr = 0, sst = 0; const double ym = sy / m;
+							for (int q = 0; q < m; ++q) { const double y = sc.Close[s0 + q]; const double e = y - (icpt + slope * q); ssr += e * e; sst += (y - ym) * (y - ym); }
+							F.legReg.startIdx = s0; F.legReg.slope = slope; F.legReg.intercept = icpt; F.legReg.sigma = sqrt(ssr / m); F.legReg.r2 = sst > 0 ? 1.0 - ssr / sst : 0.0;
+						}
+					}
+				}
 			}
 		}
 		F.Stamp(sc);
@@ -2807,6 +2878,7 @@ namespace nqe
 			H.leadLag[0] = 0;
 		}
 		H.lastEventIdx = S.flow.lastEventIdx;
+		H.legR2 = static_cast<float>(S.flow.legReg.r2); H.legDir = S.flow.legReg.slope > 0 ? 1 : (S.flow.legReg.slope < 0 ? -1 : 0);
 		H.dayType[0] = 0; H.adrPct = 0;
 		H.signalsTotal = static_cast<int>(S.dcs.signals.size());
 		if (i < static_cast<int>(S.vwap.vwap.size()) && S.vwap.vwap[i] > 0)
@@ -2976,6 +3048,7 @@ namespace nqe
 			switch (state) { case 2: return T.bull; case 1: return Blend(T.neutral, T.bull, 0.55f); case -1: return Blend(T.neutral, T.bear, 0.55f); case -2: return T.bear; default: return T.neutral; }
 		}
 
+		void DrawZones(Frame& F);
 		// ---------------- Backdrop: regime tint, session shade, separators, VWAP cloud -----------------
 		void DrawBackdrop(Frame& F)
 		{
@@ -3046,6 +3119,7 @@ namespace nqe
 					F.Line(F.XOf(i - 1), F.YOf(W.b3d[i - 1]), F.XOf(i), F.YOf(W.b3d[i]), T.dim, 1, 2);
 				}
 			}
+			if (V.layer[L_ZONES]) DrawZones(F);
 			F.Unclip();
 		}
 
@@ -3261,6 +3335,126 @@ namespace nqe
 			}
 		}
 
+		// ---------------- Zones (drawn by the backdrop, under the candles) ----------------
+		void DrawZoneSet(Frame& F, const std::vector<Zone>& zones, const char* letter, uint32_t cBull, uint32_t cBear, int fadeBars)
+		{
+			const Theme& T = F.T;
+			const int xEnd = F.fillVisible ? F.fillRight - 4 : F.right;
+			for (size_t z = 0; z < zones.size(); ++z)
+			{
+				const Zone& Z = zones[z];
+				if (Z.bornIdx > F.lastVis) continue;
+				if (!Z.active && (Z.deadIdx < 0 || Z.deadIdx + fadeBars < F.firstVis)) continue;
+				const uint32_t c = Z.dir > 0 ? cBull : (Z.dir < 0 ? cBear : T.cyan);
+				const int x1 = Max(F.left, F.XOf(Max(Z.bornIdx, F.firstVis)));
+				const int y1 = F.YOf(Z.top), y2 = F.YOf(Z.bottom);
+				if (y2 < F.top || y1 > F.bottom) continue;
+				if (Z.active)
+				{
+					F.Fill(x1, y1, xEnd, y2, c, 14);
+					F.Line(x1, y1, xEnd, y1, c, 1); F.Line(x1, y2, xEnd, y2, c, 1);
+				}
+				else
+				{
+					const int x2 = Min(xEnd, F.XOf(Min(Z.deadIdx, F.lastVis)));
+					const float age = static_cast<float>(F.lastClosed - Z.deadIdx) / Max(1, fadeBars);
+					const uint32_t cc = Blend(c, T.bg, Clamp(0.3f + 0.6f * age, 0.0f, 0.9f));
+					F.Box(x1, y1, x2, y2, cc, 1, 1);
+				}
+				if (y2 - y1 >= F.fontH && letter[0]) { F.Font(F.V.fontPt - 2, true); F.Text(x1 + 2, y1 + 1, letter, Blend(c, T.text, 0.3f)); F.Font(F.V.fontPt, false); }
+			}
+		}
+		void DrawZones(Frame& F)
+		{
+			const Theme& T = F.T; ChartState& S = F.S;
+			DrawZoneSet(F, S.auction.singlePrints, "P", Blend(T.gold, T.dim, 0.5f), Blend(T.gold, T.dim, 0.5f), 40);
+			DrawZoneSet(F, S.auction.liquidity, "L", T.cyan, T.cyan, 40);
+			DrawZoneSet(F, S.flow.imbZones, "I", T.bull, T.bear, 30);
+			DrawZoneSet(F, S.flow.absorbZones, "A", T.bull, T.bear, 40);
+			DrawZoneSet(F, S.flow.failedZones, "F", T.bull, T.bear, 40);
+		}
+
+		// ---------------- Large-trade bubbles ----------------
+		void DrawBubbles(Frame& F)
+		{
+			const FlowState& FL = F.S.flow; const Theme& T = F.T;
+			if (FL.bubbles.empty()) return;
+			double mx = 1; for (size_t q = 0; q < FL.bubbles.size(); ++q) if (F.Visible(FL.bubbles[q].idx)) mx = Max(mx, FL.bubbles[q].size);
+			F.Font(F.V.fontPt - 2, true);
+			char buf[16];
+			for (size_t q = 0; q < FL.bubbles.size(); ++q)
+			{
+				const Bubble& b = FL.bubbles[q];
+				if (!F.Visible(b.idx)) continue;
+				const int r = 3 + static_cast<int>(9.0 * sqrt(b.size / mx));
+				const int cx = F.XOf(b.idx), cy = F.YOf(b.price);
+				const uint32_t c = b.dir > 0 ? T.bull : T.bear;
+				const bool forming = b.idx == F.n - 1;
+				if (forming) { F.Pen(c, 1); n_ACSIL::s_GraphicsBrush nb; nb.m_BrushType = n_ACSIL::s_GraphicsBrush::BRUSH_TYPE_NULL; F.sc.Graphics.SetBrush(nb); F.sc.Graphics.DrawEllipse(cx - r, cy - r, cx + r, cy + r); }
+				else F.Circle(cx, cy, r, Blend(T.bg, c, 0.65f), c);
+				if (b.count > 1 && r >= 7) { sprintf_s(buf, sizeof(buf), "%d", b.count); F.TextCenter(cx, cy - F.fontH / 2, buf, T.text); }
+			}
+			F.Font(F.V.fontPt, false);
+		}
+
+		// ---------------- Swing legs: zigzag + delta labels ----------------
+		void DrawSwings(Frame& F)
+		{
+			const FlowState& FL = F.S.flow; const Theme& T = F.T; const VisualConfig& V = F.V;
+			if (FL.legs.empty() && !FL.activeValid) return;
+			char l1[24], l2[40];
+			for (size_t k = 0; k < FL.legs.size(); ++k)
+			{
+				const FlowState::Leg& L = FL.legs[k];
+				if (L.toIdx < F.firstVis || L.fromIdx > F.lastVis) continue;
+				const int x1 = F.XOf(L.fromIdx), y1 = F.YOf(L.fromPrice), x2 = F.XOf(L.toIdx), y2 = F.YOf(L.toPrice);
+				F.Line(x1, y1, x2, y2, Blend(T.neutral, T.bg, 0.35f), 1);
+				if (!F.Visible(L.toIdx)) continue;
+				const uint32_t c = L.delta >= 0 ? T.bull : T.bear;
+				Abbrev(L.delta, l1, sizeof(l1)); if (L.delta > 0) { char t[24]; sprintf_s(t, sizeof(t), "+%s", l1); strcpy_s(l1, sizeof(l1), t); }
+				char vol[16]; Abbrev(L.volume, vol, sizeof(vol));
+				sprintf_s(l2, sizeof(l2), "%s v %dt%s", vol, L.ticks, L.divergence ? " !" : "");
+				F.Font(V.fontPt + 1, true);
+				const int w1 = F.TextW(l1);
+				const int ty = L.up ? y2 - 2 * F.fontH - 6 : y2 + 6;
+				F.Text(x2 - w1 / 2, ty, l1, c);
+				F.Font(V.fontPt - 2, false);
+				F.Text(x2 - F.TextW(l2) / 2, ty + F.fontH + 1, l2, L.divergence ? T.gold : T.dim);
+			}
+			if (FL.activeValid && FL.active.toIdx >= F.firstVis)
+			{
+				const FlowState::Leg& L = FL.active;
+				const int x1 = F.XOf(L.fromIdx), y1 = F.YOf(L.fromPrice), x2 = F.XOf(L.toIdx), y2 = F.YOf(L.toPrice);
+				F.Line(x1, y1, x2, y2, Blend(T.neutral, T.bg, 0.5f), 1, 1);
+				Abbrev(L.delta, l1, sizeof(l1));
+				F.Font(V.fontPt, true);
+				F.Text(x2 + 6, L.up ? y2 - F.fontH : y2, l1, Blend(L.delta >= 0 ? T.bull : T.bear, T.bg, 0.3f));
+			}
+			F.Font(V.fontPt, false);
+		}
+
+		// ---------------- Regression channel on the active leg ----------------
+		void DrawChannel(Frame& F)
+		{
+			const FlowState::LegReg& R = F.S.flow.legReg; const Theme& T = F.T;
+			if (R.startIdx < 0 || R.sigma <= 0 || F.lastClosed - R.startIdx < 5) return;
+			const uint32_t c = Blend(R.slope > 0 ? T.bull : (R.slope < 0 ? T.bear : T.neutral), T.bg, 0.25f);
+			const int a = Max(R.startIdx, F.firstVis), b = F.lastClosed;
+			if (a > F.lastVis) return;
+			const int ext = F.fillVisible ? Min(8, static_cast<int>(F.fillW / Max(1, F.spacing)) / 3) : 0;
+			const double k = 2.0;
+			auto Y = [&](int idx, double off) { return F.YOf(static_cast<float>(R.intercept + R.slope * (idx - R.startIdx) + off)); };
+			F.Line(F.XOf(a), Y(a, 0), F.XOf(b), Y(b, 0), c, 1);
+			F.Line(F.XOf(a), Y(a, k * R.sigma), F.XOf(b), Y(b, k * R.sigma), c, 1, 2);
+			F.Line(F.XOf(a), Y(a, -k * R.sigma), F.XOf(b), Y(b, -k * R.sigma), c, 1, 2);
+			if (ext > 0)
+			{
+				F.Line(F.XOf(b), Y(b, 0), F.XOf(b + ext), Y(b + ext, 0), c, 1, 1);
+				F.Line(F.XOf(b), Y(b, k * R.sigma), F.XOf(b + ext), Y(b + ext, k * R.sigma), Blend(c, T.bg, 0.4f), 1, 2);
+				F.Line(F.XOf(b), Y(b, -k * R.sigma), F.XOf(b + ext), Y(b + ext, -k * R.sigma), Blend(c, T.bg, 0.4f), 1, 2);
+			}
+		}
+
 		// ---------------- HUD glass panel (top-right of the future space) ----------------
 		struct HudLayout { int l, t, r, b, pad, lineH; bool compact; };
 
@@ -3385,7 +3579,7 @@ namespace nqe
 					F.Text(cx + 5, y + 1, names[k], H.mtfAvail[k] ? T.bg : T.dim);
 					cx += 40;
 				}
-				sprintf_s(buf, sizeof(buf), "bias %+.2f", S.regime.mtfBias.empty() ? 0.0f : S.regime.mtfBias[Max(0, H.lastClosedIdx)]);
+				sprintf_s(buf, sizeof(buf), "bias %+.2f  leg R2 %.2f", S.regime.mtfBias.empty() ? 0.0f : S.regime.mtfBias[Max(0, H.lastClosedIdx)], H.legR2);
 				F.TextRight(L.r - L.pad, y, buf, T.dim);
 				y += lineH;
 			}
@@ -3584,6 +3778,9 @@ namespace nqe
 		// layers are added by later phases; order = back to front
 		if (V.layer[L_PROFILE]) render::DrawProfile(F);
 		if (V.layer[L_LEVELS]) render::DrawLevels(F);
+		if (V.layer[L_CHANNEL]) render::DrawChannel(F);
+		if (V.layer[L_SWINGS]) render::DrawSwings(F);
+		if (V.layer[L_BUBBLES]) render::DrawBubbles(F);
 		if (V.layer[L_RIBBON]) render::DrawRibbon(F);
 		F.Unclip();
 		if (V.layer[L_HUD])
