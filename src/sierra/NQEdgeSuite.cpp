@@ -2986,14 +2986,14 @@ namespace nqe
 		const char* vwapS = S.vwap.vwap.size() > static_cast<size_t>(i) && S.vwap.vwap[i] > 0 ? sc.FormatGraphValue(S.vwap.vwap[i], sc.BaseGraphValueFormat).GetChars() : "VWAP";
 		const Signal* live = (!S.dcs.signals.empty() && i - S.dcs.signals.back().idx <= 5) ? &S.dcs.signals.back() : nullptr;
 		if (live)
-			sprintf_s(H.stateLine, sizeof(H.stateLine), "%s %s: entry %s stop %s T1 %s", live->dir > 0 ? "LONG" : "SHORT", kSetupNames[live->type],
+			sprintf_s(H.stateLine, sizeof(H.stateLine), "%s %s (%c): entry %s, invalid at %s, T1 %s", live->dir > 0 ? "LONG" : "SHORT", kSetupNames[live->type], live->grade == 1 ? 'A' : (live->grade == 2 ? 'B' : 'C'),
 				sc.FormatGraphValue(live->entry, sc.BaseGraphValueFormat).GetChars(), sc.FormatGraphValue(live->stop, sc.BaseGraphValueFormat).GetChars(), sc.FormatGraphValue(live->t1, sc.BaseGraphValueFormat).GetChars());
 		else if (H.regime == RG_TREND_UP)
-			sprintf_s(H.stateLine, sizeof(H.stateLine), "Trend up%s, wait for pullback to %s %s with absorption", H.bias > 0 ? " (bias long)" : "", H.supKind != LVL_NONE ? LevelName(H.supKind) : "VWAP", H.supPrice > 0 ? sc.FormatGraphValue(H.supPrice, sc.BaseGraphValueFormat).GetChars() : vwapS);
+			sprintf_s(H.stateLine, sizeof(H.stateLine), "Trend up%s. Wait for pullback to %s %s with absorption or delta flip. Invalid below %s.", H.bias > 0 ? " (bias long)" : "", H.supKind != LVL_NONE ? LevelName(H.supKind) : "VWAP", H.supPrice > 0 ? sc.FormatGraphValue(H.supPrice, sc.BaseGraphValueFormat).GetChars() : vwapS, H.supPrice > 0 ? sc.FormatGraphValue(H.supPrice - H.atr, sc.BaseGraphValueFormat).GetChars() : "?");
 		else if (H.regime == RG_TREND_DOWN)
-			sprintf_s(H.stateLine, sizeof(H.stateLine), "Trend down%s, wait for pullback to %s %s with absorption", H.bias < 0 ? " (bias short)" : "", H.resKind != LVL_NONE ? LevelName(H.resKind) : "VWAP", H.resPrice > 0 ? sc.FormatGraphValue(H.resPrice, sc.BaseGraphValueFormat).GetChars() : vwapS);
+			sprintf_s(H.stateLine, sizeof(H.stateLine), "Trend down%s. Wait for pullback to %s %s with absorption or delta flip. Invalid above %s.", H.bias < 0 ? " (bias short)" : "", H.resKind != LVL_NONE ? LevelName(H.resKind) : "VWAP", H.resPrice > 0 ? sc.FormatGraphValue(H.resPrice, sc.BaseGraphValueFormat).GetChars() : vwapS, H.resPrice > 0 ? sc.FormatGraphValue(H.resPrice + H.atr, sc.BaseGraphValueFormat).GetChars() : "?");
 		else if (H.regime == RG_BALANCE)
-			sprintf_s(H.stateLine, sizeof(H.stateLine), "Balance: fade %s %s / %s %s on absorption, target POC", H.resKind != LVL_NONE ? LevelName(H.resKind) : "VAH", H.resPrice > 0 ? sc.FormatGraphValue(H.resPrice, sc.BaseGraphValueFormat).GetChars() : "", H.supKind != LVL_NONE ? LevelName(H.supKind) : "VAL", H.supPrice > 0 ? sc.FormatGraphValue(H.supPrice, sc.BaseGraphValueFormat).GetChars() : "");
+			sprintf_s(H.stateLine, sizeof(H.stateLine), "Balance. Fade %s %s / %s %s on absorption or exhaustion, target POC. Invalid on acceptance beyond the edge.", H.resKind != LVL_NONE ? LevelName(H.resKind) : "VAH", H.resPrice > 0 ? sc.FormatGraphValue(H.resPrice, sc.BaseGraphValueFormat).GetChars() : "", H.supKind != LVL_NONE ? LevelName(H.supKind) : "VAL", H.supPrice > 0 ? sc.FormatGraphValue(H.supPrice, sc.BaseGraphValueFormat).GetChars() : "");
 		else if (H.regime == RG_CHOP)
 			sprintf_s(H.stateLine, sizeof(H.stateLine), "Volatile chop: stand aside until DCS beyond %+.0f with regime change", thr);
 		else
@@ -3631,6 +3631,65 @@ namespace nqe
 			F.Font(V.fontPt, false);
 		}
 
+		// ---------------- Projection arrow: most likely forward path with empirical odds ----------------
+		void DrawProjection(Frame& F)
+		{
+			SCStudyInterfaceRef sc = F.sc; ChartState& S = F.S; const Theme& T = F.T; const VisualConfig& V = F.V; const HudSnapshot& H = S.hud;
+			if (!F.fillVisible || F.fillW < 60 || F.lastClosed < 0) return;
+			const float close = sc.Close[F.lastClosed];
+			const int reg = H.regime;
+			// path waypoints (price), invalidation level, and the stats bucket that describes this state
+			float w1 = 0, w2 = 0, inval = 0; int setup = SETUP_NONE; int dir = 0;
+			const Signal* live = (!S.dcs.signals.empty() && F.lastClosed - S.dcs.signals.back().idx <= 5 && S.dcs.signals.back().resolved == 0) ? &S.dcs.signals.back() : nullptr;
+			if (live) { dir = live->dir; w1 = live->t1; w2 = live->t2; inval = live->stop; setup = live->type; }
+			else if (reg == RG_TREND_UP || reg == RG_TREND_DOWN)
+			{
+				dir = reg == RG_TREND_UP ? 1 : -1;
+				// pullback to the nearest level against the trend, then continuation to the next level with it
+				w1 = dir > 0 ? H.supPrice : H.resPrice; w2 = dir > 0 ? H.resPrice : H.supPrice; inval = w1 > 0 ? w1 - dir * 1.0f * H.atr : 0; setup = SETUP_TREND_PULLBACK;
+			}
+			else if (reg == RG_BALANCE)
+			{
+				const float poc = S.auction.poc.empty() ? 0.0f : S.auction.poc[F.lastClosed];
+				dir = poc > close ? 1 : -1; w1 = poc; w2 = dir > 0 ? H.resPrice : H.supPrice; inval = dir > 0 ? H.supPrice : H.resPrice; setup = SETUP_VALUE_EDGE;
+			}
+			else return;   // chop or unknown: no projection
+			if (w1 <= 0) return;
+			// empirical odds for this state: setup x regime (x grade when live)
+			int n = 0, wins = 0;
+			if (setup != SETUP_NONE)
+			{
+				for (int g = 0; g < 3; ++g)
+				{
+					if (live && (g + 1) != live->grade) continue;
+					const SetupStats& st = S.val.stats3[setup][Clamp(reg, 0, 4)][g];
+					n += st.wins + st.losses; wins += st.wins;
+				}
+				if (n < 10) { const SetupStats& st = S.val.stats[setup]; n = st.wins + st.losses; wins = st.wins; }
+			}
+			const bool lowConf = n < S.params.val.minSample;
+			const uint32_t c = Blend(dir > 0 ? T.bull : T.bear, T.bg, lowConf ? 0.5f : 0.15f);
+			// geometry: start at the last closed bar, waypoints spaced across the first third of the fill space
+			const int x0 = F.XOf(F.lastClosed), y0 = F.YOf(close);
+			const int step = Max(8, Min(F.spacing * 6, F.fillW / 4));
+			const int x1 = x0 + step, x2 = x0 + 2 * step;
+			const int y1 = F.YOf(w1), y2 = w2 > 0 ? F.YOf(w2) : y1;
+			F.Clip(F.left, F.top, F.right, F.bottom);
+			if (w2 > 0 && fabs(w2 - w1) > F.tick) { F.Line(x0, y0, x1, y1, c, 2, 1); F.Arrow(x1, y1, x2, y2, c, 2, 1); }
+			else F.Arrow(x0, y0, x1, y1, c, 2, 1);
+			if (inval > 0) { const int yi = F.YOf(inval); F.Line(x0, yi, x2 + step / 2, yi, Blend(T.bear, T.bg, 0.45f), 1, 2); F.Font(V.fontPt - 2, false); F.Text(x0 + 2, yi + 2, "invalid", Blend(T.bear, T.bg, 0.3f)); }
+			// label
+			char buf[128];
+			if (n > 0) sprintf_s(buf, sizeof(buf), "%s P(T1 first) %.0f%% \xB7 n=%d%s", live ? "signal" : (reg == RG_BALANCE ? "rotation" : "pullback+go"), 100.0 * wins / Max(1, n), n, lowConf ? " \xB7 low confidence" : "");
+			else sprintf_s(buf, sizeof(buf), "%s \xB7 no history yet", live ? "signal" : (reg == RG_BALANCE ? "rotation" : "pullback+go"));
+			F.Font(V.fontPt - 1, !lowConf);
+			const int lw = F.TextW(buf) + 8, lh = F.fontH + 4;
+			int lx = x1 - lw / 2, ly = Min(y1, y2) - lh - 6; if (lx < F.fillLeft) lx = F.fillLeft; if (lx + lw > F.right) lx = F.right - lw; if (ly < F.top + 2) ly = Max(y1, y2) + 6;
+			F.Fill(lx, ly, lx + lw, ly + lh, T.panel, 85); F.Box(lx, ly, lx + lw, ly + lh, c, 1); F.Text(lx + 4, ly + 2, buf, lowConf ? T.dim : T.text);
+			F.Font(V.fontPt, false);
+			F.Unclip();
+		}
+
 		// ---------------- HUD glass panel (top-right of the future space) ----------------
 		struct HudLayout { int l, t, r, b, pad, lineH; bool compact; };
 
@@ -3986,6 +4045,7 @@ namespace nqe
 		if (V.layer[L_BUBBLES]) render::DrawBubbles(F);
 		if (V.layer[L_CARDS]) render::DrawCards(F);
 		if (V.layer[L_NOTES]) render::DrawNotes(F);
+		if (V.layer[L_PROJECTION]) render::DrawProjection(F);
 		if (V.layer[L_RIBBON]) render::DrawRibbon(F);
 		F.Unclip();
 		if (V.layer[L_HUD])
