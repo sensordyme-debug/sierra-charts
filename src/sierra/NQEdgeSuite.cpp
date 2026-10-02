@@ -3183,6 +3183,84 @@ namespace nqe
 			F.Font(V.fontPt, false);
 		}
 
+		// ---------------- Docked volume profile (session, ghost prior, composite) ----------------
+		void DrawProfile(Frame& F)
+		{
+			SCStudyInterfaceRef sc = F.sc; ChartState& S = F.S; const Theme& T = F.T; const VisualConfig& V = F.V;
+			const AuctionState& A = S.auction; const AuctionParams& AP = S.params.auction;
+			if (!F.fillVisible || F.fillW < 40) return;
+			const int tpl = Max(1, AP.profileTicksPerLevel);
+			const int W = Max(30, F.fillW * Clamp(V.profileWidthPct, 10, 90) / 100);
+			const int x0 = F.fillLeft + 3;
+			typedef std::map<int, AuctionState::PLevel> PMap;
+
+			struct Painter
+			{
+				static void Draw(Frame& F, const PMap& m, int x0, int W, int tpl, bool split, uint32_t single, int alphaIn, int alphaOut, int vaLo, int vaHi, bool outline)
+				{
+					if (m.empty()) return;
+					double mx = 0; for (PMap::const_iterator it = m.begin(); it != m.end(); ++it) mx = Max(mx, it->second.vol);
+					if (mx <= 0) return;
+					const Theme& T = F.T;
+					for (PMap::const_iterator it = m.begin(); it != m.end(); ++it)
+					{
+						const float pb = (static_cast<float>(it->first) * tpl - 0.5f) * F.tick, pt = (static_cast<float>(it->first) * tpl + tpl - 0.5f) * F.tick;
+						int y1 = F.YOf(pt), y2 = F.YOf(pb);
+						if (y2 < F.top || y1 > F.bottom) continue;
+						if (y2 - y1 < 1) y2 = y1 + 1;
+						const int w = static_cast<int>(W * it->second.vol / mx);
+						if (w <= 0) continue;
+						const bool inVa = it->first >= vaLo && it->first <= vaHi;
+						const int a = inVa ? alphaIn : alphaOut;
+						if (split && it->second.vol > 0)
+						{
+							const int wb = static_cast<int>(w * it->second.bid / it->second.vol);
+							F.Fill(x0, y1, x0 + wb, y2, T.bear, a); F.Fill(x0 + wb, y1, x0 + w, y2, T.bull, a);
+						}
+						else if (outline) { F.Line(x0 + w, y1, x0 + w, y2, single, 1); }
+						else F.Fill(x0, y1, x0 + w, y2, single, a);
+					}
+				}
+			};
+
+			// composite (faint, behind)
+			if (V.layer[L_COMPOSITE] && !A.sessionHist.empty())
+			{
+				PMap comp; const int days = Clamp(AP.compositeDays, 1, 30);
+				for (int d = static_cast<int>(A.sessionHist.size()) - 1, c = 0; d >= 0 && c < days; --d, ++c)
+					for (PMap::const_iterator it = A.sessionHist[d].begin(); it != A.sessionHist[d].end(); ++it) { AuctionState::PLevel& L = comp[it->first]; L.vol += it->second.vol; L.bid += it->second.bid; L.ask += it->second.ask; }
+				Painter::Draw(F, comp, x0, W, tpl, false, Blend(T.bg, T.cyan, 0.5f), 10, 10, INT_MIN, INT_MAX, false);
+			}
+			// ghost prior session
+			if (V.layer[L_GHOST] && !A.prevProf.empty())
+				Painter::Draw(F, A.prevProf, x0, W, tpl, false, T.dim, 16, 16, INT_MIN, INT_MAX, false);
+			// developing session, split by aggressor, value area brighter
+			if (!A.profVol.empty())
+			{
+				int vaLo = INT_MIN, vaHi = INT_MAX;
+				if (A.devVah > A.devVal) { vaLo = static_cast<int>(floor(A.devVal / F.tick + 0.5f + 0.5f)) / tpl; vaHi = static_cast<int>(floor(A.devVah / F.tick + 0.5f - 0.5f)) / tpl; }
+				Painter::Draw(F, A.profVol, x0, W, tpl, true, 0, 62, 32, vaLo, vaHi, false);
+				// POC / VAH / VAL markers with a gold POC pill
+				if (A.devPoc > 0)
+				{
+					const int yp = F.YOf(A.devPoc);
+					F.Line(x0, yp, x0 + W, yp, T.gold, 2);
+					F.Font(V.fontPt - 1, true);
+					char txt[32]; sprintf_s(txt, sizeof(txt), "POC %s", F.Px(A.devPoc));
+					F.Pill(x0 + W + 4, yp - F.fontH / 2 - 1, txt, T.gold, T.bg, 100, false);
+					F.Font(V.fontPt, false);
+					const int yh = F.YOf(A.devVah), yl = F.YOf(A.devVal);
+					F.Line(x0, yh, x0 + W, yh, T.cyan, 1, 2); F.Line(x0, yl, x0 + W, yl, T.cyan, 1, 2);
+				}
+			}
+			else if (!A.prevProf.empty() && A.prevPoc > 0)
+			{
+				// pre-open: show the prior session's POC on the ghost
+				const int yp = F.YOf(A.prevPoc);
+				F.Line(x0, yp, x0 + W, yp, Blend(T.gold, T.dim, 0.5f), 1, 1);
+			}
+		}
+
 		// ---------------- HUD glass panel (top-right of the future space) ----------------
 		struct HudLayout { int l, t, r, b, pad, lineH; bool compact; };
 
@@ -3504,6 +3582,7 @@ namespace nqe
 		if (sc.Graphics.SetTextAlign) sc.Graphics.SetTextAlign(TA_LEFT | TA_TOP | TA_NOUPDATECP);
 		F.Clip(F.left, F.top, F.right, F.bottom);
 		// layers are added by later phases; order = back to front
+		if (V.layer[L_PROFILE]) render::DrawProfile(F);
 		if (V.layer[L_LEVELS]) render::DrawLevels(F);
 		if (V.layer[L_RIBBON]) render::DrawRibbon(F);
 		F.Unclip();
