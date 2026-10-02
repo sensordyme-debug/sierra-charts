@@ -130,10 +130,15 @@ Ambiguities resolved while building, and anything not verifiable without a Sierr
     skip `SetParams` while it is set, so the two can coexist without reset ping-pong. Unexposed engine
     parameters keep their compiled defaults (the engine studies remain available for tuning/diagnostics).
 36. **HUD = text drawing objects** with `UseRelativeVerticalValues = 1` (vertical % of the region) and
-    `BeginDateTime = -(fill bars - 2)` (bars from the right edge, Sierra's fill-space convention used by
-    its own `AddAndManageSingleTextDrawingForStudy` helper). The bias pill is a text drawing with an
-    opaque `FontBackColor`; all other HUD lines have transparent backgrounds. When the fill space is
-    below the input's minimum the HUD anchors 3 bars from the right edge and the health line says so.
+    `BeginDateTime = -2`. **Verified on Sierra 2957:** a negative `BeginDateTime` counts bars to the
+    right of the *last bar* (into the fill space), not from the window edge; −48 pushed the text under
+    the price scale. The bias pill is a text drawing with an opaque `FontBackColor`; all other HUD lines
+    have transparent backgrounds. Level tags with `BeginIndex` beyond the last bar were also confirmed
+    to land in the fill space.
+36b. **Time-zone check** compares the chart clock with `sc.AdjustDateTimeToGMT` (New York = UTC−5/−4)
+    instead of parsing the time-zone string, which produced a false warning on a correctly set chart.
+36c. **VWAP anchor** defaults to the trading-day start (18:00) so the line and band exist during the
+    overnight session; *RTH Open* is selectable on the Terminal.
 37. **Right-edge tags and box labels use `BeginIndex` beyond the last bar** (fill space). If Sierra
     clamps such drawings to the last bar, lower *Fill Space Needed* and the tags will sit on the last bar.
 38. **VWAP band translucency** comes from the study-level transparency (`SetChartStudyTransparencyLevel`

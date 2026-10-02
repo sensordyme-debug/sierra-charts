@@ -97,3 +97,8 @@
 - Removed: zigzag connecting lines, the DCS ribbon, regime/session backdrop, cloud, docked pills, the Overlay/Backdrop/Tape studies and all extra regions. Swing delta is now a small label at the swing point only.
 - Layer inputs (all off by default): Volume Profile (docked, GDI), Zones (A/I/L/F rectangles within 2 ATR), Order-Flow Bubbles (markers within 2 ATR, last 90 bars), Swing Delta (last 24 legs), Annotations (last 12 events within 2 ATR, stacked), Projection (dashed path + empirical odds), Tape Strip (GDI, bottom 12 % of the price region).
 - Hierarchy rules: lines 1 px except VWAP 2 px; line colours limited to VWAP gold, level cyan and signal green/red; nothing except the 4 nearest levels is drawn more than 2 ATR from price; fills ≥ 80 % transparent.
+
+## v3.1 — first live feedback
+- HUD text anchored 2 bars right of the last bar (a negative `BeginDateTime` counts bars into the fill space; the old value pushed the text under the price scale).
+- VWAP anchor input on the Terminal, default trading-day start, so the gold line and band show overnight.
+- Time-zone warning now based on the chart's UTC offset (no false positive).

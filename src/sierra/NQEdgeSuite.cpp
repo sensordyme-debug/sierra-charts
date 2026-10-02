@@ -2998,7 +2998,15 @@ namespace nqe
 		Warnings& W = S.warn;
 		W.storageNotTick = (sc.IntradayDataStorageTimeUnit != kStorageUnitTick);
 		W.tzNotNY = false;
-		if (sc.GetChartTimeZone != nullptr)
+		{
+			// offset between the chart's clock and UTC: New York is -5 (EST) or -4 (EDT)
+			const SCDateTime nowChart = sc.CurrentSystemDateTime;
+			const SCDateTime nowUtc = sc.AdjustDateTimeToGMT(nowChart);
+			const double offH = (nowChart.GetAsDouble() - nowUtc.GetAsDouble()) * 24.0;
+			const bool ny = fabs(offH + 5.0) < 0.1 || fabs(offH + 4.0) < 0.1;
+			W.tzNotNY = !ny && fabs(offH) > 0.01;   // an unknown (zero) offset is not reported
+		}
+		if (false && sc.GetChartTimeZone != nullptr)
 		{
 			SCString tz = sc.GetChartTimeZone(sc.ChartNumber);
 			const char* s = tz.GetChars();
@@ -4037,7 +4045,7 @@ enum TermInput
 	TI_C_YM, TI_C_ES, TI_C_TICK, TI_C_MEGA1, TI_C_MEGA2, TI_C_MEGA3,
 	TI_WEIGHTS, TI_THR, TI_STRONG, TI_WEAK, TI_S1, TI_S2, TI_S3, TI_S4, TI_S5, TI_MIN_GRADE, TI_ALERTS, TI_SOUND, TI_LOG,
 	TI_L_CANDLES, TI_L_BAND, TI_L_LEVELS, TI_L_SIGNALS, TI_L_HUD, TI_L_PROFILE, TI_L_ZONES, TI_L_BUBBLES, TI_L_SWING, TI_L_NOTES, TI_L_PROJ, TI_L_TAPE,
-	TI_FONT, TI_FILL_HINT,
+	TI_FONT, TI_FILL_HINT, TI_VWAP_ANCHOR,
 	TI_COL_BULL, TI_COL_BEAR, TI_COL_NEUTRAL, TI_COL_VWAP, TI_COL_LEVEL, TI_COL_LONG, TI_COL_SHORT, TI_COL_TEXT, TI_COL_PANEL, TI_COL_DIM, TI_COUNT
 };
 enum TermSubgraph
@@ -4202,6 +4210,7 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 		NQE_YESNO_INPUT(TI_L_TAPE, "Layer: Tape Strip", 0);
 		NQE_INT_INPUT(TI_FONT, "HUD Font Size (pt)", 10, 7, 20);
 		NQE_INT_INPUT(TI_FILL_HINT, "Fill Space Needed (bars, HUD placement)", 30, 10, 200);
+		sc.Input[TI_VWAP_ANCHOR].Name = "VWAP Anchor"; sc.Input[TI_VWAP_ANCHOR].SetCustomInputStrings("Trading Day Start (18:00);RTH Open"); sc.Input[TI_VWAP_ANCHOR].SetCustomInputIndex(0);
 		NQE_COLOR_INPUT(TI_COL_BULL, "Color: Bull", 0, 200, 150);
 		NQE_COLOR_INPUT(TI_COL_BEAR, "Color: Bear", 255, 77, 94);
 		NQE_COLOR_INPUT(TI_COL_NEUTRAL, "Color: Neutral", 110, 118, 134);
@@ -4233,7 +4242,7 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 	{
 		BaseParams bp{}; bp.rthStartSec = sc.Input[TI_RTH_START].GetTime(); bp.rthEndSec = sc.Input[TI_RTH_END].GetTime(); bp.atrLength = sc.Input[TI_ATR_LEN].GetInt(); SetParams(S, E_BASE, S.params.base, bp);
 		AuctionParams ap{}; ap.valueAreaPct = sc.Input[TI_VA_PCT].GetFloat(); ap.ibMinutes = sc.Input[TI_IB_MIN].GetInt(); ap.swingStrength = sc.Input[TI_SWING_N].GetInt(); ap.swingMinAtr = sc.Input[TI_SWING_ATR].GetFloat(); SetParams(S, E_AUCTION, S.params.auction, ap);
-		VwapParams vp{}; SetParams(S, E_VWAP, S.params.vwap, vp);
+		VwapParams vp{}; vp.anchor = sc.Input[TI_VWAP_ANCHOR].GetIndex() == 0 ? 1 : 0; SetParams(S, E_VWAP, S.params.vwap, vp);
 		FlowParams fp{}; fp.imbRatioPct = sc.Input[TI_IMB_RATIO].GetFloat(); fp.imbStackLevels = sc.Input[TI_IMB_STACK].GetInt(); fp.absorbVolZ = sc.Input[TI_ABS_Z].GetFloat(); SetParams(S, E_FLOW, S.params.flow, fp);
 		RegimeParams rp{}; SetParams(S, E_REGIME, S.params.regime, rp);
 		InterParams ip{}; ip.chartYM = sc.Input[TI_C_YM].GetChartNumber(); ip.chartES = sc.Input[TI_C_ES].GetChartNumber(); ip.chartTICK = sc.Input[TI_C_TICK].GetChartNumber();
@@ -4384,7 +4393,7 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 	// HUD: text lines in the empty space right of the last bar (relative vertical %, horizontal = bars from the right edge)
 	if (V.layer[L_HUD])
 	{
-		const double relX = haveFill ? -static_cast<double>(Max(2, fillBars - 2)) : -3.0;
+		const double relX = -2.0;   // 2 bars to the right of the last bar (Sierra: negative = bars into the fill space)
 		const float top = 97.0f; const float step = Max(3.5f, 0.33f * fontPt);
 		int line = 0;
 		// 1. bias pill + score
