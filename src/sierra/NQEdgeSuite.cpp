@@ -2879,7 +2879,22 @@ namespace nqe
 		}
 		H.lastEventIdx = S.flow.lastEventIdx;
 		H.legR2 = static_cast<float>(S.flow.legReg.r2); H.legDir = S.flow.legReg.slope > 0 ? 1 : (S.flow.legReg.slope < 0 ? -1 : 0);
-		H.dayType[0] = 0; H.adrPct = 0;
+		// day type guess + range vs ADR
+		{
+			const AuctionState& A = S.auction;
+			double adr = 0; int m = 0;
+			for (int k = static_cast<int>(A.rthRanges.size()) - 1; k >= 0 && m < Max(1, S.params.auction.adrDays); --k, ++m) adr += A.rthRanges[k];
+			adr = m > 0 ? adr / m : 0;
+			const float rng = (A.rthHigh > -FLT_MAX && A.rthLow < FLT_MAX) ? A.rthHigh - A.rthLow : 0.0f;
+			H.adrPct = adr > 0 ? static_cast<float>(100.0 * rng / adr) : 0.0f;
+			const float ib = (A.ibClosed && A.ibH > A.ibL) ? A.ibH - A.ibL : 0.0f;
+			if (i < static_cast<int>(S.base.isRth.size()) && !S.base.isRth[i]) strcpy_s(H.dayType, sizeof(H.dayType), "ETH");
+			else if (ib <= 0) strcpy_s(H.dayType, sizeof(H.dayType), "IB forming");
+			else if (rng >= 1.8f * ib && (H.regime == RG_TREND_UP || H.regime == RG_TREND_DOWN)) strcpy_s(H.dayType, sizeof(H.dayType), "Trend day");
+			else if (rng >= 1.3f * ib) strcpy_s(H.dayType, sizeof(H.dayType), "Normal var.");
+			else if (rng <= 1.1f * ib) strcpy_s(H.dayType, sizeof(H.dayType), "Balance day");
+			else strcpy_s(H.dayType, sizeof(H.dayType), "Normal day");
+		}
 		H.signalsTotal = static_cast<int>(S.dcs.signals.size());
 		if (i < static_cast<int>(S.vwap.vwap.size()) && S.vwap.vwap[i] > 0)
 			sprintf_s(H.vwapText, sizeof(H.vwapText), "VWAP %s", sc.FormatGraphValue(S.vwap.vwap[i], sc.BaseGraphValueFormat).GetChars());
@@ -3476,6 +3491,12 @@ namespace nqe
 			return lines;
 		}
 
+		inline void SecondsToClock(int sec, char* out, size_t n)
+		{
+			if (sec < 0) sec = 0;
+			if (sec >= 3600) sprintf_s(out, n, "%dh%02dm", sec / 3600, (sec % 3600) / 60); else sprintf_s(out, n, "%dm%02ds", sec / 60, sec % 60);
+		}
+
 		void DrawHud(Frame& F, const unsigned int* hudInputs)
 		{
 			SCStudyInterfaceRef sc = F.sc; ChartState& S = F.S; const VisualConfig& V = F.V; const Theme& T = F.T; const HudSnapshot& H = S.hud;
@@ -3490,18 +3511,21 @@ namespace nqe
 			L.t = F.top + 6;
 			char buf[256];
 
-			// ----- measure: count lines -----
-			int lines = 0;
-			const int badgeH = F.fontH + 10;
-			lines += 1;                       // regime chip row
-			if (!L.compact) lines += 1;       // mtf
+			// scoreboard rows (setups with history)
+			int scoreRows = 0;
+			if (!L.compact && showStats) for (int k = 1; k < SETUP_COUNT; ++k) if (S.val.stats[k].count > 0) ++scoreRows;
+
+			// ----- measure -----
+			int lines = 1;                               // regime/open/value/day-type row
+			if (!L.compact) lines += 1;                  // mtf
 			if (!L.compact && showInter) lines += 1;
 			if (!L.compact && showFlow) lines += 1;
-			if (!L.compact && showLevels) lines += 1;
-			int planLines = 2;
-			if (!L.compact && showStats) lines += 1;
+			if (!L.compact && showLevels) lines += 2;    // levels + clock/day stats
+			const int planLines = 2;
+			lines += Max(1, scoreRows) * ((!L.compact && showStats) ? 1 : 0);
 			if (!L.compact && showHealth) lines += 1;
 			int warnLines = 0; if (showWarn && S.warn.text[0]) for (const char* p = S.warn.text; *p; ++p) if (*p == '\n') ++warnLines;
+			const int badgeH = F.fontH + 10;
 			const int gaugeH = L.compact ? 0 : 10, sparkH = L.compact ? 0 : 26;
 			L.b = L.t + L.pad + badgeH + 6 + gaugeH + (gaugeH ? 6 : 0) + sparkH + (sparkH ? 6 : 0) + lines * lineH + planLines * (F.fontH + 2) + 4 + warnLines * lineH + L.pad;
 			if (L.b > F.bottom - 10) L.b = F.bottom - 10;
@@ -3511,7 +3535,7 @@ namespace nqe
 			F.Box(L.l, L.t, L.r, L.b, Blend(T.panel, T.text, 0.18f), 1);
 			int x = L.l + L.pad, y = L.t + L.pad; const int w = L.r - L.l - 2 * L.pad;
 
-			// 1. bias badge + DCS + trend arrow
+			// 1. bias badge + DCS + trend arrow + regime chip
 			{
 				F.Font(V.fontPt + 3, true);
 				const uint32_t bc = H.bias > 0 ? T.bull : (H.bias < 0 ? T.bear : T.neutral);
@@ -3530,7 +3554,7 @@ namespace nqe
 				}
 				y += badgeH + 6;
 			}
-			// 2. gauge -100..+100
+			// 2. gauge -100..+100 with needle and threshold ticks
 			if (gaugeH)
 			{
 				const int gl = x, gr = x + w, gm = (gl + gr) / 2;
@@ -3559,14 +3583,14 @@ namespace nqe
 				}
 				y += sparkH + 6;
 			}
-			// 4. regime chip row: open type + value migration + day type
+			// 4. regime row: open type + value migration + day type
 			{
 				const char* vm = H.valueMig > 0.5f ? "value HIGHER" : (H.valueMig < -0.5f ? "value LOWER" : "value OVERLAP");
 				if (L.compact) sprintf_s(buf, sizeof(buf), "%s  %s", kRegimeNames[Clamp(H.regime, 0, 4)], vm);
 				else sprintf_s(buf, sizeof(buf), "%s  %s  %s", kOpenTypeNames[Clamp(H.openType, 0, 7)], vm, H.dayType);
 				F.Text(x, y, buf, T.text); y += lineH;
 			}
-			// 5. MTF strip
+			// 5. MTF strip + leg quality
 			if (!L.compact)
 			{
 				static const char* names[4] = { "1m", "5m", "15m", "60m" };
@@ -3579,8 +3603,8 @@ namespace nqe
 					F.Text(cx + 5, y + 1, names[k], H.mtfAvail[k] ? T.bg : T.dim);
 					cx += 40;
 				}
-				sprintf_s(buf, sizeof(buf), "bias %+.2f  leg R2 %.2f", S.regime.mtfBias.empty() ? 0.0f : S.regime.mtfBias[Max(0, H.lastClosedIdx)], H.legR2);
-				F.TextRight(L.r - L.pad, y, buf, T.dim);
+				sprintf_s(buf, sizeof(buf), "leg R2 %.2f", H.legR2);
+				F.TextRight(L.r - L.pad, y, buf, H.legR2 >= 0.6f ? (H.legDir > 0 ? T.bull : T.bear) : T.dim);
 				y += lineH;
 			}
 			// 6. intermarket row
@@ -3592,7 +3616,7 @@ namespace nqe
 				Item items[8]; int cnt = 0;
 				items[cnt++] = { "YM", H.ym, H.ymAvail }; items[cnt++] = { "TICK", H.tick, H.tickAvail };
 				for (int k = 0; k < H.megaCount && k < 6; ++k) items[cnt++] = { H.megaNames[k], H.mega[k], true };
-				for (int k = 0; k < cnt && cx < L.r - 50; ++k)
+				for (int k = 0; k < cnt && cx < L.r - 60; ++k)
 				{
 					const uint32_t c = !items[k].avail ? T.grid : (items[k].v > 0 ? T.bull : (items[k].v < 0 ? T.bear : T.neutral));
 					F.Circle(cx + 4, y + lineH / 2 - 1, 4, c, c);
@@ -3601,51 +3625,69 @@ namespace nqe
 					cx += 11 + F.TextW(buf) + 10;
 				}
 				if (H.smt != 0) F.Pill(L.r - L.pad, y, H.smt > 0 ? "SMT+" : "SMT-", Blend(T.panel, T.gold, 0.4f), T.gold, 100, true);
-				else if (H.leadLag[0]) F.TextRight(L.r - L.pad, y, H.leadLag, T.dim);
+				else if (H.leadLag[0]) F.TextRight(L.r - L.pad, y, H.leadLag, T.gold);
+				else if (H.interConfigured == 0) F.TextRight(L.r - L.pad, y, "set chart numbers", T.dim);
 				y += lineH;
 			}
 			// 7. order-flow row
 			if (!L.compact && showFlow)
 			{
 				const char* cvdT = H.cvdTrend > 0 ? "CVD ^" : (H.cvdTrend < 0 ? "CVD v" : "CVD =");
-				if (H.lastEvent[0]) sprintf_s(buf, sizeof(buf), "%s z%+.1f  %s @ %s (%db)", cvdT, H.cvdZ, H.lastEvent, F.Px(H.lastEventPrice), Max(0, H.lastClosedIdx - H.lastEventIdx));
+				if (H.lastEvent[0]) sprintf_s(buf, sizeof(buf), "%s z%+.1f  %s @ %s (%db ago)", cvdT, H.cvdZ, H.lastEvent, F.Px(H.lastEventPrice), Max(0, H.lastClosedIdx - H.lastEventIdx));
 				else sprintf_s(buf, sizeof(buf), "%s z%+.1f", cvdT, H.cvdZ);
 				F.Text(x, y, buf, H.cvdTrend > 0 ? T.bull : (H.cvdTrend < 0 ? T.bear : T.neutral)); y += lineH;
 			}
-			// 8. nearest levels + day stats
+			// 8. nearest levels + clock / day stats
 			if (!L.compact && showLevels)
 			{
 				const float ts = F.tick;
 				if (H.resPrice > 0 && H.supPrice > 0)
-					sprintf_s(buf, sizeof(buf), "R %s %s +%dt  S %s %s -%dt  rng %.0f%% ADR", dcs_detail::LevelName(H.resKind), F.Px(H.resPrice), static_cast<int>((H.resPrice - H.close) / ts + 0.5f),
-						dcs_detail::LevelName(H.supKind), F.Px(H.supPrice), static_cast<int>((H.close - H.supPrice) / ts + 0.5f), H.adrPct);
+					sprintf_s(buf, sizeof(buf), "R %s %s +%dt %.1fA   S %s %s -%dt %.1fA", dcs_detail::LevelName(H.resKind), F.Px(H.resPrice), static_cast<int>((H.resPrice - H.close) / ts + 0.5f), H.atr > 0 ? (H.resPrice - H.close) / H.atr : 0,
+						dcs_detail::LevelName(H.supKind), F.Px(H.supPrice), static_cast<int>((H.close - H.supPrice) / ts + 0.5f), H.atr > 0 ? (H.close - H.supPrice) / H.atr : 0);
 				else sprintf_s(buf, sizeof(buf), "Levels: waiting for session data");
 				F.Text(x, y, buf, T.cyan); y += lineH;
+				// session clock: next session event + bar countdown + range vs ADR
+				{
+					const SCDateTime now = sc.GetCurrentDateTime();
+					const int tod = now.GetTimeInSeconds();
+					const BaseParams& BP = S.params.base; const int ibEnd = BP.rthStartSec + S.params.auction.ibMinutes * 60;
+					char clk[32]; const char* what;
+					if (tod < BP.rthStartSec) { SecondsToClock(BP.rthStartSec - tod, clk, sizeof(clk)); what = "to RTH open"; }
+					else if (tod < ibEnd) { SecondsToClock(ibEnd - tod, clk, sizeof(clk)); what = "to IB end"; }
+					else if (tod < BP.rthEndSec) { SecondsToClock(BP.rthEndSec - tod, clk, sizeof(clk)); what = "to close"; }
+					else { SecondsToClock(86400 - tod + BP.rthStartSec, clk, sizeof(clk)); what = "to RTH open"; }
+					const int cd = sc.GetLatestBarCountdownAsInteger != nullptr ? sc.GetLatestBarCountdownAsInteger() : 0;
+					char cdt[16]; SecondsToClock(cd, cdt, sizeof(cdt));
+					sprintf_s(buf, sizeof(buf), "%s %s  bar %s  range %.0f%% ADR", clk, what, cdt, H.adrPct);
+					F.Text(x, y, buf, T.dim); y += lineH;
+				}
 			}
 			// 9. plan line
 			F.Font(V.fontPt, true);
 			y += WrapText(F, x, y, w, H.stateLine[0] ? H.stateLine : "Warming up...", T.gold, planLines) * (F.fontH + 2) + 4;
 			F.Font(V.fontPt, false);
-			// 10. stats
+			// 10. setup scoreboard
 			if (!L.compact && showStats)
 			{
-				if (H.statsAvail && H.curStats.count > 0)
+				if (scoreRows == 0) { F.Text(x, y, "Scoreboard: no resolved signals yet", T.dim); y += lineH; }
+				for (int k = 1; k < SETUP_COUNT; ++k)
 				{
-					const SetupStats& st = H.curStats;
+					const SetupStats& st = S.val.stats[k]; if (st.count == 0) continue;
+					const bool small = st.count < S.params.val.minSample;
 					const double pf = st.sumLossR < 0 ? st.sumWinR / -st.sumLossR : (st.sumWinR > 0 ? 99.0 : 0.0);
-					sprintf_s(buf, sizeof(buf), "%s: n=%d win %.0f%% avgR %+.2f PF %.2f%s", kSetupNames[Clamp(H.curSetup, 0, SETUP_COUNT - 1)], st.count,
-						100.0 * st.wins / Max(1, st.wins + st.losses), st.sumR / st.count, pf, st.count < S.params.val.minSample ? " (small n)" : "");
-					F.Text(x, y, buf, st.count < S.params.val.minSample ? T.dim : T.text);
+					sprintf_s(buf, sizeof(buf), "%-15s %3.0f%%  %+.2fR  PF %.2f  n=%d%s", kSetupNames[k], 100.0 * st.wins / Max(1, st.wins + st.losses), st.sumR / st.count, pf, st.count, small ? " *" : "");
+					F.Text(x, y, buf, small ? T.dim : (k == H.curSetup ? T.text : Blend(T.text, T.dim, 0.35f)));
+					y += lineH;
 				}
-				else F.Text(x, y, "Stats: no resolved signals yet", T.dim);
-				y += lineH;
 			}
 			// 11. health row
 			if (!L.compact && showHealth)
 			{
-				sprintf_s(buf, sizeof(buf), "%s %s %s mkt %d/%d  %.1fms %s", S.warn.vapOff ? "VAP off" : "VAP on", S.warn.noDepth ? "depth off" : "depth on", S.warn.tzNotNY ? "TZ!" : "TZ ok",
-					H.interConnected, H.interConfigured, S.perf.overlayMs + S.perf.backdropMs + S.perf.tapeMs, F.fillVisible && F.fillW >= 150 ? "" : "| set Fill Space >= 40 bars");
-				F.Text(x, y, buf, T.dim); y += lineH;
+				double delaySec = 0;
+				if (sc.GetDataDelayFromChart != nullptr) { const SCDateTime d = sc.GetDataDelayFromChart(sc.ChartNumber); delaySec = d.GetAsDouble() * 86400.0; }
+				sprintf_s(buf, sizeof(buf), "%s %s %s mkt %d/%d  draw %.1fms calc %.1fms%s%s", S.warn.vapOff ? "VAP off" : "VAP on", S.warn.noDepth ? "depth off" : "depth on", S.warn.tzNotNY ? "TZ!" : "TZ ok",
+					H.interConnected, H.interConfigured, S.perf.overlayMs + S.perf.backdropMs + S.perf.tapeMs, H.updateMs, delaySec > 5 ? "  DELAY!" : "", F.fillVisible && F.fillW >= 150 ? "" : "  set Fill Space >= 40");
+				F.Text(x, y, buf, delaySec > 5 ? T.bear : T.dim); y += lineH;
 			}
 			// 12. warnings
 			if (showWarn && S.warn.text[0])
