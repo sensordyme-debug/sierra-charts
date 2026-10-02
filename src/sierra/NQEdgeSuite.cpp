@@ -271,7 +271,7 @@ namespace nqe
 		LVL_NONE = 0, LVL_POC, LVL_VAH, LVL_VAL, LVL_PD_POC, LVL_PD_VAH, LVL_PD_VAL, LVL_PDH, LVL_PDL,
 		LVL_ONH, LVL_ONL, LVL_IBH, LVL_IBL, LVL_IBEXT, LVL_NAKED_POC, LVL_SWING_H, LVL_SWING_L,
 		LVL_LIQ_EQH, LVL_LIQ_EQL, LVL_VWAP, LVL_VWAP_B1U, LVL_VWAP_B1D, LVL_VWAP_B2U, LVL_VWAP_B2D,
-		LVL_VWAP_B3U, LVL_VWAP_B3D, LVL_ABSORB, LVL_IMB, LVL_SINGLE_PRINT
+		LVL_VWAP_B3U, LVL_VWAP_B3D, LVL_ABSORB, LVL_IMB, LVL_SINGLE_PRINT, LVL_PDC, LVL_OPEN, LVL_FAILED
 	};
 	struct Level { float price; int kind; int bornIdx; };
 
@@ -301,8 +301,14 @@ namespace nqe
 		int prevSwingHigh = -1, prevSwingLow = -1;
 		bool lastHighBroken = false, lastLowBroken = false;
 		// RTH profile (committed through computedThrough)
-		std::map<int, double> profVol;                       // level -> volume
+		struct PLevel { double vol = 0, bid = 0, ask = 0; };
+		std::map<int, PLevel> profVol;                       // level -> volume split by aggressor
 		double profTotal = 0;
+		std::map<int, PLevel> prevProf; double prevProfTotal = 0;   // prior RTH session profile (ghost)
+		std::vector<std::map<int, PLevel> > sessionHist;             // last N session profiles (composite)
+		std::vector<float> rthRanges;                                 // RTH range per completed session (ADR)
+		float prevDayClose = 0;
+		std::vector<float> pdc, sessOpen;                             // per-bar prior-day close, session open
 		std::map<int, int> tpoMap;                           // level -> TPO count (completed periods)
 		std::set<int> periodLevels;                          // levels touched in the current TPO period
 		int lastTpoPeriod = -1;
@@ -676,6 +682,7 @@ namespace nqe
 			S.auction.swings.clear(); S.auction.lastSwingHigh = S.auction.lastSwingLow = -1;
 			S.auction.prevSwingHigh = S.auction.prevSwingLow = -1; S.auction.lastHighBroken = S.auction.lastLowBroken = false;
 			S.auction.profVol.clear(); S.auction.profTotal = 0; S.auction.tpoMap.clear(); S.auction.periodLevels.clear(); S.auction.lastTpoPeriod = -1;
+			S.auction.prevProf.clear(); S.auction.prevProfTotal = 0; S.auction.sessionHist.clear(); S.auction.rthRanges.clear(); S.auction.prevDayClose = 0;
 			S.auction.devPoc = S.auction.devVah = S.auction.devVal = 0;
 			S.auction.curDay = 0; S.auction.finalizedSession = -1; S.auction.rthOpenSession = -1;
 			S.auction.onH = -FLT_MAX; S.auction.onL = FLT_MAX; S.auction.rthHigh = -FLT_MAX; S.auction.rthLow = FLT_MAX;
@@ -925,7 +932,7 @@ namespace nqe
 	// ==== 6  Auction / Structure engine ========================================
 	namespace auction_detail
 	{
-		typedef std::map<int, double> LevelMap;
+		typedef std::map<int, AuctionState::PLevel> LevelMap;
 
 		inline int PriceToTick(float price, float tick) { return static_cast<int>(floor(price / tick + 0.5)); }
 		inline int TickToLevel(int t, int tpl) { return (t >= 0 ? t : t - tpl + 1) / tpl; }
@@ -953,7 +960,7 @@ namespace nqe
 					{
 						if (!sc.VolumeAtPriceForBars->GetVAPElementAtIndex(i, k, &p) || p == nullptr) break;
 						const int level = TickToLevel(p->PriceInTicks, tpl);
-						vol[level] += p->Volume; total += p->Volume;
+						AuctionState::PLevel& L = vol[level]; L.vol += p->Volume; L.bid += p->BidVolume; L.ask += p->AskVolume; total += p->Volume;
 					}
 				}
 			}
@@ -961,7 +968,8 @@ namespace nqe
 			{
 				const double v = sc.Volume[i];
 				const int levels = Max(1, r_hi - r_lo + 1);
-				for (int lv = r_lo; lv <= r_hi; ++lv) vol[lv] += v / levels;
+				const double bid = sc.BidVolume[i], ask = sc.AskVolume[i];
+				for (int lv = r_lo; lv <= r_hi; ++lv) { AuctionState::PLevel& L = vol[lv]; L.vol += v / levels; L.bid += bid / levels; L.ask += ask / levels; }
 				total += v;
 			}
 		}
@@ -970,7 +978,8 @@ namespace nqe
 		bool ComputePocVa(const LevelMap& vol, double total, float vaPct, int& poc, int& vah, int& val)
 		{
 			if (vol.empty() || total <= 0) return false;
-			std::vector<std::pair<int, double> > v(vol.begin(), vol.end());
+			std::vector<std::pair<int, double> > v; v.reserve(vol.size());
+			for (LevelMap::const_iterator it = vol.begin(); it != vol.end(); ++it) v.push_back(std::make_pair(it->first, it->second.vol));
 			size_t pocIdx = 0; double best = -1;
 			for (size_t k = 0; k < v.size(); ++k) if (v[k].second > best) { best = v[k].second; pocIdx = k; }
 			// tie: prefer the level nearest the middle of the range
@@ -1083,11 +1092,14 @@ namespace nqe
 			A.singlePrints.swap(fresh);
 		}
 
-		void FinalizeRthSession(ChartState& S, int atIdx)
+		void FinalizeRthSession(ChartState& S, int atIdx, float lastClose)
 		{
 			AuctionState& A = S.auction;
+			A.prevDayClose = lastClose;
 			if (A.profTotal > 0)
 			{
+				A.prevProf = A.profVol; A.prevProfTotal = A.profTotal;
+				A.sessionHist.push_back(A.profVol); if (A.sessionHist.size() > 30) A.sessionHist.erase(A.sessionHist.begin());
 				int poc, vah, val;
 				if (ComputePocVa(A.profVol, A.profTotal, S.params.auction.valueAreaPct, poc, vah, val))
 				{
@@ -1103,7 +1115,7 @@ namespace nqe
 					}
 				}
 			}
-			if (A.rthHigh > -FLT_MAX) { A.prevDayHigh = A.rthHigh; A.prevDayLow = A.rthLow; }
+			if (A.rthHigh > -FLT_MAX) { A.prevDayHigh = A.rthHigh; A.prevDayLow = A.rthLow; A.rthRanges.push_back(A.rthHigh - A.rthLow); if (A.rthRanges.size() > 60) A.rthRanges.erase(A.rthRanges.begin()); }
 			if (A.ibClosed && A.ibH > -FLT_MAX) A.ibRangeHistory.push_back(A.ibH - A.ibL);
 			if (A.ibRangeHistory.size() > 200) A.ibRangeHistory.erase(A.ibRangeHistory.begin());
 			// close the TPO period and clear the session profile
@@ -1146,7 +1158,7 @@ namespace nqe
 		Fit(A.poc, n); Fit(A.vah, n); Fit(A.val, n); Fit(A.pdPoc, n); Fit(A.pdVah, n); Fit(A.pdVal, n); Fit(A.pdh, n); Fit(A.pdl, n);
 		Fit(A.onHigh, n); Fit(A.onLow, n); Fit(A.ibHigh, n); Fit(A.ibLow, n); Fit(A.ibDone, n);
 		Fit(A.structTrend, n); Fit(A.bos, n); Fit(A.vaPos, n); Fit(A.pocPos, n); Fit(A.ibPos, n); Fit(A.valueMig, n); Fit(A.openTypeDir, n);
-		Fit(A.openType, n); Fit(A.swingHighMark, n); Fit(A.swingLowMark, n); Fit(A.bosMark, n); Fit(A.chochMark, n);
+		Fit(A.openType, n); Fit(A.swingHighMark, n); Fit(A.swingLowMark, n); Fit(A.bosMark, n); Fit(A.chochMark, n); Fit(A.pdc, n); Fit(A.sessOpen, n);
 		if (A.UpToDate(sc)) return;   // nothing new since the last Ensure in this update cycle
 		int from = A.computedThrough + 1; if (from < 0) from = 0; if (from > n - 1) from = n - 1;
 		const int tpl = Max(1, P.profileTicksPerLevel);
@@ -1163,7 +1175,7 @@ namespace nqe
 			const bool prevRth = (i > 0) && B.isRth[i - 1] != 0;
 
 			// ---- session transitions (idempotent thanks to the guards) ----
-			if (prevRth && (!rth || newDay) && A.finalizedSession != B.rthSession[i - 1]) { A.finalizedSession = B.rthSession[i - 1]; FinalizeRthSession(S, i); }
+			if (prevRth && (!rth || newDay) && A.finalizedSession != B.rthSession[i - 1]) { A.finalizedSession = B.rthSession[i - 1]; FinalizeRthSession(S, i, sc.Close[i - 1]); }
 			if (newDay && A.curDay != B.tradingDay[i])
 			{
 				A.curDay = B.tradingDay[i];
@@ -1330,6 +1342,7 @@ namespace nqe
 			A.bos[i] = (A.lastBosIdx >= 0 && i >= A.lastBosIdx) ? static_cast<float>(A.lastBosDir) * static_cast<float>(exp(-(i - A.lastBosIdx) / decay)) : 0.0f;
 			A.poc[i] = poc; A.vah[i] = vah; A.val[i] = val;
 			A.pdPoc[i] = A.prevPoc; A.pdVah[i] = A.prevVah; A.pdVal[i] = A.prevVal; A.pdh[i] = A.prevDayHigh; A.pdl[i] = A.prevDayLow;
+			A.pdc[i] = A.prevDayClose; A.sessOpen[i] = (rth && A.rthOpenIdx >= 0) ? A.rthOpen : 0.0f;
 			A.onHigh[i] = onH > -FLT_MAX ? onH : 0.0f; A.onLow[i] = onL < FLT_MAX ? onL : 0.0f;
 			A.ibHigh[i] = (rth && ibH > -FLT_MAX) ? ibH : 0.0f; A.ibLow[i] = (rth && ibL < FLT_MAX) ? ibL : 0.0f; A.ibDone[i] = (rth && ibClosed) ? 1 : 0;
 			// location features
@@ -2291,6 +2304,8 @@ namespace nqe
 			if (A.poc[i] > 0) { out.push_back({ A.poc[i], LVL_POC }); out.push_back({ A.vah[i], LVL_VAH }); out.push_back({ A.val[i], LVL_VAL }); }
 			if (A.pdPoc[i] > 0) { out.push_back({ A.pdPoc[i], LVL_PD_POC }); out.push_back({ A.pdVah[i], LVL_PD_VAH }); out.push_back({ A.pdVal[i], LVL_PD_VAL }); }
 			if (A.pdh[i] > 0) { out.push_back({ A.pdh[i], LVL_PDH }); out.push_back({ A.pdl[i], LVL_PDL }); }
+			if (i < static_cast<int>(A.pdc.size()) && A.pdc[i] > 0) out.push_back({ A.pdc[i], LVL_PDC });
+			if (i < static_cast<int>(A.sessOpen.size()) && A.sessOpen[i] > 0) out.push_back({ A.sessOpen[i], LVL_OPEN });
 			if (A.onHigh[i] > 0) { out.push_back({ A.onHigh[i], LVL_ONH }); out.push_back({ A.onLow[i], LVL_ONL }); }
 			if (A.ibHigh[i] > 0 && A.ibDone[i])
 			{
@@ -2327,6 +2342,7 @@ namespace nqe
 			case LVL_NAKED_POC: return "nPOC"; case LVL_SWING_H: return "swing H"; case LVL_SWING_L: return "swing L"; case LVL_LIQ_EQH: return "EQH"; case LVL_LIQ_EQL: return "EQL";
 			case LVL_VWAP: return "VWAP"; case LVL_VWAP_B1U: return "VWAP+1"; case LVL_VWAP_B1D: return "VWAP-1"; case LVL_VWAP_B2U: return "VWAP+2"; case LVL_VWAP_B2D: return "VWAP-2";
 			case LVL_VWAP_B3U: return "VWAP+3"; case LVL_VWAP_B3D: return "VWAP-3"; case LVL_ABSORB: return "absorb"; case LVL_IMB: return "imb"; case LVL_SINGLE_PRINT: return "single";
+			case LVL_PDC: return "PDC"; case LVL_OPEN: return "OPEN"; case LVL_FAILED: return "fail";
 			default: return "level";
 			}
 		}
@@ -3058,6 +3074,115 @@ namespace nqe
 
 	namespace render
 	{
+		// ---------------- Level system: thin rays + right-edge price pills ----------------
+		struct Tag { float price; int kind; uint32_t color; int bornIdx; char text[40]; bool pulse; float alpha; int y; int h; bool line; };
+
+		inline uint32_t LevelColor(const Theme& T, int kind)
+		{
+			switch (kind)
+			{
+			case LVL_POC: return T.gold; case LVL_VAH: case LVL_VAL: return T.cyan;
+			case LVL_PD_POC: case LVL_PD_VAH: case LVL_PD_VAL: return Blend(T.cyan, T.dim, 0.5f);
+			case LVL_PDH: case LVL_PDL: case LVL_PDC: return T.text; case LVL_OPEN: return Blend(T.text, T.gold, 0.5f);
+			case LVL_ONH: case LVL_ONL: return Blend(T.cyan, T.text, 0.4f); case LVL_IBH: case LVL_IBL: return T.gold; case LVL_IBEXT: return Blend(T.gold, T.dim, 0.5f);
+			case LVL_NAKED_POC: return T.magenta; case LVL_SWING_H: return T.bear; case LVL_SWING_L: return T.bull;
+			case LVL_LIQ_EQH: case LVL_LIQ_EQL: return T.cyan; case LVL_VWAP: return T.gold;
+			case LVL_VWAP_B1U: case LVL_VWAP_B1D: case LVL_VWAP_B2U: case LVL_VWAP_B2D: case LVL_VWAP_B3U: case LVL_VWAP_B3D: return Blend(T.gold, T.dim, 0.6f);
+			default: return T.neutral;
+			}
+		}
+
+		// born index for the ray of each level kind (where the level came into existence)
+		inline int LevelBorn(const ChartState& S, int kind, int i)
+		{
+			const BaseState& B = S.base; const AuctionState& A = S.auction;
+			switch (kind)
+			{
+			case LVL_POC: case LVL_VAH: case LVL_VAL: case LVL_OPEN: return (i < static_cast<int>(B.rthStartIdx.size()) && B.rthStartIdx[i] >= 0) ? B.rthStartIdx[i] : i;
+			case LVL_IBH: case LVL_IBL: case LVL_IBEXT: return A.ibCloseIdx >= 0 ? A.ibCloseIdx : i;
+			case LVL_PD_POC: case LVL_PD_VAH: case LVL_PD_VAL: case LVL_PDH: case LVL_PDL: case LVL_PDC: case LVL_ONH: case LVL_ONL: return (i < static_cast<int>(B.dayStartIdx.size())) ? B.dayStartIdx[i] : i;
+			case LVL_SWING_H: return A.lastSwingHigh >= 0 ? A.swings[A.lastSwingHigh].idx : i;
+			case LVL_SWING_L: return A.lastSwingLow >= 0 ? A.swings[A.lastSwingLow].idx : i;
+			default: return -1;
+			}
+		}
+
+		void DrawLevels(Frame& F)
+		{
+			SCStudyInterfaceRef sc = F.sc; ChartState& S = F.S; const Theme& T = F.T; const VisualConfig& V = F.V;
+			const int i = F.lastClosed; if (i < 0) return;
+			std::vector<dcs_detail::Lv> lv; dcs_detail::GatherLevels(sc, S, i, lv);
+			const float close = sc.Close[F.n - 1], atr = F.atr > 0 ? F.atr : F.tick * 10;
+			const float fadeAtr = 4.0f, pulseAtr = S.params.dcs.levelTolAtr;
+			F.Font(V.fontPt - 1, false);
+			const int h = F.fontH + 2;
+			std::vector<Tag> tags; tags.reserve(lv.size());
+			for (size_t k = 0; k < lv.size(); ++k)
+			{
+				const int kind = lv[k].kind;
+				if (kind == LVL_ABSORB || kind == LVL_IMB || kind == LVL_SINGLE_PRINT) continue;   // zones are drawn as rectangles
+				if (V.preset == PRESET_CLEAN && (kind == LVL_VWAP_B1U || kind == LVL_VWAP_B1D || kind == LVL_VWAP_B2U || kind == LVL_VWAP_B2D || kind == LVL_VWAP_B3U || kind == LVL_VWAP_B3D || kind == LVL_IBEXT)) continue;
+				Tag t; t.price = lv[k].price; t.kind = kind; t.color = LevelColor(T, kind);
+				const float d = static_cast<float>(fabs(t.price - close)) / atr;
+				t.pulse = d <= pulseAtr; t.alpha = d > fadeAtr ? 0.35f : 1.0f - 0.55f * (d / fadeAtr);
+				sprintf_s(t.text, sizeof(t.text), "%s %s", dcs_detail::LevelName(kind), F.Px(t.price));
+				t.bornIdx = LevelBorn(S, kind, i);
+				if (kind == LVL_NAKED_POC) { for (size_t q = 0; q < S.auction.nakedPocs.size(); ++q) if (fabs(S.auction.nakedPocs[q] - t.price) < F.tick * 0.5f) t.bornIdx = S.auction.nakedPocBorn[q]; }
+				if (kind == LVL_LIQ_EQH || kind == LVL_LIQ_EQL) { for (size_t q = 0; q < S.auction.liquidity.size(); ++q) { const Zone& Z = S.auction.liquidity[q]; if (Z.active && fabs(0.5f * (Z.top + Z.bottom) - t.price) < F.tick * 0.5f) t.bornIdx = Z.bornIdx; } }
+				t.y = F.YOf(t.price); t.h = h; t.line = true;
+				if (t.y < F.top - h || t.y > F.bottom + h) continue;
+				tags.push_back(t);
+			}
+			if (tags.empty()) return;
+			// sort by y, merge identical prices, stack overlapping pills
+			std::sort(tags.begin(), tags.end(), [](const Tag& a, const Tag& b) { return a.y < b.y; });
+			std::vector<Tag> out; out.reserve(tags.size());
+			for (size_t k = 0; k < tags.size(); ++k)
+			{
+				if (!out.empty() && fabs(out.back().price - tags[k].price) < F.tick * 0.5f)
+				{
+					Tag& m = out.back();
+					if (strlen(m.text) < 30) { char add[16]; sprintf_s(add, sizeof(add), "/%s", dcs_detail::LevelName(tags[k].kind)); strcat_s(m.text, sizeof(m.text), add); }
+					m.pulse = m.pulse || tags[k].pulse; m.alpha = Max(m.alpha, tags[k].alpha);
+					if (tags[k].bornIdx >= 0 && (m.bornIdx < 0 || tags[k].bornIdx < m.bornIdx)) m.bornIdx = tags[k].bornIdx;
+					continue;
+				}
+				out.push_back(tags[k]);
+			}
+			// pill rows: y centre -> top; push down when overlapping the previous pill
+			int prevBottom = F.top;
+			for (size_t k = 0; k < out.size(); ++k)
+			{
+				Tag& t = out[k];
+				int ty = t.y - h / 2;
+				if (ty < prevBottom + 1) ty = prevBottom + 1;
+				if (ty + h > F.bottom) ty = F.bottom - h;
+				t.h = ty;   // reuse h field as the pill top
+				prevBottom = ty + h;
+			}
+			const int pillRight = F.fillRight;
+			for (size_t k = 0; k < out.size(); ++k)
+			{
+				const Tag& t = out[k];
+				const uint32_t c = Blend(T.bg, t.color, t.alpha);
+				const int w = F.TextW(t.text) + 8;
+				const int pillLeft = pillRight - w;
+				// ray from birth to the pill
+				if (t.line)
+				{
+					const int x0 = (t.bornIdx >= 0) ? Max(F.left, F.XOf(Max(t.bornIdx, F.firstVis))) : F.left;
+					F.Line(x0, t.y, pillLeft - 2, t.y, c, t.pulse ? 2 : 1, t.alpha < 0.5f ? 2 : 0);
+				}
+				// connector when the pill was pushed away from its price
+				const int top = t.h;
+				if (abs((top + h / 2) - t.y) > 2) F.Line(pillLeft - 2, t.y, pillLeft, top + h / 2, c, 1);
+				F.Fill(pillLeft, top, pillRight, top + h, t.pulse ? t.color : Blend(T.panel, t.color, 0.25f * t.alpha), t.pulse ? 100 : 92);
+				F.Font(V.fontPt - 1, t.pulse);
+				F.Text(pillLeft + 4, top + 1, t.text, t.pulse ? T.bg : Blend(T.dim, T.text, t.alpha));
+			}
+			F.Font(V.fontPt, false);
+		}
+
 		// ---------------- HUD glass panel (top-right of the future space) ----------------
 		struct HudLayout { int l, t, r, b, pad, lineH; bool compact; };
 
@@ -3379,6 +3504,7 @@ namespace nqe
 		if (sc.Graphics.SetTextAlign) sc.Graphics.SetTextAlign(TA_LEFT | TA_TOP | TA_NOUPDATECP);
 		F.Clip(F.left, F.top, F.right, F.bottom);
 		// layers are added by later phases; order = back to front
+		if (V.layer[L_LEVELS]) render::DrawLevels(F);
 		if (V.layer[L_RIBBON]) render::DrawRibbon(F);
 		F.Unclip();
 		if (V.layer[L_HUD])
