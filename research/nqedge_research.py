@@ -43,6 +43,7 @@ FEATURES = [
     "vwapPos", "vwapSlope", "vwapAccept", "structTrend", "bos", "vaPos", "pocPos", "ibPos",
     "valueMig", "openType", "delta", "cvdZ", "cvdDiv", "absorb", "exhaust", "imbalance", "trapped",
     "largeTrade", "regimeTrend", "mtfBias", "rsIndex", "smt", "tickCum", "tickExt", "tickDiv", "megaCap",
+    "legEff", "legVol", "pullback", "absorbQ", "auction", "leadLag",
 ]
 GROUPS = {
     "vwapPos": "location", "vwapSlope": "trend", "vwapAccept": "trend", "structTrend": "trend", "bos": "trend",
@@ -51,6 +52,7 @@ GROUPS = {
     "imbalance": "flow", "trapped": "reversal", "largeTrade": "flow", "regimeTrend": "trend", "mtfBias": "trend",
     "rsIndex": "intermarket", "smt": "reversal", "tickCum": "intermarket", "tickExt": "intermarket",
     "tickDiv": "reversal", "megaCap": "intermarket",
+    "legEff": "flow", "legVol": "flow", "pullback": "location", "absorbQ": "reversal", "auction": "trend", "leadLag": "intermarket",
 }
 GROUP_NAMES = ["trend", "flow", "reversal", "location", "intermarket", "context"]
 REGIME_NAMES = {0: "none", 1: "trend_up", 2: "trend_down", 3: "balance", 4: "chop"}

@@ -30,6 +30,13 @@ w.tickCum = 0.4
 w.tickExt = 0.4
 w.tickDiv = 0.5
 w.megaCap = 0.5
+# v2 signal-power features
+w.legEff = 0.5
+w.legVol = 0.3
+w.pullback = 0.4
+w.absorbQ = 0.6
+w.auction = 0.8
+w.leadLag = 0.6
 
 # ---- regime gates: gate.<regime>.<group>, groups: trend flow reversal location intermarket context
 # trend regimes favour continuation and damp reversal/location; balance inverts location (fade the edges)

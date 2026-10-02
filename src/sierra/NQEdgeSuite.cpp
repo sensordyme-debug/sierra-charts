@@ -294,6 +294,8 @@ namespace nqe
 		std::vector<float> structTrend, bos, vaPos, pocPos, ibPos, valueMig, openTypeDir;
 		std::vector<signed char> openType;
 		std::vector<signed char> swingHighMark, swingLowMark; // 1 at the pivot bar (set at confirmation)
+		std::vector<float> auctionF;                          // auction state feature
+		int aucState = 0, aucDir = 0, aucSinceIdx = -1, aucBeyond = 0, aucBarsSince = 0; int aucRejectIdx = -1000, aucRejectDir = 0;
 		std::vector<signed char> bosMark, chochMark;          // +1/-1 at the bar that broke
 		// swings
 		std::vector<Swing> swings;
@@ -357,6 +359,8 @@ namespace nqe
 	{
 		std::vector<float> delta, deltaPct, cvd, cvdZ, volZ;
 		std::vector<float> fAbsorb, fExhaust, fImb, fTrapped, fCvdDiv, fLarge;   // features
+		std::vector<float> fLegEff, fLegVol, fPullback, fAbsorbQ;                // v2 features
+		int swingPtr = 0; float lastAbsQ = 0;
 		std::vector<signed char> absorbMark, exhaustMark, imbMark, trapMark, divMark;
 		std::vector<double> volPre1, volPre2, dzPre1, dzPre2;                   // prefix sums over closed bars
 		std::vector<float> cvdDz;
@@ -425,6 +429,9 @@ namespace nqe
 		std::vector<float> tickVal, tickEmaArr;
 		int lastSmtIdx = -1; float lastSmtVal = 0, lastSmtPrice = 0;
 		signed char megaState[6] = { 0, 0, 0, 0, 0, 0 };
+		std::vector<float> leadLag;                 // feature
+		std::vector<float> retP; std::vector<float> retR[3];   // 1-bar returns: primary, YM, mega1, mega2
+		int leadBars = 0; float leadCorr = 0; int leadRef = -1; char leadText[32] = "";
 	};
 
 	// Feature vector published to the composite. Index constants must match kFeatureNames.
@@ -433,13 +440,14 @@ namespace nqe
 		F_VWAP_POS = 0, F_VWAP_SLOPE, F_VWAP_ACCEPT, F_STRUCT_TREND, F_BOS, F_VA_POS, F_POC_POS, F_IB_POS,
 		F_VALUE_MIG, F_OPEN_TYPE, F_DELTA, F_CVD_Z, F_CVD_DIV, F_ABSORB, F_EXHAUST, F_IMBALANCE, F_TRAPPED,
 		F_LARGE_TRADE, F_REGIME_TREND, F_MTF_BIAS, F_RS_INDEX, F_SMT, F_TICK_CUM, F_TICK_EXT, F_TICK_DIV,
-		F_MEGA_CAP, F_COUNT
+		F_MEGA_CAP, F_LEG_EFF, F_LEG_VOL, F_PULLBACK, F_ABSORB_Q, F_AUCTION, F_LEADLAG, F_COUNT
 	};
 	static const char* kFeatureNames[F_COUNT] =
 	{
 		"vwapPos", "vwapSlope", "vwapAccept", "structTrend", "bos", "vaPos", "pocPos", "ibPos",
 		"valueMig", "openType", "delta", "cvdZ", "cvdDiv", "absorb", "exhaust", "imbalance", "trapped",
-		"largeTrade", "regimeTrend", "mtfBias", "rsIndex", "smt", "tickCum", "tickExt", "tickDiv", "megaCap"
+		"largeTrade", "regimeTrend", "mtfBias", "rsIndex", "smt", "tickCum", "tickExt", "tickDiv", "megaCap",
+		"legEff", "legVol", "pullback", "absorbQ", "auction", "leadLag"
 	};
 	enum FeatureGroup { G_TREND = 0, G_FLOW, G_REVERSAL, G_LOCATION, G_INTERMARKET, G_CONTEXT, G_COUNT };
 	static const char* kGroupNames[G_COUNT] = { "trend", "flow", "reversal", "location", "intermarket", "context" };
@@ -448,7 +456,7 @@ namespace nqe
 		G_LOCATION, G_TREND, G_TREND, G_TREND, G_TREND, G_LOCATION, G_LOCATION, G_LOCATION,
 		G_CONTEXT, G_CONTEXT, G_FLOW, G_FLOW, G_REVERSAL, G_REVERSAL, G_REVERSAL, G_FLOW, G_REVERSAL,
 		G_FLOW, G_TREND, G_TREND, G_INTERMARKET, G_REVERSAL, G_INTERMARKET, G_INTERMARKET, G_REVERSAL,
-		G_INTERMARKET
+		G_INTERMARKET, G_FLOW, G_FLOW, G_LOCATION, G_REVERSAL, G_TREND, G_INTERMARKET
 	};
 
 	struct Weights
@@ -464,7 +472,8 @@ namespace nqe
 			{
 				0.6f, 0.8f, 0.5f, 0.9f, 0.6f, 0.5f, 0.4f, 0.3f,
 				0.4f, 0.4f, 0.6f, 0.8f, 0.7f, 0.8f, 0.5f, 0.7f, 0.8f,
-				0.5f, 1.0f, 0.9f, 0.5f, 0.7f, 0.4f, 0.4f, 0.5f, 0.5f
+				0.5f, 1.0f, 0.9f, 0.5f, 0.7f, 0.4f, 0.4f, 0.5f, 0.5f,
+				0.5f, 0.3f, 0.4f, 0.6f, 0.8f, 0.6f
 			};
 			for (int i = 0; i < F_COUNT; ++i) w[i] = d[i];
 			for (int r = 0; r < 5; ++r) for (int g = 0; g < G_COUNT; ++g) gate[r][g] = 1.0f;
@@ -514,7 +523,7 @@ namespace nqe
 
 	struct LogRow
 	{
-		int idx; double t; float o, h, l, c, v; float feat[F_COUNT]; float dcs; int regime; int setup; int dir; int tradingDay;
+		int idx; double t; float o, h, l, c, v; float feat[F_COUNT]; float dcs; int regime; int setup; int dir; int grade; int tradingDay;
 		float atr; float fwd5, fwd15, fwd30, fwd60, mfe, mae; bool done;
 	};
 
@@ -710,6 +719,7 @@ namespace nqe
 			S.auction.prevDayHigh = S.auction.prevDayLow = S.auction.prevPoc = S.auction.prevVah = S.auction.prevVal = 0;
 			S.auction.rthOpen = 0; S.auction.rthOpenIdx = -1; S.auction.o30High = -FLT_MAX; S.auction.o30Low = FLT_MAX; S.auction.o30HighIdx = S.auction.o30LowIdx = -1;
 			S.auction.todayOpenType = OT_NONE; S.auction.openTypeDone = false; S.auction.openTypeDirValue = 0;
+			S.auction.aucState = 0; S.auction.aucDir = 0; S.auction.aucSinceIdx = -1; S.auction.aucBeyond = 0; S.auction.aucBarsSince = 0; S.auction.aucRejectIdx = -1000; S.auction.aucRejectDir = 0;
 			S.auction.ibRangeHistory.clear();
 			for (size_t k = 0; k < S.auction.nakedPocLine.size(); ++k) if (S.auction.nakedPocLine[k]) S.auction.deadLines.push_back(S.auction.nakedPocLine[k]);
 			for (size_t k = 0; k < S.auction.singlePrints.size(); ++k) if (S.auction.singlePrints[k].lineNumber) S.auction.deadLines.push_back(S.auction.singlePrints[k].lineNumber);
@@ -732,7 +742,7 @@ namespace nqe
 			for (size_t k = 0; k < S.flow.bubbles.size(); ++k) if (S.flow.bubbles[k].lineNumber) S.flow.deadLines.push_back(S.flow.bubbles[k].lineNumber);
 			for (size_t k = 0; k < S.flow.markers.size(); ++k) if (S.flow.markers[k].lineNumber) S.flow.deadLines.push_back(S.flow.markers[k].lineNumber);
 			S.flow.absorbZones.clear(); S.flow.imbZones.clear(); S.flow.bubbles.clear(); S.flow.markers.clear();
-			S.flow.legs.clear(); S.flow.activeValid = false; S.flow.legsSwingCount = 0; S.flow.legReg = FlowState::LegReg(); S.flow.failedZones.clear();
+			S.flow.legs.clear(); S.flow.activeValid = false; S.flow.legsSwingCount = 0; S.flow.legReg = FlowState::LegReg(); S.flow.failedZones.clear(); S.flow.swingPtr = 0; S.flow.lastAbsQ = 0;
 			S.flow.tradeSizes.clear(); S.flow.lastTsSequence = 0; S.flow.liveSampleCount = 0; S.flow.liveThreshold = 0;
 			S.flow.levelAvgSizes.clear(); S.flow.ltSampleCount = 0; S.flow.ltThreshold = 0; S.flow.lastProcessedSwing = -1; S.flow.pendingBreakouts.clear();
 			S.flow.lastAbsIdx = S.flow.lastExhIdx = S.flow.lastImbIdx = S.flow.lastTrapIdx = S.flow.lastDivIdx = -1000;
@@ -1180,7 +1190,7 @@ namespace nqe
 		Fit(A.poc, n); Fit(A.vah, n); Fit(A.val, n); Fit(A.pdPoc, n); Fit(A.pdVah, n); Fit(A.pdVal, n); Fit(A.pdh, n); Fit(A.pdl, n);
 		Fit(A.onHigh, n); Fit(A.onLow, n); Fit(A.ibHigh, n); Fit(A.ibLow, n); Fit(A.ibDone, n);
 		Fit(A.structTrend, n); Fit(A.bos, n); Fit(A.vaPos, n); Fit(A.pocPos, n); Fit(A.ibPos, n); Fit(A.valueMig, n); Fit(A.openTypeDir, n);
-		Fit(A.openType, n); Fit(A.swingHighMark, n); Fit(A.swingLowMark, n); Fit(A.bosMark, n); Fit(A.chochMark, n); Fit(A.pdc, n); Fit(A.sessOpen, n);
+		Fit(A.openType, n); Fit(A.swingHighMark, n); Fit(A.swingLowMark, n); Fit(A.bosMark, n); Fit(A.chochMark, n); Fit(A.pdc, n); Fit(A.sessOpen, n); Fit(A.auctionF, n);
 		if (A.UpToDate(sc)) return;   // nothing new since the last Ensure in this update cycle
 		int from = A.computedThrough + 1; if (from < 0) from = 0; if (from > n - 1) from = n - 1;
 		const int tpl = Max(1, P.profileTicksPerLevel);
@@ -1209,6 +1219,7 @@ namespace nqe
 				A.o30High = -FLT_MAX; A.o30Low = FLT_MAX; A.o30HighIdx = A.o30LowIdx = -1;
 				A.profVol.clear(); A.profTotal = 0; A.tpoMap.clear(); A.periodLevels.clear(); A.lastTpoPeriod = -1;
 				A.rthHigh = -FLT_MAX; A.rthLow = FLT_MAX; A.ibH = -FLT_MAX; A.ibL = FLT_MAX; A.ibClosed = false; A.ibCloseIdx = -1; A.ibBreakDir = 0;
+				A.aucState = 0; A.aucDir = 0; A.aucSinceIdx = -1; A.aucBeyond = 0; A.aucBarsSince = 0;
 			}
 
 			// ---- provisional copies of the committed accumulators for this bar ----
@@ -1398,6 +1409,28 @@ namespace nqe
 				if (w > 0 && ov / w >= 0.5f) A.valueMig[i] = 0; else A.valueMig[i] = Sign(poc - A.prevPoc);
 			}
 			else A.valueMig[i] = (i > 0 && rth) ? A.valueMig[i - 1] : 0.0f;
+			// ---- auction state machine: balance -> initiative breakout -> acceptance / rejection ----
+			if (closed && rth && (vah > val || (ibClosed && ibH > ibL)))
+			{
+				const float upEdge = Max(vah > val ? vah : -FLT_MAX, ibClosed ? ibH : -FLT_MAX), dnEdge = Min(vah > val ? val : FLT_MAX, ibClosed ? ibL : FLT_MAX);
+				const int beyond = c > upEdge ? 1 : (c < dnEdge ? -1 : 0);
+				if (A.aucState == 0 && beyond != 0) { A.aucState = 1; A.aucDir = beyond; A.aucSinceIdx = i; A.aucBeyond = 1; A.aucBarsSince = 1; }
+				else if (A.aucState >= 1)
+				{
+					++A.aucBarsSince; if (beyond == A.aucDir) ++A.aucBeyond;
+					const float share = static_cast<float>(A.aucBeyond) / Max(1, A.aucBarsSince);
+					if (A.aucState == 1 && A.aucBeyond >= 3 && share >= 0.6f) { A.aucState = 2; char t[64]; sprintf_s(t, sizeof(t), "acceptance %s value", A.aucDir > 0 ? "above" : "below"); PushEvent(sc, S, i, EV_ACCEPT, A.aucDir, c, t); }
+					else if (A.aucState == 1 && beyond != A.aucDir && A.aucBarsSince <= 4) { A.aucState = 0; A.aucRejectIdx = i; A.aucRejectDir = -A.aucDir; char t[64]; sprintf_s(t, sizeof(t), "rejection: back inside value"); PushEvent(sc, S, i, EV_REJECT, -A.aucDir, c, t); A.aucDir = 0; }
+					else if (A.aucState == 2 && beyond == -A.aucDir) { A.aucState = 0; A.aucRejectIdx = i; A.aucRejectDir = -A.aucDir; A.aucDir = 0; }
+					else if (A.aucState >= 1 && beyond == 0 && share < 0.3f && A.aucBarsSince > 10) { A.aucState = 0; A.aucDir = 0; }
+				}
+			}
+			{
+				float af = 0;
+				if (A.aucState == 1) af = 0.5f * A.aucDir; else if (A.aucState == 2) af = 1.0f * A.aucDir;
+				if (A.aucRejectIdx >= 0 && i - A.aucRejectIdx <= 10 && A.aucState == 0) af = 0.5f * A.aucRejectDir * static_cast<float>(exp(-(i - A.aucRejectIdx) / 5.0));
+				A.auctionF[i] = rth ? af : 0.0f;
+			}
 			A.openType[i] = rth ? A.todayOpenType : static_cast<signed char>(OT_NONE);
 			A.openTypeDir[i] = (rth && A.openTypeDone && B.secIntoRth[i] <= 2 * 3600) ? A.openTypeDirValue : 0.0f;
 		}
@@ -1607,6 +1640,7 @@ namespace nqe
 		FlowState& F = S.flow; const FlowParams& P = S.params.flow; const BaseState& B = S.base; const AuctionState& A = S.auction;
 		Fit(F.delta, n); Fit(F.deltaPct, n); Fit(F.cvd, n); Fit(F.cvdZ, n); Fit(F.volZ, n);
 		Fit(F.fAbsorb, n); Fit(F.fExhaust, n); Fit(F.fImb, n); Fit(F.fTrapped, n); Fit(F.fCvdDiv, n); Fit(F.fLarge, n);
+		Fit(F.fLegEff, n); Fit(F.fLegVol, n); Fit(F.fPullback, n); Fit(F.fAbsorbQ, n);
 		Fit(F.absorbMark, n); Fit(F.exhaustMark, n); Fit(F.imbMark, n); Fit(F.trapMark, n); Fit(F.divMark, n);
 		Fit(F.volPre1, n); Fit(F.volPre2, n); Fit(F.dzPre1, n); Fit(F.dzPre2, n); Fit(F.cvdDz, n); Fit(F.deltaPre, n);
 		if (F.UpToDate(sc)) return;
@@ -1706,13 +1740,17 @@ namespace nqe
 				{
 					const float prevLow = Min(sc.Low[i - 1], Min(sc.Low[i - 2], sc.Low[i - 3]));
 					const float prevHigh = Max(sc.High[i - 1], Max(sc.High[i - 2], sc.High[i - 3]));
+					const float closePosB = range > 0 ? (c - l) / range : 0.5f, closePosS = range > 0 ? (h - c) / range : 0.5f;
+					int touches = 0; for (int z = static_cast<int>(F.absorbZones.size()) - 1; z >= 0 && F.absorbZones[z].bornIdx >= i - 50; --z) if (fabs(0.5f * (F.absorbZones[z].top + F.absorbZones[z].bottom) - (F.deltaPct[i] <= -0.10f ? l : h)) <= 0.5f * atr) ++touches;
 					if (F.deltaPct[i] <= -0.10f && (c - l) >= 0.4f * range && l <= prevLow)
 					{
+						F.lastAbsQ = Clamp1(F.volZ[i] * (1.0f - range / atr) * closePosB * (1.0f + 0.25f * touches) / 2.5f);
 						Zone z; z.bornIdx = i; z.bottom = l; z.top = l + P.absorbZoneFrac * range; z.dir = 1; z.kind = LVL_ABSORB; z.active = true;
 						F.absorbZones.push_back(z); F.absorbMark[i] = 1; F.lastAbsIdx = i; F.lastAbsDir = 1; SetEvent(F, i, l, "Absorption (buyers)"); Note(sc, S, i, EV_ABSORB, 1, l, "absorption: passive buyers");
 					}
 					else if (F.deltaPct[i] >= 0.10f && (h - c) >= 0.4f * range && h >= prevHigh)
 					{
+						F.lastAbsQ = Clamp1(F.volZ[i] * (1.0f - range / atr) * closePosS * (1.0f + 0.25f * touches) / 2.5f);
 						Zone z; z.bornIdx = i; z.top = h; z.bottom = h - P.absorbZoneFrac * range; z.dir = -1; z.kind = LVL_ABSORB; z.active = true;
 						F.absorbZones.push_back(z); F.absorbMark[i] = -1; F.lastAbsIdx = i; F.lastAbsDir = -1; SetEvent(F, i, h, "Absorption (sellers)"); Note(sc, S, i, EV_ABSORB, -1, h, "absorption: passive sellers");
 					}
@@ -1851,9 +1889,41 @@ namespace nqe
 				}
 			}
 
+			// ---- leg-based features as of bar i (swings confirmed at or before i) ----
+			{
+				while (F.swingPtr < static_cast<int>(A.swings.size()) && A.swings[F.swingPtr].confirmIdx <= i) ++F.swingPtr;
+				const int k = F.swingPtr - 1;             // last confirmed swing as of i
+				float legEff = 0, legVol = 0, pull = 0;
+				if (k >= 0 && A.swings[k].idx < i && i > 0)
+				{
+					const Swing& sw = A.swings[k];
+					const int from = sw.idx;
+					const double legDelta = (closed ? F.deltaPre[i] : F.deltaPre[i - 1] + delta) - F.deltaPre[from];
+					const double legVolume = (closed ? F.volPre1[i] : F.volPre1[i - 1] + vol) - F.volPre1[from];
+					const float legTicks = Max(1.0f, static_cast<float>(fabs(c - sw.price) / Max(tick, 1e-6f)));
+					double volMean = 0; { double m = 0, sd = 0; if (WindowStats(F.volPre1, F.volPre2, i - 1, L, m, sd)) volMean = m; }
+					const float ticksPerBar = Max(1.0f, atr / Max(tick, 1e-6f));
+					if (volMean > 0) legEff = Clamp1((legDelta / legTicks) / (volMean / ticksPerBar));
+					if (k >= 1)
+					{
+						const Swing& pv = A.swings[k - 1];
+						const double prevVol = F.volPre1[Min(sw.idx, i)] - F.volPre1[pv.idx];
+						if (prevVol > 0 && legVolume > 0) legVol = Clamp1(log(legVolume / prevVol) / log(2.0) / 2.0) * (c >= sw.price ? 1.0f : -1.0f);
+						const float prevRange = static_cast<float>(fabs(sw.price - pv.price));
+						const bool prevUp = sw.price > pv.price, activeDown = c < sw.price;
+						if (prevRange > 0 && prevUp == activeDown)   // active leg pulls back against the prior leg
+						{
+							const float depth = static_cast<float>(fabs(c - sw.price)) / prevRange;
+							pull = Clamp1(1.0 - 2.0 * depth) * (prevUp ? 1.0f : -1.0f);
+						}
+					}
+				}
+				F.fLegEff[i] = legEff; F.fLegVol[i] = legVol; F.fPullback[i] = pull;
+			}
 			// ---- features ----
 			const int decay = Max(1, P.eventDecayBars);
 			F.fAbsorb[i] = Decayed(F.lastAbsDir, F.lastAbsIdx, i, decay);
+			F.fAbsorbQ[i] = Decayed(F.lastAbsDir, F.lastAbsIdx, i, decay) * static_cast<float>(fabs(F.lastAbsQ));
 			F.fExhaust[i] = Decayed(F.lastExhDir, F.lastExhIdx, i, decay);
 			F.fImb[i] = Decayed(F.lastImbDir, F.lastImbIdx, i, decay);
 			F.fTrapped[i] = Decayed(F.lastTrapDir, F.lastTrapIdx, i, decay);
@@ -2027,6 +2097,7 @@ namespace nqe
 			const float erN = Clamp(R.er[i] / Max(0.05f, P.erTrend), 0.0f, 1.0f);
 			float trendiness = 0.35f * erN + 0.25f * static_cast<float>(fabs(vs)) + 0.20f * static_cast<float>(fabs(st)) + 0.20f * (1.0f - insideFrac);
 			if (ibRel > 1.2f) trendiness += 0.05f; else if (ibRel < 0.8f) trendiness -= 0.05f;
+			if (i < static_cast<int>(A.auctionF.size()) && fabs(A.auctionF[i]) >= 1.0f) trendiness += 0.1f;
 			trendiness = Clamp(trendiness, 0.0f, 1.0f);
 			const float dir = Clamp1(0.4 * vs + 0.3 * st + 0.2 * side + 0.1 * vm);
 			R.trendiness[i] = trendiness; R.dirScore[i] = dir;
@@ -2168,7 +2239,7 @@ namespace nqe
 		Fit(I.rsYM, n); Fit(I.rsES, n); Fit(I.rsRTY, n); Fit(I.rsIndex, n); Fit(I.smt, n); Fit(I.tickCum, n); Fit(I.tickExt, n);
 		Fit(I.tickDiv, n); Fit(I.megaCap, n); Fit(I.composite, n); Fit(I.smtMark, n);
 		for (int k = 0; k < 3; ++k) { Fit(I.rsPre1[k], n); Fit(I.rsPre2[k], n); Fit(I.rsRaw[k], n); }
-		Fit(I.tickVal, n); Fit(I.tickEmaArr, n);
+		Fit(I.tickVal, n); Fit(I.tickEmaArr, n); Fit(I.leadLag, n); Fit(I.retP, n); for (int k = 0; k < 3; ++k) Fit(I.retR[k], n);
 		if (I.UpToDate(sc)) return;
 		int from = I.computedThrough + 1; if (from < 0) from = 0; if (from > n - 1) from = n - 1;
 
@@ -2311,6 +2382,49 @@ namespace nqe
 			}
 			else I.megaCap[i] = kNaN;
 
+			// ---- lead / lag vs YM and the first two mega caps (rolling correlation at lags -3..+3) ----
+			{
+				I.retP[i] = (i > 0 && sc.Close[i - 1] > 0) ? c / sc.Close[i - 1] - 1.0f : 0.0f;
+				RefChart* lr[3] = { &I.ym, nullptr, nullptr }; int lc = 1;
+				for (int k = 0; k < 6 && lc < 3; ++k) if (I.mega[k].ok) lr[lc++] = &I.mega[k];
+				float best = 0; int bestLag = 0, bestRef = -1; float feature = 0;
+				for (int r = 0; r < 3; ++r)
+				{
+					RefChart* R = lr[r];
+					if (R == nullptr || !R->ok) { I.retR[r][i] = 0; continue; }
+					const int j = Align(sc, *R, i, n);
+					I.retR[r][i] = (j > 0 && R->data[SC_LAST][j - 1] > 0) ? R->data[SC_LAST][j] / R->data[SC_LAST][j - 1] - 1.0f : 0.0f;
+					if (i < 70) continue;
+					const int W = 60;
+					for (int lag = -3; lag <= 3; ++lag)
+					{
+						double sxy = 0, sxx = 0, syy = 0, sx = 0, sy = 0; int m = 0;
+						for (int q = i - W + 1; q <= i; ++q)
+						{
+							const int qr = q - lag; if (qr < 0 || qr > i) continue;
+							const double x = I.retP[q], y = I.retR[r][qr];
+							sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y; ++m;
+						}
+						if (m < 20) continue;
+						const double cov = sxy / m - (sx / m) * (sy / m), vx = sxx / m - (sx / m) * (sx / m), vy = syy / m - (sy / m) * (sy / m);
+						const double corr = (vx > 0 && vy > 0) ? cov / sqrt(vx * vy) : 0.0;
+						if (fabs(corr) > fabs(best)) { best = static_cast<float>(corr); bestLag = lag; bestRef = r; }
+					}
+				}
+				if (bestRef >= 0 && bestLag > 0 && fabs(best) >= 0.3f)
+				{
+					// the reference leads by bestLag bars: has it moved while the primary has not?
+					double rsum = 0, psum = 0, rsq = 0, psq = 0; const int W = 60;
+					for (int q = Max(1, i - W + 1); q <= i; ++q) { rsq += static_cast<double>(I.retR[bestRef][q]) * I.retR[bestRef][q]; psq += static_cast<double>(I.retP[q]) * I.retP[q]; }
+					const double rsd = sqrt(rsq / W), psd = sqrt(psq / W);
+					for (int q = i - bestLag + 1; q <= i; ++q) { rsum += I.retR[bestRef][q]; psum += I.retP[q]; }
+					const double zr = rsd > 0 ? rsum / (rsd * sqrt(static_cast<double>(bestLag))) : 0, zp = psd > 0 ? psum / (psd * sqrt(static_cast<double>(bestLag))) : 0;
+					if (fabs(zr) >= 1.0 && fabs(zp) < 0.5) feature = Clamp1(Sign(zr) * Min(1.0, fabs(zr) / 2.0));
+					if (closed) { I.leadBars = bestLag; I.leadCorr = best; I.leadRef = bestRef; sprintf_s(I.leadText, sizeof(I.leadText), "%s leads %db%s", bestRef == 0 ? "YM" : (lr[bestRef] && !lr[bestRef]->symbol.IsEmpty() ? lr[bestRef]->symbol.GetChars() : "cap"), bestLag, feature > 0 ? " ^" : (feature < 0 ? " v" : "")); }
+				}
+				else if (closed) { I.leadBars = 0; I.leadRef = -1; I.leadText[0] = 0; }
+				I.leadLag[i] = (I.ym.ok || megaN > 0) ? feature : kNaN;
+			}
 			// composite for the subgraph (mean of what is available)
 			{
 				float s = 0; int cnt = 0;
@@ -2558,6 +2672,7 @@ namespace nqe
 			f[F_IMBALANCE] = F.fImb[i]; f[F_TRAPPED] = F.fTrapped[i]; f[F_LARGE_TRADE] = F.fLarge[i];
 			f[F_REGIME_TREND] = R.regimeTrend[i]; f[F_MTF_BIAS] = R.mtfBias[i];
 			f[F_RS_INDEX] = I.rsIndex[i]; f[F_SMT] = I.smt[i]; f[F_TICK_CUM] = I.tickCum[i]; f[F_TICK_EXT] = I.tickExt[i]; f[F_TICK_DIV] = I.tickDiv[i]; f[F_MEGA_CAP] = I.megaCap[i];
+			f[F_LEG_EFF] = F.fLegEff[i]; f[F_LEG_VOL] = F.fLegVol[i]; f[F_PULLBACK] = F.fPullback[i]; f[F_ABSORB_Q] = F.fAbsorbQ[i]; f[F_AUCTION] = A.auctionF[i]; f[F_LEADLAG] = I.leadLag[i];
 
 			const int reg = Clamp(static_cast<int>(R.regime[i]), 0, 4);
 			double num = 0, den = 0;
@@ -2633,9 +2748,9 @@ namespace nqe
 					for (int q = 0; hiKinds[q] >= 0; ++q) if (lv[k].kind == hiKinds[q]) hi = true;
 					for (int q = 0; loKinds[q] >= 0; ++q) if (lv[k].kind == loKinds[q]) lo = true;
 					if (hi && dcs >= thr && dPct > 0 && flowUp && c > L && sc.Close[i - 1] > L && sc.Close[i - 2] <= L && c - L <= 2.0f * atr)
-					{ cands.push_back({ SETUP_BREAK_ACCEPT, 1, L - buf, L, lv[k].kind, 2, (imbBuy ? 1.0f : 0.5f) + (F.cvdZ[i] > 1.0f ? 0.5f : 0.0f) }); break; }
+					{ cands.push_back({ SETUP_BREAK_ACCEPT, 1, L - buf, L, lv[k].kind, 2, (imbBuy ? 1.0f : 0.5f) + (F.cvdZ[i] > 1.0f ? 0.5f : 0.0f) + (A.auctionF[i] >= 0.5f ? 0.5f : 0.0f) }); break; }
 					if (lo && dcs <= -thr && dPct < 0 && flowDn && c < L && sc.Close[i - 1] < L && sc.Close[i - 2] >= L && L - c <= 2.0f * atr)
-					{ cands.push_back({ SETUP_BREAK_ACCEPT, -1, L + buf, L, lv[k].kind, 2, (imbSell ? 1.0f : 0.5f) + (F.cvdZ[i] < -1.0f ? 0.5f : 0.0f) }); break; }
+					{ cands.push_back({ SETUP_BREAK_ACCEPT, -1, L + buf, L, lv[k].kind, 2, (imbSell ? 1.0f : 0.5f) + (F.cvdZ[i] < -1.0f ? 0.5f : 0.0f) + (A.auctionF[i] <= -0.5f ? 0.5f : 0.0f) }); break; }
 				}
 			}
 			// 5. SMT / CVD divergence reversal at liquidity
@@ -2768,7 +2883,7 @@ namespace nqe
 		{
 			fprintf(f, "time,idx,trading_day,open,high,low,close,volume,atr");
 			for (int k = 0; k < F_COUNT; ++k) fprintf(f, ",%s", kFeatureNames[k]);
-			fprintf(f, ",dcs,regime,setup,dir,fwd5,fwd15,fwd30,fwd60,mfe,mae\n");
+			fprintf(f, ",dcs,regime,setup,dir,grade,fwd5,fwd15,fwd30,fwd60,mfe,mae\n");
 		}
 	}
 
@@ -2789,6 +2904,7 @@ namespace nqe
 			LogRow r; r.idx = i; r.t = sc.BaseDateTimeIn[i].GetAsDouble(); r.o = sc.Open[i]; r.h = sc.High[i]; r.l = sc.Low[i]; r.c = sc.Close[i]; r.v = sc.Volume[i];
 			for (int k = 0; k < F_COUNT; ++k) r.feat[k] = D.feat[static_cast<size_t>(i) * F_COUNT + k];
 			r.dcs = D.dcs[i]; r.regime = S.regime.regime[i]; r.setup = D.signalType[i]; r.dir = D.signalDir[i]; r.atr = AtrAt(S, i);
+			r.grade = 0; if (r.setup != 0) for (int k = static_cast<int>(D.signals.size()) - 1; k >= 0 && D.signals[k].idx >= i; --k) if (D.signals[k].idx == i) { r.grade = D.signals[k].grade; break; }
 			r.fwd5 = r.fwd15 = r.fwd30 = r.fwd60 = r.mfe = r.mae = 0; r.done = false; r.tradingDay = B.tradingDay[i];
 			L.pending.push_back(r);
 			L.lastQueuedIdx = i;
@@ -2846,7 +2962,7 @@ namespace nqe
 					SCDateTime dt(r.t); int Y, M, Dd, hh, mm, ss; dt.GetDateTimeYMDHMS(Y, M, Dd, hh, mm, ss);
 					fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g", Y, M, Dd, hh, mm, ss, r.idx, r.tradingDay, r.o, r.h, r.l, r.c, r.v, r.atr);
 					for (int k = 0; k < F_COUNT; ++k) { if (IsNan(r.feat[k])) fputs(",", f); else fprintf(f, ",%.4f", r.feat[k]); }
-					fprintf(f, ",%.2f,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", r.dcs, r.regime, r.setup, r.dir, r.fwd5, r.fwd15, r.fwd30, r.fwd60, r.mfe, r.mae);
+					fprintf(f, ",%.2f,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", r.dcs, r.regime, r.setup, r.dir, r.grade, r.fwd5, r.fwd15, r.fwd30, r.fwd60, r.mfe, r.mae);
 				}
 				fclose(f);
 				L.rowsWritten += static_cast<int>(ready);
@@ -2940,7 +3056,7 @@ namespace nqe
 			H.interConfigured = (IP.chartYM > 0) + (IP.chartES > 0) + (IP.chartRTY > 0) + (IP.chartTICK > 0);
 			for (int k = 0; k < 6; ++k) H.interConfigured += (IP.chartMega[k] > 0);
 			H.interConnected = 0; for (int b = 0; b < 10; ++b) H.interConnected += (I.available >> b) & 1;
-			H.leadLag[0] = 0;
+			strncpy_s(H.leadLag, sizeof(H.leadLag), I.leadText, _TRUNCATE);
 		}
 		H.lastEventIdx = S.flow.lastEventIdx;
 		H.legR2 = static_cast<float>(S.flow.legReg.r2); H.legDir = S.flow.legReg.slope > 0 ? 1 : (S.flow.legReg.slope < 0 ? -1 : 0);
