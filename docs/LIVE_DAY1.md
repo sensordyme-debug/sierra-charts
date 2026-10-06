@@ -19,7 +19,8 @@ login, set it in *Global Settings >> Data/Trade Service Settings* (service: the 
 welcome email), reconnect, and the chart's title bar stops saying `Delayed`. Everything in this suite
 then runs in real time, and the Terminal's position line reads the live account.
 
-**Path B — TradingView for the live chart, Sierra for research.** Add `tradingview/NQEdgeLite.pine`
+**Path B — TradingView for the live chart, Sierra for research** (`docs/TRADINGVIEW.md` has the install
+steps, the chart settings and how to read the dashboard and the performance panel). Add `tradingview/NQEdgeLite.pine`
 as a TradingView indicator (Pine Editor >> paste >> Add to chart) on `CME_MINI:NQ1!` or `MNQ1!`,
 2- or 3-minute bars (1-minute delta needs a timeframe above one minute; on a 1-minute chart the
 bar's own tick rule is used). TradingView needs a CME real-time data subscription for live futures

@@ -210,3 +210,21 @@
   action line, trade window, max signals per day, and alerts (`alert()` once per bar close). Not compiled here: paste it in the
   Pine Editor and report any error line.
 - `docs/LIVE_DAY1.md`: the day-one protocol (rules the Terminal enforces, the two live-data paths, pre-flight, session, after).
+
+## TradingView 2.0 — NQ Edge Lite redesign (clean neon look + expectancy gate)
+- Status line cleaned: every input `display=display.none`, every plot pane-only (the VWAP keeps its price-scale label).
+- Signals: compact `A` / `B` tags with the full plan in the hover tooltip; one live position tool (risk and reward boxes,
+  ENTRY with live R, STOP, T1, T2 tags) instead of a 30-bar box per signal; `+R` / `-R` outcome tags at the exit price.
+- **Expectancy gate**: every A/B signal is tracked forward (shown or muted); a setup with ≥ 15 resolved trades and a negative
+  running average R is muted (no marker, no alert) until its record recovers. Performance panel: per-setup N, win %, avg R,
+  state (LEARN / ON / MUTED) and the SHOWN total.
+- **Session volume profile** (RTH): incremental POC and value area; POC / VAH / VAL and prior-session pdPOC / pdVAH / pdVAL join
+  the level set and the setups (value-edge fades at VAH / VAL, failed breakouts and break-and-accept through them); the profile
+  is drawn in the right margin with a gold POC row.
+- EMA 9/21 ribbon (visual and a with-trend filter: pullbacks and break-and-accept need it aligned).
+- Look: conviction-gradient candles, glowing VWAP without reset jumps, violet ±1σ gradient cloud, glow-ring absorption bubbles at
+  the absorbed price, subtle context marks (exhaustion only on *All*), glowing trend lines, nearest 3+3 levels with colour-coded
+  monospace tags, faint trade-window tint, monospace dashboard (bias, action, plan, regime, MTF, flow, feeds, levels, value, status).
+- Defaults follow the day-one protocol: grade B hidden, max 3 signals per day.
+- `docs/TRADINGVIEW.md`: install, chart settings for the look, how to read the dashboard and the gate.
+- **NQ Edge Flow** (`tradingview/NQEdgeFlow.pine`): companion pane with three modes (CVD with glow, gradient fill and divergence dots; Delta columns with absorption in gold, pressure line and high-volume shading; DCS oscillator linked from NQ Edge Lite via indicator-on-indicator). NQ Edge Lite exports `DCS` as a data-window plot for it. TRADINGVIEW.md: Plus section (data check, 10K bars, 4-chart layout, Bar Replay, mobile alerts).

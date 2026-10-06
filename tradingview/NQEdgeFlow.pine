@@ -1,0 +1,153 @@
+//@version=5
+// ============================================================================
+//  NQ Edge Flow — companion pane for NQ Edge Lite
+//  Add it to the chart up to three times, each with a different "Show" setting:
+//    CVD           session cumulative delta: neon line with glow, gradient fill, divergence dots
+//    Delta         per-bar delta columns (gold = absorption), pressure line, high-volume shading
+//    DCS (linked)  NQ Edge Lite's conviction score as an oscillator. Set "DCS source" to
+//                  "NQ Edge Lite: DCS" (indicator-on-indicator).
+//  Delta = tick rule on 1-minute intrabars (charts above one minute), the same as NQ Edge Lite.
+// ============================================================================
+indicator("NQ Edge Flow", "NQ Flow", overlay=false, format=format.volume)
+
+mode        = input.string("CVD", "Show", options=["CVD", "Delta", "DCS (linked)"], display=display.none)
+dcsSrc      = input.source(close, "DCS source (pick: NQ Edge Lite: DCS)", display=display.none)
+gS = "Session (New York time)"
+rthStartH   = input.int(9,  "RTH start hour",   minval=0, maxval=23, group=gS, display=display.none)
+rthStartM   = input.int(30, "RTH start minute", minval=0, maxval=59, group=gS, display=display.none)
+rthEndH     = input.int(16, "RTH end hour",     minval=0, maxval=23, group=gS, display=display.none)
+dayStartH   = input.int(18, "Trading day start hour (evening open)", minval=0, maxval=23, group=gS, display=display.none)
+gF = "Order flow"
+ltfStr      = input.string("1", "Lower timeframe for delta (1 = one minute)", group=gF, display=display.none)
+cvdResetRth = input.bool(true, "Reset CVD at RTH open (off = trading day start)", group=gF, display=display.none)
+swingN      = input.int(5, "Swing strength bars (divergence)", minval=2, maxval=30, group=gF, display=display.none)
+volZLen     = input.int(50, "Volume z-score length", minval=10, maxval=500, group=gF, display=display.none)
+absZ        = input.float(2.0, "Absorption: volume z >=", minval=0.5, maxval=10, step=0.1, group=gF, display=display.none)
+pressLen    = input.int(10, "Pressure EMA length", minval=2, maxval=200, group=gF, display=display.none)
+hiVolZ      = input.float(1.5, "Shade bars with volume z >=", minval=0.5, maxval=6, step=0.1, group=gF, display=display.none)
+gD = "DCS levels"
+sigThr      = input.float(40, "Signal threshold", minval=10, maxval=100, step=1, group=gD, display=display.none)
+weakThr     = input.float(25, "Bias threshold", minval=0, maxval=100, step=1, group=gD, display=display.none)
+gV = "Colours"
+cBull  = input.color(#00F5A0, "Bull", group=gV)
+cBear  = input.color(#FF3366, "Bear", group=gV)
+cVwap  = input.color(#00D4FF, "Pressure / accent", group=gV)
+cBand  = input.color(#7B61FF, "High-volume shade", group=gV)
+cGold  = input.color(#FFC857, "Absorption", group=gV)
+cMag   = input.color(#E040FB, "Divergence", group=gV)
+cText  = input.color(#E8ECF5, "Text", group=gV)
+cPanel = input.color(#0A0E17, "Panel", group=gV)
+cDim   = input.color(#7D879C, "Dim", group=gV)
+cClear = color.new(#000000, 100)
+
+// ───────── Session ─────────
+tz = "America/New_York"
+tod      = hour(time, tz) * 60 + minute(time, tz)
+rthStart = rthStartH * 60 + rthStartM
+rthEnd   = rthEndH * 60
+dayStart = dayStartH * 60
+inRTH    = tod >= rthStart and tod < rthEnd
+prevInRTH = inRTH[1] ? true : false
+rthOpen  = inRTH and not prevInRTH
+prevTod  = nz(tod[1], -1)
+newDay   = tod >= dayStart and (prevTod < dayStart or prevTod > tod)
+
+// ───────── Delta, CVD, volume ─────────
+f_sign(c, o, pc) => c > o ? 1.0 : c < o ? -1.0 : c > pc ? 1.0 : c < pc ? -1.0 : 0.0
+ltfOk    = timeframe.in_seconds() > timeframe.in_seconds(ltfStr)
+effLtf   = ltfOk ? ltfStr : timeframe.period
+deltaArr = request.security_lower_tf(syminfo.tickerid, effLtf, volume * f_sign(close, open, close[1]))
+barDelta = array.size(deltaArr) > 0 ? array.sum(deltaArr) : volume * f_sign(close, open, close[1])
+volMean  = ta.sma(volume, volZLen)
+volSd    = ta.stdev(volume, volZLen)
+volZ     = volSd > 0 ? (volume - volMean) / volSd : 0.0
+deltaPct = volume > 0 ? barDelta / volume : 0.0
+resetNow = cvdResetRth ? rthOpen : newDay
+var float cvd = 0.0
+if resetNow
+    cvd := 0.0
+cvd += barDelta
+cvdLine = resetNow ? na : cvd
+press = ta.ema(barDelta, pressLen)
+
+// ───────── CVD divergence at confirmed swings (marked on the confirmation bar) ─────────
+ph = ta.pivothigh(high, swingN, swingN)
+pl = ta.pivotlow(low, swingN, swingN)
+var float sh1 = na
+var float sh2 = na
+var float shC1 = na
+var float shC2 = na
+var float sl1 = na
+var float sl2 = na
+var float slC1 = na
+var float slC2 = na
+divBear = false
+divBull = false
+if not na(ph)
+    sh2 := sh1
+    shC2 := shC1
+    sh1 := ph
+    shC1 := cvd[swingN]
+    if not na(sh2) and sh1 > sh2 and shC1 <= shC2
+        divBear := true
+if not na(pl)
+    sl2 := sl1
+    slC2 := slC1
+    sl1 := pl
+    slC1 := cvd[swingN]
+    if not na(sl2) and sl1 < sl2 and slC1 >= slC2
+        divBull := true
+
+// ───────── Absorption ─────────
+rng = high - low
+absorbBuy  = volZ >= absZ and deltaPct <= -0.10 and rng > 0 and (close - low) >= 0.4 * rng and low <= low[1]
+absorbSell = volZ >= absZ and deltaPct >= 0.10 and rng > 0 and (high - close) >= 0.4 * rng and high >= high[1]
+
+// ───────── Modes ─────────
+isCvd  = mode == "CVD"
+isDel  = mode == "Delta"
+isDcs  = mode == "DCS (linked)"
+linked = not na(dcsSrc) and math.abs(dcsSrc) <= 100.5
+pZero  = plot(0, "Zero", color=cClear, display=display.none)
+hline(0, "Zero line", color=color.new(cDim, 70), linestyle=hline.style_dotted)
+
+// CVD: gradient fill toward the line, glow, divergence dots
+cvdCol    = cvd >= nz(cvd[1], cvd) ? cBull : cBear
+cvdV      = isCvd ? cvdLine : na
+cvdAbsMax = ta.highest(math.abs(cvd), 300)
+pCvdP = plot(isCvd ? math.max(nz(cvdLine), 0) : na, "CVD fill +", color=cClear, display=display.none)
+pCvdN = plot(isCvd ? math.min(nz(cvdLine), 0) : na, "CVD fill -", color=cClear, display=display.none)
+fill(pCvdP, pZero, isCvd ? cvdAbsMax : na, isCvd ? 0.0 : na, color.new(cBull, 68), color.new(cBull, 100), "CVD above zero")
+fill(pZero, pCvdN, isCvd ? 0.0 : na, isCvd ? -cvdAbsMax : na, color.new(cBear, 100), color.new(cBear, 68), "CVD below zero")
+plot(cvdV, "CVD glow outer", color.new(cvdCol, 86), 7, plot.style_linebr, display=display.pane)
+plot(cvdV, "CVD glow inner", color.new(cvdCol, 66), 4, plot.style_linebr, display=display.pane)
+plot(cvdV, "CVD", cvdCol, 2, plot.style_linebr, display=display.all - display.status_line)
+divY = isCvd and (divBear or divBull) ? cvd : na
+plotshape(divY, "Divergence glow", shape.circle, location.absolute, color.new(cMag, 72), size=size.small, display=display.pane)
+plotshape(divY, "CVD divergence", shape.circle, location.absolute, cMag, size=size.tiny, display=display.pane)
+
+// Delta: columns by sign and strength, gold on absorption, pressure line, high-volume shade
+dInt = math.min(1.0, math.abs(deltaPct) / 0.35)
+dCol = absorbBuy or absorbSell ? cGold : barDelta >= 0 ? color.from_gradient(dInt, 0.0, 1.0, color.new(cBull, 72), cBull) : color.from_gradient(dInt, 0.0, 1.0, color.new(cBear, 72), cBear)
+plot(isDel ? barDelta : na, "Delta", dCol, 3, plot.style_columns, display=display.all - display.status_line)
+plot(isDel ? press : na, "Pressure glow", color.new(cVwap, 78), 5, display=display.pane)
+plot(isDel ? press : na, "Pressure", cVwap, 2, display=display.pane)
+bgcolor(isDel and volZ >= hiVolZ ? color.new(cBand, 88) : na, title="High volume")
+
+// DCS (linked from NQ Edge Lite): gradient oscillator with signal and bias thresholds
+dcsV   = isDcs and linked ? dcsSrc : na
+dcsCol = color.from_gradient(nz(dcsV), -60.0, 60.0, cBear, cBull)
+pDcsP = plot(isDcs and linked ? math.max(dcsSrc, 0) : na, "DCS fill +", color=cClear, display=display.none)
+pDcsN = plot(isDcs and linked ? math.min(dcsSrc, 0) : na, "DCS fill -", color=cClear, display=display.none)
+fill(pDcsP, pZero, isDcs ? 100.0 : na, isDcs ? 0.0 : na, color.new(cBull, 55), color.new(cBull, 100), "DCS above zero")
+fill(pZero, pDcsN, isDcs ? 0.0 : na, isDcs ? -100.0 : na, color.new(cBear, 100), color.new(cBear, 55), "DCS below zero")
+plot(dcsV, "DCS glow outer", color.new(dcsCol, 85), 7, display=display.pane)
+plot(dcsV, "DCS glow inner", color.new(dcsCol, 65), 4, display=display.pane)
+plot(dcsV, "DCS", dcsCol, 2, display=display.all - display.status_line)
+plot(isDcs ? sigThr : na, "Signal +", color.new(cBull, 55), 1, display=display.pane)
+plot(isDcs ? -sigThr : na, "Signal -", color.new(cBear, 55), 1, display=display.pane)
+plot(isDcs ? weakThr : na, "Bias +", color.new(cBull, 82), 1, display=display.pane)
+plot(isDcs ? -weakThr : na, "Bias -", color.new(cBear, 82), 1, display=display.pane)
+var note = table.new(position.middle_center, 1, 1)
+if barstate.islast and isDcs and not linked
+    table.cell(note, 0, 0, "Settings → DCS source → choose  NQ Edge Lite: DCS", text_color=cText, bgcolor=color.new(cPanel, 10), text_size=size.normal)

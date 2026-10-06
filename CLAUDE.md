@@ -70,7 +70,9 @@ and daily-risk guard from `sc.GetTradePosition` (`limitHit` suppresses alerts), 
 lines validated against the bars between), used by the Terminal (`TL_TRENDLINES`, drawing objects) and
 Flow Candles (line subgraphs); absorption bubbles sized by volume z in both. v4.6: trade window
 (`DcsParams::tradeStartSec/EndSec`), `docs/LIVE_DAY1.md`, and `tradingview/NQEdgeLite.pine` (Pine v5 port
-of the system for live TradingView data; keep its weights/setups in step with the C++ when either changes). The v2 GDI overlay/backdrop/tape studies were
+of the system for live TradingView data; keep its weights/setups in step with the C++ when either changes).
+TradingView 2.0 adds the expectancy gate (forward-tracked per-setup stats mute losing setups), an RTH volume
+profile (POC/VA levels), compact hover-tooltip markers and a single live position tool; `docs/TRADINGVIEW.md`. The v2 GDI overlay/backdrop/tape studies were
 removed; `render::Frame`, `DrawProfile` and `DrawTape` remain. New Terminal layer: add a `TL_*` entry,
 its name in `kTermLayerNames`, both `kTermPreset` rows, slots in `TermState`, and a draw block that
 either redraws (when `heavy`) or `SlotKeep`s.

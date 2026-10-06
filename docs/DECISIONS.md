@@ -282,3 +282,17 @@ single colour); `DRAWSTYLE_RIGHT/LEFT_PRICE_BAR_DASH` draw at the subgraph value
     same day. Higher-timeframe bias uses the previous completed HTF bar (`[1]` with lookahead on) so it never repaints.
 77. **The Pine script was written without a compiler.** First paste may surface a syntax error; the structures used are
     standard v5 (`request.security_lower_tf`, arrays, tables, boxes, labels). Fix lines as reported before trading on it.
+
+## TradingView 2.0 decisions
+
+78. **Expectancy gate on forward-tracked results.** Each setup's record is built only from trades resolved before the bar
+    being evaluated (stop first, then T1), so muting uses no future information. Muted and hidden-grade signals are still
+    tracked, otherwise a muted setup could never come back. Threshold: 15 resolved trades, average R < 0 (inputs).
+    Motivation: the user's 5-minute NQ chart showed *Trend Pullback 30 % win, −0.16 R, n = 20* before the redesign.
+79. **One live position tool, outcomes as tags.** Historical risk / reward boxes were the main clutter; history is now a
+    marker plus an outcome tag, and only the newest open shown trade is drawn as boxes.
+80. **Profile = RTH volume spread evenly over each bar's range** in rows of `binTicks` ticks (TradingView has no volume at
+    price); value area grows from the POC toward the heavier neighbour. Good enough for POC / VA levels on 1- to 5-minute bars.
+81. **Pine API used beyond v1** (written without a compiler): `display=` on inputs and plots with `display.all -
+    display.status_line`, `text_font_family` on labels and table cells, gradient `fill()`, `array.sort_indices`,
+    `color.from_gradient`, `plotshape(location.absolute)`. Fix by reported line if TradingView rejects one.
