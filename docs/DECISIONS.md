@@ -269,3 +269,16 @@ single colour); `DRAWSTYLE_RIGHT/LEFT_PRICE_BAR_DASH` draw at the subgraph value
     pivot. Only one resistance and one support line are drawn, which keeps the chart within the hierarchy rules.
 74. **Absorption bubbles are sized by volume z-score** (the absorption detector requires z ≥ 2, so the smallest bubble already
     marks an above-average bar). Large-print bubbles stay smaller (4–12 px) so the two kinds read differently at a glance.
+
+## v4.6 decisions
+
+75. **The trade window suppresses signals in the engine**, not only alerts, so arrows, boxes and the scoreboard describe only
+    the hours the trader may act in. End ≤ start disables it. Default 10:00–15:30 ET is the day-one protocol, not a claim
+    that the open is untradeable.
+76. **NQ Edge Lite (Pine) is a faithful subset, not a port of every feature.** No bid × ask footprint (TradingView has no
+    aggressor volume), so delta is the tick rule on 1-minute intrabars, imbalances are absent, exhaustion is "extension bar on
+    low volume" and the value area is replaced by the prior-day range. Weights and gates mirror `config/NQEdge_weights.txt`
+    by group. The forward validation and the scoreboard run inside the script, so the two platforms can be compared on the
+    same day. Higher-timeframe bias uses the previous completed HTF bar (`[1]` with lookahead on) so it never repaints.
+77. **The Pine script was written without a compiler.** First paste may surface a syntax error; the structures used are
+    standard v5 (`request.security_lower_tf`, arrays, tables, boxes, labels). Fix lines as reported before trading on it.

@@ -50,7 +50,7 @@ projection, footprint/depth, signal-power features) are implemented — see CHAN
 built and run in Sierra by the user; v2 is syntax-checked only. `docs/DECISIONS.md` 26–34 list the
 v2 API details to confirm on the first Remote Build. `docs/VISUAL_GUIDE.md` explains every visual.
 
-## v4.5 (current): one study, PRO preset, Flow series, cockpit
+## v4.6 (current): one study, PRO preset, Flow series, cockpit, live protocol
 `scsf_NQEdge_Terminal` is the only study the trader adds. It sets every engine's parameters from its
 own inputs (`S.terminalPresent` makes the engine studies passive) and draws with Sierra drawing
 objects managed by line number (`term::Slot*` helpers, `TermState` slots, `SlotFlush` each update,
@@ -68,7 +68,9 @@ companion charts that share the engines; Flow Candles sets parameters only when 
 and daily-risk guard from `sc.GetTradePosition` (`limitHit` suppresses alerts), `TL_KEYTIMES` vertical lines,
 `LVL_PWH/LVL_PWL`. `docs/COCKPIT.md` is the multi-chart layout recipe. v4.5: `nqe::TrendLine` / `FindTrendLine` (swing-pair
 lines validated against the bars between), used by the Terminal (`TL_TRENDLINES`, drawing objects) and
-Flow Candles (line subgraphs); absorption bubbles sized by volume z in both. The v2 GDI overlay/backdrop/tape studies were
+Flow Candles (line subgraphs); absorption bubbles sized by volume z in both. v4.6: trade window
+(`DcsParams::tradeStartSec/EndSec`), `docs/LIVE_DAY1.md`, and `tradingview/NQEdgeLite.pine` (Pine v5 port
+of the system for live TradingView data; keep its weights/setups in step with the C++ when either changes). The v2 GDI overlay/backdrop/tape studies were
 removed; `render::Frame`, `DrawProfile` and `DrawTape` remain. New Terminal layer: add a `TL_*` entry,
 its name in `kTermLayerNames`, both `kTermPreset` rows, slots in `TermState`, and a draw block that
 either redraws (when `heavy`) or `SlotKeep`s.

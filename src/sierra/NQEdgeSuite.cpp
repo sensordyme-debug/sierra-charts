@@ -211,6 +211,7 @@ namespace nqe
 		int minStopTicks = 6;
 		int ethSignals = 1;         // outside RTH: 0 none, 1 grade A only, 2 all
 		float riskPerTrade = 100.0f; // $ risk behind the size suggestion
+		int tradeStartSec = 10 * 3600, tradeEndSec = 15 * 3600 + 30 * 60;   // signals only inside this window (end <= start = always)
 	};
 
 	struct ValParams
@@ -2899,6 +2900,8 @@ namespace nqe
 			}
 			// outside RTH only the configured grades are taken (thin overnight flow produces weaker setups)
 			if (best >= 0 && i < static_cast<int>(S.base.isRth.size()) && !S.base.isRth[i] && (P.ethSignals == 0 || (P.ethSignals == 1 && sig.grade > 1))) best = -1;
+			// live protocol: no signals outside the trade window (the open and the last half hour are left alone)
+			if (best >= 0 && P.tradeEndSec > P.tradeStartSec) { const int tod = sc.BaseDateTimeIn[i].GetTimeInSeconds(); if (tod < P.tradeStartSec || tod >= P.tradeEndSec) best = -1; }
 			if (best >= 0)
 			{
 				// no duplicate of the same setup/direction within 3 bars
@@ -4311,7 +4314,7 @@ enum TermInput
 	TI_PRESET = 0, TI_RTH_START, TI_RTH_END, TI_DAY_START, TI_ATR_LEN, TI_VA_PCT, TI_IB_MIN, TI_SWING_N, TI_SWING_ATR, TI_IMB_RATIO, TI_IMB_STACK, TI_ABS_Z,
 	TI_C_YM, TI_C_ES, TI_C_TICK, TI_C_MEGA1, TI_C_MEGA2, TI_C_MEGA3,
 	TI_WEIGHTS, TI_THR, TI_STRONG, TI_WEAK, TI_S1, TI_S2, TI_S3, TI_S4, TI_S5, TI_MIN_GRADE, TI_ALERTS, TI_SOUND, TI_LOG, TI_VWAP_ANCHOR,
-	TI_RISK, TI_ETH, TI_MIN_STOP, TI_MAX_STOP, TI_MIN_RR, TI_DAY_LOSS, TI_MAX_TRADES,
+	TI_RISK, TI_ETH, TI_MIN_STOP, TI_MAX_STOP, TI_MIN_RR, TI_DAY_LOSS, TI_MAX_TRADES, TI_TRADE_START, TI_TRADE_END,
 	TI_LAYER0,                                   // TL_COUNT tri-state inputs follow
 	TI_FONT = TI_LAYER0 + TL_COUNT, TI_NUM_BARS, TI_PROFILE_W, TI_BAND_STYLE, TI_BAND_ALPHA, TI_TL_SWINGS,
 	TI_COL_BULL, TI_COL_BEAR, TI_COL_NEUTRAL, TI_COL_NEUTRAL_UP, TI_COL_VWAP, TI_COL_LEVEL, TI_COL_LONG, TI_COL_SHORT, TI_COL_TEXT, TI_COL_PANEL, TI_COL_DIM, TI_COUNT
@@ -4486,6 +4489,8 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 		NQE_FLT_INPUT(TI_MIN_RR, "Setup: Min R:R To T1", 1.0, 0.5, 5.0);
 		NQE_FLT_INPUT(TI_DAY_LOSS, "Risk: Daily Loss Limit ($, 0 = off)", 500.0, 0.0, 1000000.0);
 		NQE_INT_INPUT(TI_MAX_TRADES, "Risk: Max Trades Per Day (0 = off)", 6, 0, 100);
+		sc.Input[TI_TRADE_START].Name = "Live: Trade Window Start (end <= start = always)"; sc.Input[TI_TRADE_START].SetTime(HMS_TIME(10, 0, 0));
+		sc.Input[TI_TRADE_END].Name = "Live: Trade Window End"; sc.Input[TI_TRADE_END].SetTime(HMS_TIME(15, 30, 0));
 		for (int k = 0; k < TL_COUNT; ++k)
 		{
 			SCString nm; nm.Format("Layer: %s", kTermLayerNames[k]);
@@ -4538,6 +4543,7 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 		for (int k = 1; k < SETUP_COUNT; ++k) dp.setupOn[k] = sc.Input[TI_S1 + k - 1].GetYesNo();
 		dp.alertsOn = sc.Input[TI_ALERTS].GetYesNo(); dp.alertSound = sc.Input[TI_SOUND].GetAlertSoundNumber(); dp.alertMinGrade = sc.Input[TI_MIN_GRADE].GetIndex() + 1;
 		dp.riskPerTrade = sc.Input[TI_RISK].GetFloat(); dp.ethSignals = sc.Input[TI_ETH].GetIndex(); dp.minStopAtr = sc.Input[TI_MIN_STOP].GetFloat(); dp.maxStopAtr = sc.Input[TI_MAX_STOP].GetFloat(); dp.minRR = sc.Input[TI_MIN_RR].GetFloat();
+		dp.tradeStartSec = sc.Input[TI_TRADE_START].GetTime(); dp.tradeEndSec = sc.Input[TI_TRADE_END].GetTime();
 		SetParams(S, E_DCS, S.params.dcs, dp);
 		ValParams vlp{}; SetParams(S, E_VAL, S.params.val, vlp);
 		LogParams lp{}; lp.enabled = sc.Input[TI_LOG].GetYesNo(); SetParams(S, E_LOG, S.params.log, lp);
@@ -4958,7 +4964,10 @@ SCSFExport scsf_NQEdge_Terminal(SCStudyInterfaceRef sc)
 		// 2 action pill: the one thing to do right now (daily risk guard overrides everything)
 		{
 			int kind = H.actionKind; char act[128];
+			const int wS = S.params.dcs.tradeStartSec, wE = S.params.dcs.tradeEndSec; const int todNow = sc.GetCurrentDateTime().GetTimeInSeconds();
+			const bool outsideWindow = wE > wS && (todNow < wS || todNow >= wE);
 			if (limitHit) { kind = 3; sprintf_s(act, sizeof(act), " NO TRADE | daily limit hit (day $%+.0f) ", dayPnl); }
+			else if (outsideWindow && (kind == 0 || kind == 3)) { kind = 3; sprintf_s(act, sizeof(act), " NO TRADE | outside window %02d:%02d-%02d:%02d ", wS / 3600, (wS % 3600) / 60, wE / 3600, (wE % 3600) / 60); }
 			else sprintf_s(act, sizeof(act), " %s ", H.action[0] ? H.action : "WAIT");
 			L.pill = true; L.bold = true; L.pt = hudPt + 1;
 			if (kind == 1 || kind == 2) { L.back = cBull; L.color = cPanel; }

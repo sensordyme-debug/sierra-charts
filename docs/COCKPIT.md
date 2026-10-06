@@ -55,6 +55,7 @@ need to exist and update.
 | Risk: Daily Loss Limit ($) | your prop-firm daily limit minus a cushion (e.g. $1,000 limit → $700). |
 | Risk: Max Trades Per Day | 4–6. Over-trading is the common failure mode, not bad setups. |
 | Signals Outside RTH | Grade A only (default). Overnight MES/MNQ flow is thin. |
+| Live: Trade Window Start / End | 10:00 / 15:30 on day one (`docs/LIVE_DAY1.md`); widen only when the scoreboard earns it. |
 | Signals Shown: Minimum Grade | A and B. Grade C is logged for research, never traded. |
 | Chart Numbers | the feeds above. |
 | Alerts Enabled + Sound | yes; the alert text carries entry, stop, T1, T2 and size. |

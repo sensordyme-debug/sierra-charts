@@ -198,3 +198,15 @@
   8–24 px within 3 ATR of price, last 150 bars, in the Bubbles layer; Flow Candles: three size classes at z ≥ 2 / 3 / 4,
   default marker style, *Absorption Marker* input keeps the diamonds as an option).
 - Docs: VISUAL_GUIDE, DECISIONS 73–74.
+
+## v4.6 — live protocol: trade window + TradingView port
+- **Trade window** (`DcsParams::tradeStartSec/EndSec`, Terminal inputs *Live: Trade Window Start / End*, default 10:00–15:30 ET):
+  no signals outside it; the action pill says `NO TRADE | outside window 10:00-15:30` while nothing is open.
+- **`tradingview/NQEdgeLite.pine`** — the system for TradingView's live data (Pine v5): trading-day VWAP ± 1σ, prior-day /
+  overnight / IB / prior-week levels with tags, tick-rule delta from intrabars, CVD and its z-score, absorption / exhaustion /
+  trapped / CVD-divergence detection, swing structure, regime with hysteresis, MTF bias (chart / 5 / 15 / 60), ES relative strength
+  and NYSE TICK feeds, the gated-weight DCS, the five setups with stop sanity, liquidity targets, A/B grading, $-risk sizing,
+  in-script forward validation (scoreboard), signal boxes + labels, auto trend lines, absorption bubbles, a HUD with the
+  action line, trade window, max signals per day, and alerts (`alert()` once per bar close). Not compiled here: paste it in the
+  Pine Editor and report any error line.
+- `docs/LIVE_DAY1.md`: the day-one protocol (rules the Terminal enforces, the two live-data paths, pre-flight, session, after).
